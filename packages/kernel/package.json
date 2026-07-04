@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@puppetmaster/db": "workspace:*",
     "@puppetmaster/shared": "workspace:*",
     "bullmq": "^5.34.0",

@@ -67,6 +67,12 @@ them in your shell or prefix the run command:
 | `REDIS_URL`    | *(unset → in-memory bus)* | `redis://127.0.0.1:6379`                                |
 | `PORT`         | `4000`                  | server HTTP port                                        |
 | `HOST`         | `0.0.0.0`               |                                                          |
+| `ANTHROPIC_API_KEY` | *(unset)*          | enables agents on `claude-*` models                     |
+| `OPENAI_BASE_URL` / `OPENAI_API_KEY` | *(unset)* | enables `openai/<model>` agents (or any OpenAI-compatible runtime, e.g. vLLM) |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | used by `ollama/<model>` agents                     |
+
+Without any provider keys, agents on the `mock` model still work — a scripted provider used
+for demos and tests.
 
 If you omit `DATABASE_URL` and `REDIS_URL`, the server falls back to an in-memory event bus
 and an embedded PGlite database — handy for a quick look, but state doesn't persist across

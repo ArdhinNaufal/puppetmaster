@@ -110,6 +110,33 @@ export async function createMission(
   return m!;
 }
 
+export async function createAgentMission(
+  db: Db,
+  input: {
+    workspaceId: string;
+    agentId: string;
+    trigger: unknown;
+    payload: unknown;
+    parentMissionId?: string | null;
+  },
+) {
+  const [m] = await db
+    .insert(missions)
+    .values({
+      workspaceId: input.workspaceId,
+      kind: "agent",
+      subjectId: input.agentId,
+      workflowVersionId: null,
+      parentMissionId: input.parentMissionId ?? null,
+      status: "queued",
+      trigger: input.trigger,
+      input: input.payload,
+      cursor: {},
+    })
+    .returning();
+  return m!;
+}
+
 export async function getMission(db: Db, id: string) {
   const [m] = await db.select().from(missions).where(eq(missions.id, id)).limit(1);
   return m ?? null;

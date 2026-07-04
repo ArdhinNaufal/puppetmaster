@@ -97,6 +97,44 @@ export const approvals = pgTable("approvals", {
   decidedAt: timestamp("decided_at", { withTimezone: true }),
 });
 
+export const agents = pgTable("agents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  persona: text("persona").notNull().default(""),
+  model: text("model").notNull(),
+  autonomy: text("autonomy").notNull().default("write_approved"),
+  toolGrants: jsonb("tool_grants").notNull().default([]),
+  schedule: text("schedule"),
+  /** Structured scratchpad the agent maintains across ticks (ARCHITECTURE.md §3.1). */
+  scratchpad: jsonb("scratchpad").notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const agentMessages = pgTable("agent_messages", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  agentId: uuid("agent_id")
+    .notNull()
+    .references(() => agents.id, { onDelete: "cascade" }),
+  missionId: uuid("mission_id"),
+  role: text("role").notNull(), // "user" | "assistant" | "tool"
+  content: jsonb("content").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Long-term memory; `embedding` is filled when an embedding provider is
+ *  configured (pgvector), otherwise recall falls back to keyword search. */
+export const agentMemories = pgTable("agent_memories", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  agentId: uuid("agent_id")
+    .notNull()
+    .references(() => agents.id, { onDelete: "cascade" }),
+  content: text("content").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const schema = {
   workspaces,
   workflows,
@@ -104,4 +142,7 @@ export const schema = {
   missions,
   missionSteps,
   approvals,
+  agents,
+  agentMessages,
+  agentMemories,
 };

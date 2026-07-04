@@ -106,9 +106,40 @@ const DDL: string[] = [
      created_at timestamptz NOT NULL DEFAULT now(),
      decided_at timestamptz
    )`,
+  `CREATE TABLE IF NOT EXISTS agents (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     name text NOT NULL,
+     persona text NOT NULL DEFAULT '',
+     model text NOT NULL,
+     autonomy text NOT NULL DEFAULT 'write_approved',
+     tool_grants jsonb NOT NULL DEFAULT '[]',
+     schedule text,
+     scratchpad jsonb NOT NULL DEFAULT '{}',
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS agent_messages (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+     mission_id uuid,
+     role text NOT NULL,
+     content jsonb NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS agent_memories (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+     content text NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  // pgvector column for semantic memory; separate statement so the rest of the
+  // schema still applies when the vector extension is unavailable.
+  `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS embedding vector(1024)`,
   `CREATE INDEX IF NOT EXISTS mission_steps_mission_idx ON mission_steps(mission_id)`,
   `CREATE INDEX IF NOT EXISTS missions_workspace_idx ON missions(workspace_id)`,
   `CREATE INDEX IF NOT EXISTS approvals_status_idx ON approvals(status)`,
+  `CREATE INDEX IF NOT EXISTS agent_messages_agent_idx ON agent_messages(agent_id)`,
+  `CREATE INDEX IF NOT EXISTS agent_memories_agent_idx ON agent_memories(agent_id)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {
@@ -116,9 +147,10 @@ export async function migrate(handle: DbHandle): Promise<void> {
     try {
       await handle.db.execute(sql.raw(statement));
     } catch (err) {
-      // `CREATE EXTENSION vector` may be unavailable on a stock Postgres without
-      // pgvector; the rest of the schema must still apply. Surface anything else.
-      if (statement.includes("EXTENSION")) continue;
+      // `CREATE EXTENSION vector` (and the vector-typed column that depends on
+      // it) may be unavailable on a stock Postgres without pgvector; the rest
+      // of the schema must still apply. Surface anything else.
+      if (statement.includes("EXTENSION") || statement.includes("vector(")) continue;
       throw err;
     }
   }

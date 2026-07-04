@@ -6,8 +6,16 @@ import type { MissionStatus, StepStatus, WorkflowNodeKind } from "@puppetmaster/
  * Redis stream unchanged. See docs/ARCHITECTURE.md §3.3.
  */
 export type BusEvent =
-  | { type: "mission.started"; missionId: string; workflowVersionId: string; at: string }
+  | { type: "mission.started"; missionId: string; workflowVersionId?: string; agentId?: string; at: string }
   | { type: "mission.finished"; missionId: string; status: MissionStatus; at: string }
+  | {
+      type: "agent.message";
+      agentId: string;
+      missionId: string;
+      role: "user" | "assistant" | "tool";
+      text: string;
+      at: string;
+    }
   | {
       type: "mission.step";
       missionId: string;

@@ -2,30 +2,41 @@ import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { WorkflowGraph } from "@puppetmaster/shared";
 import {
+  createAgent,
   createDb,
   createWorkflow,
+  deleteAgent,
   ensureDefaultWorkspace,
+  getAgent,
+  getAgentMessages,
   getApproval,
   getMission,
   getMissionSteps,
   getWorkflowWithGraph,
+  listAgents,
   listApprovals,
+  listMemories,
   listMissions,
   listWorkflows,
   migrate,
   resolveApproval,
   saveWorkflowVersion,
+  updateAgent,
   type DbHandle,
 } from "@puppetmaster/db";
 import {
+  AgentRuntime,
   BuiltinToolRegistry,
   InlineRunner,
   InMemoryEventBus,
+  ModelRouter,
   QueueRunner,
   RedisEventBus,
+  startAgentTick,
   startWorkflow,
   WorkflowExecutor,
   type EventBus,
+  type MissionDispatcher,
   type WorkflowRunner,
 } from "@puppetmaster/kernel";
 
@@ -43,10 +54,27 @@ const workspaceId = await ensureDefaultWorkspace(db);
 
 const tools = new BuiltinToolRegistry();
 const bus: EventBus = REDIS_URL ? new RedisEventBus(REDIS_URL) : new InMemoryEventBus();
+const router = new ModelRouter({
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  openaiBaseUrl: process.env.OPENAI_BASE_URL,
+  openaiApiKey: process.env.OPENAI_API_KEY,
+  ollamaBaseUrl: process.env.OLLAMA_BASE_URL,
+});
 const executor = new WorkflowExecutor({ db, bus, tools });
+const agentRuntime = new AgentRuntime({ db, bus, router, tools });
+
+/** Route a mission to the right executor based on its kind. */
+const dispatch: MissionDispatcher = async (missionId) => {
+  const mission = await getMission(db, missionId);
+  if (!mission) throw new Error(`mission ${missionId} not found`);
+  return mission.kind === "agent"
+    ? agentRuntime.runMission(missionId)
+    : executor.runMission(missionId);
+};
+
 const runner: WorkflowRunner = REDIS_URL
-  ? new QueueRunner(REDIS_URL, { executor, db })
-  : new InlineRunner(executor);
+  ? new QueueRunner(REDIS_URL, { run: dispatch, db })
+  : new InlineRunner(dispatch);
 
 app.log.info(
   { dbDriver: handle.driver, bus: REDIS_URL ? "redis" : "memory", runner: REDIS_URL ? "queue" : "inline" },
@@ -60,14 +88,23 @@ async function scheduleCrons(workflowId: string, graph: unknown): Promise<void> 
   const cronNode = parsed.data.nodes.find(
     (n) => n.kind === "trigger" && n.config?.mode === "cron" && typeof n.config?.cron === "string",
   );
-  if (cronNode) await runner.scheduleCron(workflowId, String(cronNode.config.cron));
-  else await runner.unscheduleCron(workflowId).catch(() => {});
+  if (cronNode) await runner.scheduleCron("workflow", workflowId, String(cronNode.config.cron));
+  else await runner.unscheduleCron("workflow", workflowId).catch(() => {});
 }
 
-// Re-arm cron triggers for existing workflows on boot.
+/** Register/unregister an agent's cron schedule. */
+async function scheduleAgentCron(agentId: string, cron: string | null): Promise<void> {
+  if (cron) await runner.scheduleCron("agent", agentId, cron);
+  else await runner.unscheduleCron("agent", agentId).catch(() => {});
+}
+
+// Re-arm cron triggers for existing workflows and agents on boot.
 for (const wf of await listWorkflows(db, workspaceId)) {
   const full = await getWorkflowWithGraph(db, wf.id);
   if (full?.version) await scheduleCrons(wf.id, full.version.graph);
+}
+for (const agent of await listAgents(db, workspaceId)) {
+  if (agent.schedule) await scheduleAgentCron(agent.id, agent.schedule);
 }
 
 await app.register(websocket);
@@ -148,6 +185,86 @@ app.post("/api/hooks/:workflowId", async (req, reply) => {
   } catch (err) {
     return reply.code(404).send({ error: err instanceof Error ? err.message : "hook failed" });
   }
+});
+
+// --- Agents (M2) ---------------------------------------------------------------
+app.get("/api/agents", async () => listAgents(db, workspaceId));
+
+app.post("/api/agents", async (req, reply) => {
+  const body = (req.body ?? {}) as {
+    name?: string;
+    persona?: string;
+    model?: string;
+    autonomy?: string;
+    schedule?: string | null;
+  };
+  if (!body.name?.trim()) return reply.code(400).send({ error: "name is required" });
+  const agent = await createAgent(db, {
+    workspaceId,
+    name: body.name.trim(),
+    persona: body.persona ?? "You are a helpful assistant.",
+    model: body.model ?? "mock",
+    autonomy: body.autonomy,
+    schedule: body.schedule ?? null,
+  });
+  if (agent.schedule) await scheduleAgentCron(agent.id, agent.schedule);
+  return reply.code(201).send(agent);
+});
+
+app.get("/api/agents/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const agent = await getAgent(db, id);
+  if (!agent) return reply.code(404).send({ error: "agent not found" });
+  return agent;
+});
+
+app.put("/api/agents/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const agent = await getAgent(db, id);
+  if (!agent) return reply.code(404).send({ error: "agent not found" });
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const key of ["name", "persona", "model", "autonomy", "schedule"]) {
+    if (key in body) patch[key] = body[key];
+  }
+  await updateAgent(db, id, patch);
+  if ("schedule" in patch) await scheduleAgentCron(id, (patch.schedule as string | null) ?? null);
+  return getAgent(db, id);
+});
+
+app.delete("/api/agents/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  await scheduleAgentCron(id, null);
+  await deleteAgent(db, id);
+  return reply.code(204).send();
+});
+
+/** Direct chat: queue an agent tick carrying the user message. */
+app.post("/api/agents/:id/chat", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const body = (req.body ?? {}) as { message?: string };
+  if (!body.message?.trim()) return reply.code(400).send({ error: "message is required" });
+  try {
+    const mission = await startAgentTick(db, {
+      agentId: id,
+      trigger: { mode: "chat" },
+      payload: { message: body.message },
+    });
+    await runner.enqueue(mission.id);
+    return reply.code(202).send({ missionId: mission.id });
+  } catch (err) {
+    return reply.code(404).send({ error: err instanceof Error ? err.message : "chat failed" });
+  }
+});
+
+app.get("/api/agents/:id/messages", async (req) => {
+  const { id } = req.params as { id: string };
+  return getAgentMessages(db, id, 100);
+});
+
+app.get("/api/agents/:id/memories", async (req) => {
+  const { id } = req.params as { id: string };
+  return listMemories(db, id);
 });
 
 // --- Missions & traces -------------------------------------------------------

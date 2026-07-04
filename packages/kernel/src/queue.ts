@@ -1,7 +1,6 @@
 import { Queue, Worker, type ConnectionOptions, type Job } from "bullmq";
 import type { Db } from "@puppetmaster/db";
-import type { WorkflowExecutor } from "./executor.js";
-import { startWorkflow } from "./orchestrator.js";
+import { startAgentTick, startWorkflow } from "./orchestrator.js";
 
 /** Parse a redis:// URL into BullMQ connection options (its blocking clients
  *  require maxRetriesPerRequest: null). BullMQ owns the resulting connections. */
@@ -17,18 +16,22 @@ function connectionFromUrl(url: string): ConnectionOptions {
   };
 }
 
+export type CronSubjectKind = "workflow" | "agent";
+
 /**
  * Runs missions off a queue so execution is durable and decoupled from HTTP.
- * `QueueRunner` uses BullMQ on Redis (retries + backoff at the job level, plus
- * cron trigger scheduling); `InlineRunner` executes in-process for Redis-free
- * local dev.
+ * The `run` dependency dispatches a mission id to the right executor (workflow
+ * engine or agent runtime) based on the mission's kind. `QueueRunner` uses
+ * BullMQ on Redis; `InlineRunner` executes in-process for Redis-free dev.
  */
 export interface WorkflowRunner {
   enqueue(missionId: string): Promise<void>;
-  scheduleCron(workflowId: string, cron: string): Promise<void>;
-  unscheduleCron(workflowId: string): Promise<void>;
+  scheduleCron(kind: CronSubjectKind, subjectId: string, cron: string): Promise<void>;
+  unscheduleCron(kind: CronSubjectKind, subjectId: string): Promise<void>;
   close(): Promise<void>;
 }
+
+export type MissionDispatcher = (missionId: string) => Promise<unknown>;
 
 const QUEUE_NAME = "puppetmaster-workflows";
 
@@ -36,21 +39,29 @@ export class QueueRunner implements WorkflowRunner {
   private readonly queue: Queue;
   private readonly worker: Worker;
 
-  constructor(url: string, deps: { executor: WorkflowExecutor; db: Db }) {
+  constructor(url: string, deps: { run: MissionDispatcher; db: Db }) {
     const connection = connectionFromUrl(url);
     this.queue = new Queue(QUEUE_NAME, { connection });
     this.worker = new Worker(
       QUEUE_NAME,
       async (job: Job) => {
         if (job.name === "cron") {
-          const mission = await startWorkflow(deps.db, {
-            workflowId: job.data.workflowId,
-            trigger: { mode: "cron" },
-            payload: {},
-          });
-          return deps.executor.runMission(mission.id);
+          const kind = (job.data.kind ?? "workflow") as CronSubjectKind;
+          const mission =
+            kind === "agent"
+              ? await startAgentTick(deps.db, {
+                  agentId: job.data.subjectId ?? job.data.workflowId,
+                  trigger: { mode: "cron" },
+                  payload: {},
+                })
+              : await startWorkflow(deps.db, {
+                  workflowId: job.data.subjectId ?? job.data.workflowId,
+                  trigger: { mode: "cron" },
+                  payload: {},
+                });
+          return deps.run(mission.id);
         }
-        return deps.executor.runMission(job.data.missionId);
+        return deps.run(job.data.missionId);
       },
       { connection },
     );
@@ -67,16 +78,16 @@ export class QueueRunner implements WorkflowRunner {
     );
   }
 
-  async scheduleCron(workflowId: string, cron: string): Promise<void> {
+  async scheduleCron(kind: CronSubjectKind, subjectId: string, cron: string): Promise<void> {
     await this.queue.upsertJobScheduler(
-      `cron:${workflowId}`,
+      `cron:${kind}:${subjectId}`,
       { pattern: cron },
-      { name: "cron", data: { workflowId } },
+      { name: "cron", data: { kind, subjectId } },
     );
   }
 
-  async unscheduleCron(workflowId: string): Promise<void> {
-    await this.queue.removeJobScheduler(`cron:${workflowId}`);
+  async unscheduleCron(kind: CronSubjectKind, subjectId: string): Promise<void> {
+    await this.queue.removeJobScheduler(`cron:${kind}:${subjectId}`);
   }
 
   async close(): Promise<void> {
@@ -87,10 +98,10 @@ export class QueueRunner implements WorkflowRunner {
 
 /** In-process runner for local dev without Redis; cron scheduling is a no-op. */
 export class InlineRunner implements WorkflowRunner {
-  constructor(private readonly executor: WorkflowExecutor) {}
+  constructor(private readonly run: MissionDispatcher) {}
 
   async enqueue(missionId: string): Promise<void> {
-    void this.executor.runMission(missionId).catch((err) => {
+    void this.run(missionId).catch((err) => {
       console.error(`[inline] mission ${missionId} failed:`, err);
     });
   }

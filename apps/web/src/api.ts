@@ -111,8 +111,56 @@ export const api = {
     }).then(json<{ ok: boolean }>),
 };
 
+export interface Agent {
+  id: string;
+  name: string;
+  persona: string;
+  model: string;
+  autonomy: string;
+  schedule: string | null;
+  scratchpad: Record<string, unknown>;
+  createdAt: string;
+}
+export interface AgentMessage {
+  id: string;
+  agentId: string;
+  missionId: string | null;
+  role: "user" | "assistant" | "tool";
+  content: {
+    text?: string;
+    toolCalls?: { id: string; name: string; args: Record<string, unknown> }[];
+    toolResults?: { toolCallId: string; result: unknown; isError?: boolean }[];
+  };
+  createdAt: string;
+}
+export interface AgentMemory {
+  id: string;
+  content: string;
+  createdAt: string;
+}
+
+export const agentApi = {
+  list: () => fetch("/api/agents").then(json<Agent[]>),
+  create: (input: { name: string; persona?: string; model?: string; autonomy?: string }) =>
+    fetch("/api/agents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    }).then(json<Agent>),
+  remove: (id: string) => fetch(`/api/agents/${id}`, { method: "DELETE" }),
+  chat: (id: string, message: string) =>
+    fetch(`/api/agents/${id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message }),
+    }).then(json<{ missionId: string }>),
+  messages: (id: string) => fetch(`/api/agents/${id}/messages`).then(json<AgentMessage[]>),
+  memories: (id: string) => fetch(`/api/agents/${id}/memories`).then(json<AgentMemory[]>),
+};
+
 export type BusEvent =
-  | { type: "mission.started"; missionId: string; at: string }
+  | { type: "mission.started"; missionId: string; agentId?: string; at: string }
+  | { type: "agent.message"; agentId: string; missionId: string; role: string; text: string; at: string }
   | { type: "mission.finished"; missionId: string; status: string; at: string }
   | { type: "mission.step"; missionId: string; nodeId: string; kind: NodeKind; status: StepStatus; at: string }
   | { type: "approval.requested"; missionId: string; nodeId: string; approvalId: string; prompt: string; at: string }

@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Approval, type Mission, type MissionStep, type StepStatus, type Workflow } from "./api.js";
+import {
+  agentApi,
+  api,
+  type Agent,
+  type Approval,
+  type Mission,
+  type MissionStep,
+  type StepStatus,
+  type Workflow,
+} from "./api.js";
 import { Canvas } from "./Canvas.js";
+import { Command } from "./Command.js";
 import { useEventStream } from "./useEventStream.js";
 import { NODE_META } from "./FlowNode.js";
 
@@ -32,8 +42,12 @@ const STATUS_LABEL: Record<StepStatus, string> = {
 };
 
 export function App() {
+  const [view, setView] = useState<"command" | "canvas">("command");
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [chatRefresh, setChatRefresh] = useState(0);
   const [tracked, setTracked] = useState<string | null>(null);
   const [nodeStatus, setNodeStatus] = useState<Record<string, StepStatus>>({});
   const [mission, setMission] = useState<Mission | null>(null);
@@ -43,8 +57,11 @@ export function App() {
 
   const trackedRef = useRef<string | null>(null);
   trackedRef.current = tracked;
+  const selectedAgentRef = useRef<string | null>(null);
+  selectedAgentRef.current = selectedAgent;
 
   const refreshWorkflows = useCallback(() => api.listWorkflows().then(setWorkflows), []);
+  const refreshAgents = useCallback(() => agentApi.list().then(setAgents), []);
   const refreshApprovals = useCallback(() => api.listApprovals("pending").then(setApprovals), []);
   const refreshTrace = useCallback((id: string) => {
     return api.getMission(id).then(({ mission, steps }) => {
@@ -56,8 +73,9 @@ export function App() {
   useEffect(() => {
     api.bootstrap().then(setInfo).catch(() => setInfo(null));
     refreshWorkflows();
+    refreshAgents();
     refreshApprovals();
-  }, [refreshWorkflows, refreshApprovals]);
+  }, [refreshWorkflows, refreshAgents, refreshApprovals]);
 
   const { connected } = useEventStream(
     useCallback(
@@ -74,6 +92,9 @@ export function App() {
         if (event.type === "approval.requested" || event.type === "approval.resolved") {
           refreshApprovals();
           if (active) refreshTrace(active);
+        }
+        if (event.type === "agent.message" && event.agentId === selectedAgentRef.current) {
+          setChatRefresh((n) => n + 1);
         }
       },
       [refreshApprovals, refreshTrace],
@@ -107,12 +128,34 @@ export function App() {
     await api.resolveApproval(id, approved);
     await refreshApprovals();
     if (tracked) refreshTrace(tracked);
+    setChatRefresh((n) => n + 1);
   };
+
+  const newAgent = async () => {
+    const name = prompt("Agent name", "Scout");
+    if (name === null) return;
+    const model = prompt("Model (claude-*, openai/*, ollama/*, mock)", "mock") ?? "mock";
+    const persona = prompt("Persona", "You are a helpful research assistant.") ?? "";
+    const agent = await agentApi.create({ name: name || "Agent", model, persona });
+    await refreshAgents();
+    setSelectedAgent(agent.id);
+    setView("command");
+  };
+
+  const currentAgent = agents.find((a) => a.id === selectedAgent) ?? null;
 
   return (
     <div className="app">
       <header className="rail">
         <span className="brand">PUPPETMASTER</span>
+        <nav className="view-switch">
+          <button className={`vs ${view === "command" ? "on" : ""}`} onClick={() => setView("command")}>
+            COMMAND
+          </button>
+          <button className={`vs ${view === "canvas" ? "on" : ""}`} onClick={() => setView("canvas")}>
+            CANVAS
+          </button>
+        </nav>
         <span className="rail-meta">
           {info && <span className="tag-lo">DB {info.dbDriver.toUpperCase()} · Q {info.queue.toUpperCase()}</span>}
           <span className={`status ${connected ? "ok" : "down"}`}>
@@ -123,24 +166,51 @@ export function App() {
 
       <div className="grid">
         <aside className="panel side">
-          <div className="panel-head">
-            <span>WORKFLOWS</span>
-            <span className="head-actions">
-              <button className="chip tiny" onClick={newWorkflow}>＋</button>
-              <button className="chip tiny" onClick={sampleWorkflow}>SAMPLE</button>
-            </span>
-          </div>
-          <ul className="wf-list">
-            {workflows.length === 0 && <li className="muted">No workflows yet.</li>}
-            {workflows.map((w) => (
-              <li key={w.id}>
-                <button className={`wf-item ${selected === w.id ? "sel" : ""}`} onClick={() => setSelected(w.id)}>
-                  <span className="wf-name">{w.name}</span>
-                  <span className="wf-ver">v{w.currentVersion}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          {view === "command" ? (
+            <>
+              <div className="panel-head">
+                <span>AGENTS</span>
+                <span className="head-actions">
+                  <button className="chip tiny" onClick={newAgent}>＋</button>
+                </span>
+              </div>
+              <ul className="wf-list">
+                {agents.length === 0 && <li className="muted pad">No agents yet.</li>}
+                {agents.map((a) => (
+                  <li key={a.id}>
+                    <button
+                      className={`wf-item ${selectedAgent === a.id ? "sel" : ""}`}
+                      onClick={() => setSelectedAgent(a.id)}
+                    >
+                      <span className="wf-name">◉ {a.name}</span>
+                      <span className="wf-ver">{a.model}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <>
+              <div className="panel-head">
+                <span>WORKFLOWS</span>
+                <span className="head-actions">
+                  <button className="chip tiny" onClick={newWorkflow}>＋</button>
+                  <button className="chip tiny" onClick={sampleWorkflow}>SAMPLE</button>
+                </span>
+              </div>
+              <ul className="wf-list">
+                {workflows.length === 0 && <li className="muted pad">No workflows yet.</li>}
+                {workflows.map((w) => (
+                  <li key={w.id}>
+                    <button className={`wf-item ${selected === w.id ? "sel" : ""}`} onClick={() => setSelected(w.id)}>
+                      <span className="wf-name">{w.name}</span>
+                      <span className="wf-ver">v{w.currentVersion}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
 
           <div className="panel-head">
             <span>APPROVALS</span>
@@ -161,12 +231,16 @@ export function App() {
         </aside>
 
         <main className="panel canvas-panel">
-          <Canvas
-            workflowId={selected}
-            nodeStatus={nodeStatus}
-            onRan={track}
-            onSaved={refreshWorkflows}
-          />
+          {view === "command" ? (
+            <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} />
+          ) : (
+            <Canvas
+              workflowId={selected}
+              nodeStatus={nodeStatus}
+              onRan={track}
+              onSaved={refreshWorkflows}
+            />
+          )}
         </main>
 
         <aside className="panel trace">
