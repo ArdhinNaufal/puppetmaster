@@ -14,6 +14,26 @@ import {
  * node-postgres (production, pgvector image) and PGlite (local/desktop) drivers.
  */
 
+export const users = pgTable("users", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  email: text("email").notNull().unique(),
+  name: text("name").notNull(),
+  /** scrypt hash, `salthex:hashhex` (see apps/server auth). */
+  passwordHash: text("password_hash").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Opaque bearer sessions; the token travels in an HttpOnly cookie. */
+export const sessions = pgTable("sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  token: text("token").notNull().unique(),
+  userId: uuid("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const workspaces = pgTable("workspaces", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: text("name").notNull(),
@@ -21,6 +41,40 @@ export const workspaces = pgTable("workspaces", {
   branding: jsonb("branding").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/** User ↔ workspace with a role: owner | admin | builder | member (PRD). */
+export const memberships = pgTable(
+  "memberships",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    role: text("role").notNull().default("member"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqMember: unique().on(t.userId, t.workspaceId) }),
+);
+
+/** Per-user, per-workspace UI state: panel layouts, theme, default view. */
+export const uiPreferences = pgTable(
+  "ui_preferences",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    layout: jsonb("layout").notNull().default({}),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqPrefs: unique().on(t.userId, t.workspaceId) }),
+);
 
 export const workflows = pgTable("workflows", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -138,6 +192,10 @@ export const agentMemories = pgTable("agent_memories", {
 });
 
 export const schema = {
+  users,
+  sessions,
+  memberships,
+  uiPreferences,
   workspaces,
   workflows,
   workflowVersions,

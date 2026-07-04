@@ -3,10 +3,13 @@ import { Chip, Panel, Stat, StatusDot, StatusText, TierBadge } from "@puppetmast
 import {
   agentApi,
   api,
+  memberApi,
   workspaceApi,
   type Agent,
   type AgentMemory,
+  type MemberRow,
   type Mission,
+  type Role,
   type Workspace,
 } from "./api.js";
 
@@ -76,7 +79,7 @@ export function MissionsView(props: {
 
 /* ------------------------------------------------------------------ Agents */
 
-export function AgentsView(props: { onOpenChat: (agentId: string) => void }) {
+export function AgentsView(props: { onOpenChat: (agentId: string) => void; readOnly?: boolean }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [memories, setMemories] = useState<AgentMemory[]>([]);
@@ -94,7 +97,7 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void }) {
   }, [selected]);
 
   const patch = async (p: Record<string, unknown>) => {
-    if (!agent) return;
+    if (!agent || props.readOnly) return;
     setSaving(true);
     await fetch(`/api/agents/${agent.id}`, {
       method: "PUT",
@@ -124,8 +127,11 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void }) {
         actions={agent ? <Chip tiny tone="accent" onClick={() => props.onOpenChat(agent.id)}>OPEN CHANNEL</Chip> : undefined}
       >
         {!agent && <p className="dim pad">Select an agent to inspect its definition, scratchpad, and memory.</p>}
+        {agent && props.readOnly && (
+          <p className="dim pad">Read-only — editing agent definitions requires the builder role.</p>
+        )}
         {agent && (
-          <div className="inspector-grid">
+          <div className={`inspector-grid ${props.readOnly ? "readonly" : ""}`}>
             <label className="ins-field">
               <span>Persona</span>
               <textarea
@@ -236,13 +242,53 @@ export function ToolsView() {
 
 /* ------------------------------------------------------------------- Admin */
 
-export function AdminView(props: { onBrandingChange: (ws: Workspace) => void }) {
+const ASSIGNABLE_ROLES: Role[] = ["admin", "builder", "member"];
+
+export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspace) => void }) {
   const [ws, setWs] = useState<Workspace | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [members, setMembers] = useState<MemberRow[]>([]);
+  const [memberErr, setMemberErr] = useState<string | null>(null);
+  const [draft, setDraft] = useState({ email: "", name: "", password: "", role: "member" as Role });
 
+  const refreshMembers = () => memberApi.list().then(setMembers).catch(() => {});
   useEffect(() => {
     workspaceApi.get().then(setWs).catch(() => {});
+    refreshMembers();
   }, []);
+
+  const addMember = async () => {
+    setMemberErr(null);
+    try {
+      await memberApi.create(draft);
+      setDraft({ email: "", name: "", password: "", role: "member" });
+      await refreshMembers();
+    } catch (err) {
+      setMemberErr(err instanceof Error ? err.message : "failed to add member");
+    }
+  };
+
+  const setRole = async (userId: string, role: Role) => {
+    setMemberErr(null);
+    try {
+      await memberApi.setRole(userId, role);
+      await refreshMembers();
+    } catch (err) {
+      setMemberErr(err instanceof Error ? err.message : "failed to change role");
+      await refreshMembers();
+    }
+  };
+
+  const removeMember = async (userId: string, email: string) => {
+    if (!confirm(`Remove ${email} from the workspace?`)) return;
+    setMemberErr(null);
+    try {
+      await memberApi.remove(userId);
+      await refreshMembers();
+    } catch (err) {
+      setMemberErr(err instanceof Error ? err.message : "failed to remove member");
+    }
+  };
 
   const save = async (patch: { name?: string; branding?: Workspace["branding"] }) => {
     const updated = await workspaceApi.update(patch);
@@ -282,7 +328,67 @@ export function AdminView(props: { onBrandingChange: (ws: Workspace) => void }) 
           </div>
           <p className="dim">
             Branding is workspace-scoped white-labelling (PRD §6): the accent hue and brand name skin
-            the shell for every member. Members, roles, and per-role dashboards arrive with auth.
+            the shell for every member.
+          </p>
+        </div>
+      </Panel>
+
+      <Panel title={`MEMBERS · ${members.length}`} className="grow" scroll
+        actions={memberErr ? <span className="login-error">▲ {memberErr}</span> : undefined}
+      >
+        <table className="fui-table">
+          <thead>
+            <tr><th>NAME</th><th>EMAIL</th><th>ROLE</th><th></th></tr>
+          </thead>
+          <tbody>
+            {members.map((m) => (
+              <tr key={m.userId}>
+                <td>{m.name}{m.userId === props.meId && <span className="dim"> · YOU</span>}</td>
+                <td className="dim">{m.email}</td>
+                <td>
+                  {m.role === "owner" || m.userId === props.meId ? (
+                    <span className={`role-badge r-${m.role}`}>{m.role.toUpperCase()}</span>
+                  ) : (
+                    <select value={m.role} onChange={(e) => setRole(m.userId, e.target.value as Role)}>
+                      {ASSIGNABLE_ROLES.map((r) => (
+                        <option key={r} value={r}>{r}</option>
+                      ))}
+                    </select>
+                  )}
+                </td>
+                <td>
+                  {m.role !== "owner" && m.userId !== props.meId && (
+                    <Chip tiny tone="danger" onClick={() => removeMember(m.userId, m.email)}>REMOVE</Chip>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="member-add">
+          <span className="tag-lo">ADD MEMBER</span>
+          <div className="ins-row">
+            <label className="ins-field"><span>Name</span>
+              <input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
+            </label>
+            <label className="ins-field"><span>Email</span>
+              <input type="email" value={draft.email} onChange={(e) => setDraft({ ...draft, email: e.target.value })} />
+            </label>
+            <label className="ins-field"><span>Password (8+)</span>
+              <input type="password" value={draft.password} onChange={(e) => setDraft({ ...draft, password: e.target.value })} />
+            </label>
+            <label className="ins-field"><span>Role</span>
+              <select value={draft.role} onChange={(e) => setDraft({ ...draft, role: e.target.value as Role })}>
+                {ASSIGNABLE_ROLES.map((r) => (
+                  <option key={r} value={r}>{r}</option>
+                ))}
+              </select>
+            </label>
+            <Chip tone="accent" onClick={addMember}>CREATE</Chip>
+          </div>
+          <p className="dim">
+            Roles gate the gateway (RBAC): <b>member</b> observes and chats, <b>builder</b> authors and
+            approves, <b>admin</b> manages members and branding, <b>owner</b> is fixed at setup.
           </p>
         </div>
       </Panel>

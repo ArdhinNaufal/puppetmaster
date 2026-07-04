@@ -1,16 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import {
   agentApi,
   api,
+  authApi,
+  prefsApi,
   type Agent,
   type Approval,
+  type Me,
   type Mission,
   type MissionStep,
+  type Role,
   type StepStatus,
   type Workflow,
 } from "./api.js";
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
+import { Login } from "./Login.js";
 import { AdminView, AgentsView, MissionsView, ToolsView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
@@ -18,6 +23,31 @@ import { NODE_META } from "./FlowNode.js";
 
 const VIEWS = ["command", "canvas", "missions", "agents", "tools", "admin"] as const;
 type View = (typeof VIEWS)[number];
+
+const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
+
+/** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
+const ROLE_VIEWS: Record<Role, View[]> = {
+  member: ["command", "missions", "agents", "tools"],
+  builder: ["command", "canvas", "missions", "agents", "tools"],
+  admin: [...VIEWS],
+  owner: [...VIEWS],
+};
+/** …and where each role lands after sign-in (role dashboards). */
+const ROLE_HOME: Record<Role, View> = {
+  member: "command",
+  builder: "canvas",
+  admin: "missions",
+  owner: "missions",
+};
+
+/** Arrangeable side panels: default layout per role; users override via ui_preferences. */
+const PANEL_PRESET: Record<Role, { order: string[]; collapsed: Record<string, boolean> }> = {
+  member: { order: ["list", "approvals"], collapsed: { approvals: true } },
+  builder: { order: ["list", "approvals"], collapsed: {} },
+  admin: { order: ["approvals", "list"], collapsed: {} },
+  owner: { order: ["approvals", "list"], collapsed: {} },
+};
 
 function applyBranding(ws: Workspace) {
   if (ws.branding?.accent) {
@@ -52,8 +82,34 @@ const STATUS_LABEL: Record<StepStatus, string> = {
   awaiting_approval: "GATE",
 };
 
+/** Auth gate: resolve the session, then render the shell for the signed-in user. */
 export function App() {
-  const [view, setView] = useState<View>("command");
+  const [me, setMe] = useState<Me | null | undefined>(undefined);
+
+  const resolve = useCallback(() => {
+    authApi.me().then(setMe).catch(() => setMe(null));
+  }, []);
+  useEffect(resolve, [resolve]);
+
+  if (me === undefined) {
+    return <div className="login-screen"><p className="dim">CONNECTING…</p></div>;
+  }
+  if (me === null) return <Login onAuthed={resolve} />;
+  return (
+    <Shell
+      key={me.user.id}
+      me={me}
+      onSignOut={async () => {
+        await authApi.logout();
+        setMe(null);
+      }}
+    />
+  );
+}
+
+function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
+  const canBuild = RANK[me.role] >= RANK.builder;
+  const [view, setView] = useState<View>(ROLE_HOME[me.role]);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -67,6 +123,11 @@ export function App() {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [missionsRefresh, setMissionsRefresh] = useState(0);
   const [info, setInfo] = useState<{ dbDriver: string; queue: string } | null>(null);
+
+  // Arrangeable panels persisted per user (ui_preferences).
+  const [panelOrder, setPanelOrder] = useState<string[]>(PANEL_PRESET[me.role].order);
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(PANEL_PRESET[me.role].collapsed);
+  const prefsReady = useRef(false);
 
   const trackedRef = useRef<string | null>(null);
   trackedRef.current = tracked;
@@ -95,7 +156,26 @@ export function App() {
     refreshWorkflows();
     refreshAgents();
     refreshApprovals();
+    prefsApi
+      .get()
+      .then(({ layout }) => {
+        if (layout.panels?.order?.length) setPanelOrder(layout.panels.order);
+        if (layout.panels?.collapsed) setCollapsed(layout.panels.collapsed);
+        prefsReady.current = true;
+      })
+      .catch(() => {
+        prefsReady.current = true;
+      });
   }, [refreshWorkflows, refreshAgents, refreshApprovals]);
+
+  // Debounced save of the panel arrangement, once initial prefs have loaded.
+  useEffect(() => {
+    if (!prefsReady.current) return;
+    const t = setTimeout(() => {
+      prefsApi.save({ panels: { order: panelOrder, collapsed } }).catch(() => {});
+    }, 400);
+    return () => clearTimeout(t);
+  }, [panelOrder, collapsed]);
 
   const { connected } = useEventStream(
     useCallback(
@@ -167,60 +247,48 @@ export function App() {
 
   const currentAgent = agents.find((a) => a.id === selectedAgent) ?? null;
 
-  return (
-    <div className="app">
-      <header className="rail">
-        <span className="brand">{workspace?.branding?.brandName || "PUPPETMASTER"}</span>
-        <nav className="view-switch">
-          {VIEWS.map((v) => (
-            <button key={v} className={`vs ${view === v ? "on" : ""}`} onClick={() => setView(v)}>
-              {v.toUpperCase()}
-            </button>
-          ))}
-        </nav>
-        <span className="rail-meta">
-          {info && <span className="tag-lo">DB {info.dbDriver.toUpperCase()} · Q {info.queue.toUpperCase()}</span>}
-          <span className={`status ${connected ? "ok" : "down"}`}>
-            {connected ? "BUS ONLINE" : "BUS OFFLINE"}
-          </span>
-        </span>
-      </header>
+  // --- Panel arrangement helpers -------------------------------------------------
+  const movePanel = (id: string, dir: -1 | 1) => {
+    setPanelOrder((order) => {
+      const idx = order.indexOf(id);
+      const to = idx + dir;
+      if (idx < 0 || to < 0 || to >= order.length) return order;
+      const next = [...order];
+      next.splice(idx, 1);
+      next.splice(to, 0, id);
+      return next;
+    });
+  };
+  const togglePanel = (id: string) => setCollapsed((c) => ({ ...c, [id]: !c[id] }));
 
-      <div className="grid">
-        <aside className="panel side">
-          {view === "command" && (
-            <>
-              <div className="panel-head">
-                <span>AGENTS</span>
-                <span className="head-actions">
-                  <button className="chip tiny" onClick={newAgent}>＋</button>
-                </span>
-              </div>
-              <ul className="wf-list">
-                {agents.length === 0 && <li className="muted pad">No agents yet.</li>}
-                {agents.map((a) => (
-                  <li key={a.id}>
-                    <button
-                      className={`wf-item ${selectedAgent === a.id ? "sel" : ""}`}
-                      onClick={() => setSelectedAgent(a.id)}
-                    >
-                      <span className="wf-name">◉ {a.name}</span>
-                      <span className="wf-ver">{a.model}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
-          {view === "canvas" && (
-            <>
-              <div className="panel-head">
-                <span>WORKFLOWS</span>
-                <span className="head-actions">
-                  <button className="chip tiny" onClick={newWorkflow}>＋</button>
-                  <button className="chip tiny" onClick={sampleWorkflow}>SAMPLE</button>
-                </span>
-              </div>
+  const panelControls = (id: string) => (
+    <span className="head-actions">
+      <button className="ph-btn" title="Move up" onClick={() => movePanel(id, -1)}>▲</button>
+      <button className="ph-btn" title="Move down" onClick={() => movePanel(id, 1)}>▼</button>
+      <button className="ph-btn" title={collapsed[id] ? "Expand" : "Collapse"} onClick={() => togglePanel(id)}>
+        {collapsed[id] ? "＋" : "－"}
+      </button>
+    </span>
+  );
+
+  const sections: Record<string, () => JSX.Element | null> = {
+    list: () => {
+      if (view === "canvas" && canBuild) {
+        return (
+          <section key="list">
+            <div className="panel-head">
+              <span>WORKFLOWS</span>
+              <span className="head-actions">
+                {!collapsed.list && (
+                  <>
+                    <button className="chip tiny" onClick={newWorkflow}>＋</button>
+                    <button className="chip tiny" onClick={sampleWorkflow}>SAMPLE</button>
+                  </>
+                )}
+                {panelControls("list")}
+              </span>
+            </div>
+            {!collapsed.list && (
               <ul className="wf-list">
                 {workflows.length === 0 && <li className="muted pad">No workflows yet.</li>}
                 {workflows.map((w) => (
@@ -232,30 +300,101 @@ export function App() {
                   </li>
                 ))}
               </ul>
-            </>
-          )}
-
+            )}
+          </section>
+        );
+      }
+      if (view !== "command") return null;
+      return (
+        <section key="list">
           <div className="panel-head">
-            <span>APPROVALS</span>
-            <span className="count">{approvals.length}</span>
+            <span>AGENTS</span>
+            <span className="head-actions">
+              {canBuild && !collapsed.list && <button className="chip tiny" onClick={newAgent}>＋</button>}
+              {panelControls("list")}
+            </span>
           </div>
+          {!collapsed.list && (
+            <ul className="wf-list">
+              {agents.length === 0 && <li className="muted pad">No agents yet.</li>}
+              {agents.map((a) => (
+                <li key={a.id}>
+                  <button
+                    className={`wf-item ${selectedAgent === a.id ? "sel" : ""}`}
+                    onClick={() => setSelectedAgent(a.id)}
+                  >
+                    <span className="wf-name">◉ {a.name}</span>
+                    <span className="wf-ver">{a.model}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      );
+    },
+    approvals: () => (
+      <section key="approvals">
+        <div className="panel-head">
+          <span>APPROVALS</span>
+          <span className="head-actions">
+            <span className="count">{approvals.length}</span>
+            {panelControls("approvals")}
+          </span>
+        </div>
+        {!collapsed.approvals && (
           <ul className="appr-list">
             {approvals.length === 0 && <li className="muted">Inbox clear.</li>}
             {approvals.map((a) => (
               <li key={a.id} className="appr">
                 <div className="appr-prompt">{a.prompt}</div>
-                <div className="appr-actions">
-                  <button className="chip accent tiny" onClick={() => decide(a.id, true)}>APPROVE</button>
-                  <button className="chip danger tiny" onClick={() => decide(a.id, false)}>REJECT</button>
-                </div>
+                {canBuild ? (
+                  <div className="appr-actions">
+                    <button className="chip accent tiny" onClick={() => decide(a.id, true)}>APPROVE</button>
+                    <button className="chip danger tiny" onClick={() => decide(a.id, false)}>REJECT</button>
+                  </div>
+                ) : (
+                  <div className="appr-actions"><span className="tag-lo">BUILDER+ ONLY</span></div>
+                )}
               </li>
             ))}
           </ul>
+        )}
+      </section>
+    ),
+  };
+
+  return (
+    <div className="app">
+      <header className="rail">
+        <span className="brand">{workspace?.branding?.brandName || "PUPPETMASTER"}</span>
+        <nav className="view-switch">
+          {ROLE_VIEWS[me.role].map((v) => (
+            <button key={v} className={`vs ${view === v ? "on" : ""}`} onClick={() => setView(v)}>
+              {v.toUpperCase()}
+            </button>
+          ))}
+        </nav>
+        <span className="rail-meta">
+          {info && <span className="tag-lo">DB {info.dbDriver.toUpperCase()} · Q {info.queue.toUpperCase()}</span>}
+          <span className={`status ${connected ? "ok" : "down"}`}>
+            {connected ? "BUS ONLINE" : "BUS OFFLINE"}
+          </span>
+          <span className="user-chip" title={me.user.email}>
+            {me.user.name.toUpperCase()} · {me.role.toUpperCase()}
+          </span>
+          <button className="chip tiny" onClick={onSignOut}>SIGN OUT</button>
+        </span>
+      </header>
+
+      <div className={`grid ${collapsed.trace ? "no-trace" : ""}`}>
+        <aside className="panel side">
+          {panelOrder.map((id) => sections[id]?.() ?? null)}
         </aside>
 
         <main className="panel canvas-panel">
           {view === "command" && <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} />}
-          {view === "canvas" && (
+          {view === "canvas" && canBuild && (
             <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
           )}
           {view === "missions" && (
@@ -263,6 +402,7 @@ export function App() {
           )}
           {view === "agents" && (
             <AgentsView
+              readOnly={!canBuild}
               onOpenChat={(id) => {
                 setSelectedAgent(id);
                 setView("command");
@@ -270,8 +410,9 @@ export function App() {
             />
           )}
           {view === "tools" && <ToolsView />}
-          {view === "admin" && (
+          {view === "admin" && RANK[me.role] >= RANK.admin && (
             <AdminView
+              meId={me.user.id}
               onBrandingChange={(ws) => {
                 setWorkspace(ws);
                 applyBranding(ws);
@@ -282,55 +423,66 @@ export function App() {
 
         <aside className="panel trace">
           <div className="panel-head">
-            <span>MISSION TRACE</span>
-            {mission && <span className={`mstatus st-${mission.status}`}>{mission.status.toUpperCase()}</span>}
-          </div>
-          {mission?.parentMissionId && (
-            <button className="chip tiny parent-chip" onClick={() => track(mission.parentMissionId!)}>
-              ↑ NESTED · VIEW PARENT MISSION
-            </button>
-          )}
-          {!mission && <p className="muted pad">Run a workflow to see its live trace.</p>}
-          {mission && (
-            <>
-              {(() => {
-                const t = steps.reduce(
-                  (acc, s) => {
-                    const u = (s.output as { usage?: { inputTokens?: number; outputTokens?: number } } | null)?.usage;
-                    if (u) {
-                      acc.in += u.inputTokens ?? 0;
-                      acc.out += u.outputTokens ?? 0;
-                    }
-                    return acc;
-                  },
-                  { in: 0, out: 0 },
-                );
-                return t.in + t.out > 0 ? (
-                  <div className="trace-cost tag-lo">COST · {t.in} TOK IN · {t.out} TOK OUT</div>
-                ) : null;
-              })()}
-              <ul className="step-list">
-                {steps.map((s) => (
-                  <li key={s.id} className={`step st-${s.status}`}>
-                    <span className="step-dot" />
-                    <span className="step-node">
-                      {NODE_META[s.kind]?.glyph} {s.nodeId}
-                    </span>
-                    <span className="step-status">{STATUS_LABEL[s.status]}</span>
-                  </li>
-                ))}
-              </ul>
-              {mission.output !== null && mission.output !== undefined && (
-                <div className="mission-output">
-                  <span className="tag-lo">OUTPUT</span>
-                  <pre>{JSON.stringify(mission.output, null, 2)}</pre>
-                </div>
+            <span>{collapsed.trace ? "TRACE" : "MISSION TRACE"}</span>
+            <span className="head-actions">
+              {mission && !collapsed.trace && (
+                <span className={`mstatus st-${mission.status}`}>{mission.status.toUpperCase()}</span>
               )}
-              {mission.error && (
-                <div className="mission-output err">
-                  <span className="tag-lo">ERROR</span>
-                  <pre>{mission.error}</pre>
-                </div>
+              <button className="ph-btn" title={collapsed.trace ? "Expand" : "Collapse"} onClick={() => togglePanel("trace")}>
+                {collapsed.trace ? "＋" : "－"}
+              </button>
+            </span>
+          </div>
+          {!collapsed.trace && (
+            <>
+              {mission?.parentMissionId && (
+                <button className="chip tiny parent-chip" onClick={() => track(mission.parentMissionId!)}>
+                  ↑ NESTED · VIEW PARENT MISSION
+                </button>
+              )}
+              {!mission && <p className="muted pad">Run a workflow to see its live trace.</p>}
+              {mission && (
+                <>
+                  {(() => {
+                    const t = steps.reduce(
+                      (acc, s) => {
+                        const u = (s.output as { usage?: { inputTokens?: number; outputTokens?: number } } | null)?.usage;
+                        if (u) {
+                          acc.in += u.inputTokens ?? 0;
+                          acc.out += u.outputTokens ?? 0;
+                        }
+                        return acc;
+                      },
+                      { in: 0, out: 0 },
+                    );
+                    return t.in + t.out > 0 ? (
+                      <div className="trace-cost tag-lo">COST · {t.in} TOK IN · {t.out} TOK OUT</div>
+                    ) : null;
+                  })()}
+                  <ul className="step-list">
+                    {steps.map((s) => (
+                      <li key={s.id} className={`step st-${s.status}`}>
+                        <span className="step-dot" />
+                        <span className="step-node">
+                          {NODE_META[s.kind]?.glyph} {s.nodeId}
+                        </span>
+                        <span className="step-status">{STATUS_LABEL[s.status]}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  {mission.output !== null && mission.output !== undefined && (
+                    <div className="mission-output">
+                      <span className="tag-lo">OUTPUT</span>
+                      <pre>{JSON.stringify(mission.output, null, 2)}</pre>
+                    </div>
+                  )}
+                  {mission.error && (
+                    <div className="mission-output err">
+                      <span className="tag-lo">ERROR</span>
+                      <pre>{mission.error}</pre>
+                    </div>
+                  )}
+                </>
               )}
             </>
           )}

@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.0.2",
     "@fastify/websocket": "^11.0.0",
     "@puppetmaster/db": "workspace:*",
     "@puppetmaster/kernel": "workspace:*",

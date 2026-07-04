@@ -132,6 +132,36 @@ const DDL: string[] = [
      content text NOT NULL,
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `CREATE TABLE IF NOT EXISTS users (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     email text NOT NULL UNIQUE,
+     name text NOT NULL,
+     password_hash text NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     token text NOT NULL UNIQUE,
+     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     expires_at timestamptz NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS memberships (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     role text NOT NULL DEFAULT 'member',
+     created_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (user_id, workspace_id)
+   )`,
+  `CREATE TABLE IF NOT EXISTS ui_preferences (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     layout jsonb NOT NULL DEFAULT '{}',
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (user_id, workspace_id)
+   )`,
   // pgvector column for semantic memory; separate statement so the rest of the
   // schema still applies when the vector extension is unavailable.
   `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS embedding vector(1024)`,

@@ -450,3 +450,62 @@ button { font-family: inherit; cursor: pointer; }
   .step.st-running .step-dot, .fnode.st-running .fnode-dot { animation: pulse 1.2s ease-in-out infinite; }
   @keyframes pulse { 50% { opacity: 0.5; } }
 }
+
+/* ---- Auth (login/setup gate) ------------------------------------------- */
+.login-screen {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(ellipse at 30% 20%, rgba(53, 208, 224, 0.05), transparent 55%),
+    var(--bg-void, #05080a);
+}
+.login-box { width: min(380px, 92vw); }
+.login-brand {
+  text-align: center;
+  font-size: 0.9rem;
+  letter-spacing: 0.5em;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+.login-form { display: flex; flex-direction: column; gap: 0.8rem; padding: 1rem; }
+.login-error { color: var(--danger); font-size: 0.68rem; letter-spacing: 0.08em; }
+.login-submit { justify-content: center; padding: 0.55rem; }
+
+.user-chip {
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;
+  color: var(--text-lo);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  padding: 0.25rem 0.5rem;
+}
+
+/* ---- Arrangeable panels (ui_preferences) -------------------------------- */
+.ph-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-lo);
+  font-size: 0.55rem;
+  cursor: pointer;
+  padding: 0.1rem 0.25rem;
+  border-radius: var(--radius);
+}
+.ph-btn:hover { color: var(--accent); border-color: var(--stroke); }
+.head-actions { align-items: center; }
+.grid.no-trace { grid-template-columns: 240px 1fr 150px; }
+
+/* ---- Members (Admin) ----------------------------------------------------- */
+.member-add { padding: 0.8rem 0.7rem; border-top: 1px solid var(--stroke); display: flex; flex-direction: column; gap: 0.6rem; }
+.member-add .ins-row { align-items: flex-end; }
+.role-badge {
+  font-size: 0.58rem;
+  letter-spacing: 0.14em;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  padding: 0.15rem 0.4rem;
+  color: var(--text-lo);
+}
+.role-badge.r-owner { color: var(--warn); border-color: var(--warn); }
+.inspector-grid.readonly { opacity: 0.75; pointer-events: none; }

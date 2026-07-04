@@ -71,8 +71,17 @@ export interface Approval {
   createdAt: string;
 }
 
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
 async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? res.statusText);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -174,6 +183,65 @@ export const agentApi = {
     }).then(json<{ missionId: string }>),
   messages: (id: string) => fetch(`/api/agents/${id}/messages`).then(json<AgentMessage[]>),
   memories: (id: string) => fetch(`/api/agents/${id}/memories`).then(json<AgentMemory[]>),
+};
+
+/* ------------------------------------------------------------ Auth / members */
+
+export type Role = "owner" | "admin" | "builder" | "member";
+
+export interface Me {
+  user: { id: string; email: string; name: string };
+  role: Role;
+  workspaceId: string;
+}
+export interface MemberRow {
+  userId: string;
+  email: string;
+  name: string;
+  role: Role;
+  createdAt: string;
+}
+
+/** Per-user layout persisted in ui_preferences (ARCHITECTURE.md §4). */
+export interface PanelLayout {
+  order?: string[];
+  collapsed?: Record<string, boolean>;
+}
+
+const post = (url: string, body: unknown) =>
+  fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+export const authApi = {
+  status: () => fetch("/api/auth/status").then(json<{ needsSetup: boolean }>),
+  setup: (input: { email: string; name: string; password: string }) =>
+    post("/api/auth/setup", input).then(json<{ user: Me["user"]; role: Role }>),
+  login: (email: string, password: string) =>
+    post("/api/auth/login", { email, password }).then(json<{ user: Me["user"]; role: Role }>),
+  logout: () => post("/api/auth/logout", {}).then(() => undefined).catch(() => undefined),
+  me: () => fetch("/api/auth/me").then(json<Me>),
+};
+
+export const memberApi = {
+  list: () => fetch("/api/members").then(json<MemberRow[]>),
+  create: (input: { email: string; name: string; password: string; role: Role }) =>
+    post("/api/members", input).then(json<MemberRow>),
+  setRole: (userId: string, role: Role) =>
+    fetch(`/api/members/${userId}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ role }),
+    }).then(json<{ userId: string; role: Role }>),
+  remove: (userId: string) => fetch(`/api/members/${userId}`, { method: "DELETE" }),
+};
+
+export const prefsApi = {
+  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout } }>),
+  save: (layout: { panels?: PanelLayout }) =>
+    fetch("/api/me/preferences", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ layout }),
+    }).then(json<{ layout: { panels?: PanelLayout } }>),
 };
 
 export type BusEvent =

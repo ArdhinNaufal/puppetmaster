@@ -47,6 +47,7 @@ import {
   type WorkflowRunner,
 } from "@puppetmaster/kernel";
 import { utilsServerPath } from "@puppetmaster/mcp-connectors";
+import { registerAuth } from "./auth.js";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -139,6 +140,10 @@ for (const agent of await listAgents(db, workspaceId)) {
 }
 
 await app.register(websocket);
+
+// --- Auth + RBAC gateway (ARCHITECTURE.md §6) ---------------------------------
+// Must come before route definitions so the session/RBAC hook attaches to them.
+await registerAuth(app, { db, workspaceId });
 
 // --- Meta --------------------------------------------------------------------
 app.get("/api/health", async () => ({ ok: true, service: "puppetmaster-server", version: "0.0.1" }));

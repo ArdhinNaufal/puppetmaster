@@ -110,6 +110,22 @@ pnpm --filter @puppetmaster/web dev
 Open http://localhost:3000 — it proxies `/api` and the `/api/events` WebSocket to
 `localhost:4000`.
 
+### 6. First run — create the owner account
+
+The first visit to http://localhost:3000 shows the **FIRST RUN · CREATE OWNER** screen
+(no accounts exist yet). Enter a name, email, and a password of 8+ characters — this
+account becomes the workspace **owner**. Afterwards the same screen is a normal sign-in.
+
+Sessions are HttpOnly-cookie based and live 30 days. Additional users are created from the
+**ADMIN** view (owner/admin only) with a role per member:
+
+| Role      | Can do |
+| --------- | ------ |
+| `member`  | Observe everything (missions, agents, tools) and chat with agents |
+| `builder` | + author/run workflows, manage agents, resolve approvals |
+| `admin`   | + manage members and workspace branding |
+| `owner`   | Everything; fixed at first-run setup, cannot be demoted or removed |
+
 ## Verifying the install
 
 1. Open the web app, click **SAMPLE** to create the bundled example workflow.

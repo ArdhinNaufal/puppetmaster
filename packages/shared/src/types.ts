@@ -4,6 +4,13 @@ import { z } from "zod";
 export const AutonomyTier = z.enum(["read_auto", "write_approved", "destructive_confirmed"]);
 export type AutonomyTier = z.infer<typeof AutonomyTier>;
 
+/** Workspace membership roles — see docs/PRD.md §MVP (owner / admin / builder / member). */
+export const Role = z.enum(["owner", "admin", "builder", "member"]);
+export type Role = z.infer<typeof Role>;
+
+/** Ordering used by the RBAC gateway: a route guarded at `builder` admits builder and above. */
+export const ROLE_RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
+
 export const AgentDefinition = z.object({
   id: z.string().uuid(),
   workspaceId: z.string().uuid(),

@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M4 core complete
+**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M4 complete (incl. auth/RBAC)
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -56,12 +56,42 @@ decisions; this file only captures state and next steps.
 
 1. Owner review of M1–M4 on `claude/kickoff-prompt-continuation-cy021r` (manual review
    pending).
-2. **Remaining M4 items (deferred, need auth first)**: session auth + users/memberships +
-   RBAC at the gateway (ARCHITECTURE.md §6), then role-based dashboards and per-user
-   arrangeable panel layouts (`ui_preferences`). Branding is done; the layout engine and
-   role presets should build on the `packages/ui` Panel primitives.
-3. **M5 — ecosystem**: templates/marketplace, RAG pipeline (pgvector column is ready),
+2. **M5 — ecosystem**: templates/marketplace, RAG pipeline (pgvector column is ready),
    adaptive UI, Tauri desktop.
+3. Security hardening candidates (later): per-webhook signing secrets (`/api/hooks/:id` is
+   deliberately public), OIDC (ARCHITECTURE.md §6 "later"), append-only audit log surface.
+
+### M4b — auth, members & RBAC (verified in the browser)
+
+- **DB**: `users`, `sessions`, `memberships(role)`, `ui_preferences` tables + repos
+  (`packages/db/src/auth-repo.ts`). Roles locked from PRD: **owner / admin / builder /
+  member** (`Role` + `ROLE_RANK` in `@puppetmaster/shared`).
+- **Session auth** (`apps/server/src/auth.ts`): scrypt password hashes (node:crypto, no new
+  deps), opaque tokens in an HttpOnly `pm_session` cookie (30-day TTL), login/logout/me.
+  First-run flow: `GET /api/auth/status` → `POST /api/auth/setup` creates the founding
+  **owner** (only while zero users exist; 409 afterwards).
+- **RBAC at the gateway** (ARCHITECTURE.md §6): one `onRequest` hook resolves the session
+  and enforces a central method+path policy for every `/api` route including the WS
+  upgrade. Public allowlist: health, auth handshake, `/api/hooks/:id` (webhooks).
+  member = read + agent chat · builder = + workflow/agent mutations + approvals ·
+  admin = + members + workspace branding · owner = fixed at setup (cannot be demoted,
+  removed, or re-granted). Members CRUD: `GET/POST /api/members`, `PUT/DELETE
+  /api/members/:userId` (self-role-change and owner-change rejected).
+- **Web**: FUI login/setup gate (`Login.tsx`), auth-gated shell, user chip + sign-out in
+  the rail. **Role dashboards**: nav filtered per role (member has no CANVAS/ADMIN) and a
+  per-role home view (member→Command, builder→Canvas, admin/owner→Missions); mutating
+  controls (new agent/workflow, approve/reject, agent inspector) hidden or read-only below
+  builder. **Admin view** gained the members roster: add member (email/password/role),
+  inline role select, remove.
+- **Arrangeable panels**: sidebar sections (agents/workflows list, approvals) reorder via
+  ▲▼ and collapse via −/＋; mission-trace panel collapses. Layout persists per user in
+  `ui_preferences` (debounced `PUT /api/me/preferences`), with per-role presets as the
+  default (e.g. member starts with approvals collapsed).
+- **Verified** (API + Playwright, real Redis + PGlite): full matrix — first-run owner
+  setup; 401 unauthenticated; member 403 on workflow create/workspace PUT/members;
+  builder creates+runs the gated sample workflow and approves it; admin adds/re-roles/
+  removes members; owner immutability; logout revokes the session; panel rearrangement
+  survives reload; webhook stays public.
 
 ### M4 — FUI shell core (verified in the browser)
 
