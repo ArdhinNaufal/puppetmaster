@@ -43,6 +43,8 @@ export interface WorkflowVersion {
 }
 export interface Mission {
   id: string;
+  kind: string;
+  parentMissionId: string | null;
   status: string;
   output: unknown;
   error: string | null;

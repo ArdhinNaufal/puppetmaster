@@ -84,6 +84,14 @@ export const ApprovalConfig = z.object({
 });
 export type ApprovalConfig = z.infer<typeof ApprovalConfig>;
 
+/** Agent node (the bridge, workflow → agent): send a task, await the result. */
+export const AgentNodeConfig = z.object({
+  agentId: z.string().min(1),
+  /** Task template; `{{input}}` interpolates the upstream node output. */
+  message: z.string().default("{{input}}"),
+});
+export type AgentNodeConfig = z.infer<typeof AgentNodeConfig>;
+
 /** The full editable graph carried by a workflow version. */
 export const WorkflowGraph = z.object({
   nodes: z.array(WorkflowNode),

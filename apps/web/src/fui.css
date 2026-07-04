@@ -316,6 +316,7 @@ button { font-family: inherit; cursor: pointer; }
 
 /* ---- Trace ------------------------------------------------------------- */
 .trace { overflow-y: auto; }
+.parent-chip { margin: 0.5rem 0.7rem 0; color: var(--accent); }
 .mstatus { font-size: 0.6rem; letter-spacing: 0.12em; }
 .mstatus.st-succeeded { color: var(--ok); }
 .mstatus.st-failed { color: var(--danger); }

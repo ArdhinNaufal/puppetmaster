@@ -1,21 +1,20 @@
 {
-  "name": "@puppetmaster/kernel",
+  "name": "@puppetmaster/mcp-connectors",
   "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "puppetmaster-mcp-utils": "dist/utils-server.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.110.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@puppetmaster/db": "workspace:*",
-    "@puppetmaster/shared": "workspace:*",
-    "bullmq": "^5.34.0",
-    "ioredis": "^5.4.2"
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.0",

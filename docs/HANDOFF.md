@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M2 complete
+**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M3 complete
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -54,13 +54,41 @@ decisions; this file only captures state and next steps.
 
 ## 3. Next steps (roadmap)
 
-1. Owner review of M1 + M2 on `claude/kickoff-prompt-continuation-cy021r` (manual review pending).
-2. **M3 — the bridge** (ARCHITECTURE.md §3.3): expose workflows to agents as tools
-   (`workflow.run`, `workflow.create_draft`), make the workflow `agent` node (currently a
-   passthrough stub in the executor) send a task to an agent and await its result, nest
-   mission traces via `parent_mission_id` (column already exists), and replace the built-in
-   tool registry's demo connectors with real MCP servers behind the same `callTool` surface.
-3. M4 FUI shell → M5 ecosystem (see ARCHITECTURE.md §8).
+1. Owner review of M1 + M2 + M3 on `claude/kickoff-prompt-continuation-cy021r` (manual
+   review pending).
+2. **M4 — FUI shell** (ARCHITECTURE.md §5, DESIGN-LANGUAGE.md): full design system in
+   `packages/ui` (Panel with corner brackets/title rail, telemetry stat, mission timeline,
+   agent card, live log stream), Missions view (list + nested trace navigation — the trace
+   panel already links child → parent), Agents view (roster + memory inspector), Tools view
+   (MCP catalog), role dashboards + arrangeable panels + branding, auth/RBAC (§6).
+3. M5 ecosystem: templates/marketplace, RAG pipeline, adaptive UI, Tauri desktop.
+
+### M3 — the bridge (verified end-to-end)
+
+- **Workflow → agent** (`packages/kernel/src/bridge-tools.ts` + executor): the `agent` node
+  is real — `AgentNodeConfig {agentId, message}` with `{{input}}` templating; the executor's
+  injected `AgentInvoker` runs the agent tick as a child mission (`parent_mission_id` set)
+  and awaits its result, polling through approval pauses until the node's `timeoutMs`
+  (sync-with-timeout mode from §3.3).
+- **Agent → workflow**: `workflow.list` / `workflow.run` / `workflow.create_draft` join the
+  shared tool catalog. `workflow.run` accepts id or exact name, runs the child workflow
+  mission with the agent's mission as parent, and returns `{missionId, status, output}`.
+  `create_draft` is write-tier (pauses for approval); `run` is read-tier — gating lives on
+  the workflow's own approval nodes.
+- **MCP tool layer** (`packages/kernel/src/mcp.ts` + `packages/mcp-connectors`, new):
+  `connectMcpServer` speaks MCP over stdio (official `@modelcontextprotocol/sdk`), merging
+  server tools into the same catalog (`<name>.<tool>`, per-server autonomy tier). A bundled
+  first-party connector (`puppetmaster-mcp-utils`: upper/word_count/uuid) is registered by
+  default; configure more via `MCP_SERVERS` JSON env (disable bundled with
+  `MCP_DISABLE_BUNDLED=1`).
+- **Shared tool grants**: `agents.tool_grants` (e.g. `["util.echo","workflow.*"]`) filters
+  the tools advertised to the model **and** is enforced at execution. Empty = full catalog.
+- **Web**: agent node default config on the canvas; mission trace shows a "view parent
+  mission" chip on nested missions.
+- **Verified** (API + browser, real Redis + PGlite): agent called `mcputil.upper` via MCP;
+  agent ran the "Doubler" workflow via `workflow.run` (child mission nested, output
+  propagated); a workflow with an agent node ran green from the canvas (child agent mission
+  nested); a grants-restricted agent was refused an ungranted tool at execution.
 
 ### M2 — agent runtime (verified end-to-end)
 

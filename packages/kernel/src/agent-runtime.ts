@@ -134,7 +134,7 @@ export class AgentRuntime {
       let isError = false;
       if (approved) {
         try {
-          result = await this.executeTool(agent.id, pending.name, pending.args);
+          result = await this.executeTool(agent.id, missionId, pending.name, pending.args);
         } catch (err) {
           result = { error: err instanceof Error ? err.message : String(err) };
           isError = true;
@@ -164,13 +164,24 @@ export class AgentRuntime {
       const memories = await searchMemories(this.db, agent.id, firstWords(lastUserText), 5);
       const system = buildSystemPrompt(agent, memories.map((m) => m.content));
 
+      // Shared tool catalog filtered by this agent's grants (ARCHITECTURE.md
+      // §3.4): empty grants = full catalog; entries like "util.echo" or
+      // "workflow.*" restrict it. Runtime memory/scratchpad tools always apply.
+      const grants = Array.isArray(agent.toolGrants) ? (agent.toolGrants as string[]) : [];
+      const granted = (server: string, tool: string) =>
+        grants.length === 0 ||
+        grants.includes(`${server}.${tool}`) ||
+        grants.includes(`${server}.*`);
       const toolDefs: ChatToolDef[] = [
         ...RUNTIME_TOOLS,
-        ...this.tools.list().map((t) => ({
-          name: `${t.server}__${t.tool}`,
-          description: `${t.description} (autonomy tier: ${t.tier})`,
-          inputSchema: t.inputSchema,
-        })),
+        ...this.tools
+          .list()
+          .filter((t) => granted(t.server, t.tool))
+          .map((t) => ({
+            name: `${t.server}__${t.tool}`,
+            description: `${t.description} (autonomy tier: ${t.tier})`,
+            inputSchema: t.inputSchema,
+          })),
       ];
 
       const modelStep = await insertStep(this.db, {
@@ -281,7 +292,7 @@ export class AgentRuntime {
         let result: unknown;
         let isError = false;
         try {
-          result = await this.executeTool(agent.id, call.name, call.args);
+          result = await this.executeTool(agent.id, missionId, call.name, call.args);
         } catch (err) {
           result = { error: err instanceof Error ? err.message : String(err) };
           isError = true;
@@ -310,6 +321,7 @@ export class AgentRuntime {
 
   private async executeTool(
     agentId: string,
+    missionId: string,
     toolName: string,
     args: Record<string, unknown>,
   ): Promise<unknown> {
@@ -330,7 +342,13 @@ export class AgentRuntime {
     }
     const [server, tool] = toolName.split("__");
     if (!server || !tool) throw new Error(`malformed tool name: ${toolName}`);
-    return this.tools.callTool(server, tool, args, { input: null, agentId });
+    // Enforce grants at execution too, not just when advertising tools.
+    const agent = await getAgent(this.db, agentId);
+    const grants = Array.isArray(agent?.toolGrants) ? (agent!.toolGrants as string[]) : [];
+    if (grants.length > 0 && !grants.includes(`${server}.${tool}`) && !grants.includes(`${server}.*`)) {
+      throw new Error(`tool ${server}.${tool} is not granted to this agent`);
+    }
+    return this.tools.callTool(server, tool, args, { input: null, agentId, missionId });
   }
 
   private async recordToolStep(

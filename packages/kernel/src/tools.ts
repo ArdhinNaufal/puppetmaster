@@ -11,6 +11,8 @@ export interface ToolContext {
   input: unknown;
   /** Set when the caller is an agent tick rather than a workflow node. */
   agentId?: string;
+  /** The calling mission — child missions launched by bridge tools nest under it. */
+  missionId?: string;
 }
 
 export type ToolFn = (args: Record<string, unknown>, ctx: ToolContext) => Promise<unknown>;

@@ -12,6 +12,7 @@
     "@fastify/websocket": "^11.0.0",
     "@puppetmaster/db": "workspace:*",
     "@puppetmaster/kernel": "workspace:*",
+    "@puppetmaster/mcp-connectors": "workspace:*",
     "@puppetmaster/shared": "workspace:*",
     "fastify": "^5.2.0"
   },

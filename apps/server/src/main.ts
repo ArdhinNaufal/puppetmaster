@@ -27,18 +27,24 @@ import {
 import {
   AgentRuntime,
   BuiltinToolRegistry,
+  connectMcpServer,
+  createAgentInvoker,
   InlineRunner,
   InMemoryEventBus,
   ModelRouter,
+  parseMcpServersEnv,
   QueueRunner,
   RedisEventBus,
+  registerBridgeTools,
   startAgentTick,
   startWorkflow,
   WorkflowExecutor,
   type EventBus,
+  type McpConnection,
   type MissionDispatcher,
   type WorkflowRunner,
 } from "@puppetmaster/kernel";
+import { utilsServerPath } from "@puppetmaster/mcp-connectors";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -62,6 +68,29 @@ const router = new ModelRouter({
 });
 const executor = new WorkflowExecutor({ db, bus, tools });
 const agentRuntime = new AgentRuntime({ db, bus, router, tools });
+
+// --- The bridge (ARCHITECTURE.md §3.3) ----------------------------------------
+// Workflow → agent: agent nodes dispatch a task and await the child mission.
+executor.setAgentInvoker(createAgentInvoker({ db, runtime: agentRuntime }));
+// Agent → workflow: workflows join the shared tool catalog (workflow.list/run/create_draft).
+registerBridgeTools(tools, { db, workspaceId, executor });
+
+// --- Tool layer: MCP servers (ARCHITECTURE.md §3.4) ---------------------------
+// Bundled utils connector by default; extend/override via MCP_SERVERS JSON.
+const mcpConfigs = parseMcpServersEnv(process.env.MCP_SERVERS);
+if (mcpConfigs.length === 0 && process.env.MCP_DISABLE_BUNDLED !== "1") {
+  mcpConfigs.push({ name: "mcputil", command: process.execPath, args: [utilsServerPath] });
+}
+const mcpConnections: McpConnection[] = [];
+for (const cfg of mcpConfigs) {
+  try {
+    const conn = await connectMcpServer(tools, cfg);
+    mcpConnections.push(conn);
+    app.log.info({ server: cfg.name, tools: conn.toolCount }, "mcp server connected");
+  } catch (err) {
+    app.log.error({ server: cfg.name, err }, "mcp server failed to connect");
+  }
+}
 
 /** Route a mission to the right executor based on its kind. */
 const dispatch: MissionDispatcher = async (missionId) => {
@@ -197,6 +226,7 @@ app.post("/api/agents", async (req, reply) => {
     model?: string;
     autonomy?: string;
     schedule?: string | null;
+    toolGrants?: string[];
   };
   if (!body.name?.trim()) return reply.code(400).send({ error: "name is required" });
   const agent = await createAgent(db, {
@@ -206,6 +236,7 @@ app.post("/api/agents", async (req, reply) => {
     model: body.model ?? "mock",
     autonomy: body.autonomy,
     schedule: body.schedule ?? null,
+    toolGrants: Array.isArray(body.toolGrants) ? body.toolGrants : undefined,
   });
   if (agent.schedule) await scheduleAgentCron(agent.id, agent.schedule);
   return reply.code(201).send(agent);
@@ -224,7 +255,7 @@ app.put("/api/agents/:id", async (req, reply) => {
   if (!agent) return reply.code(404).send({ error: "agent not found" });
   const body = (req.body ?? {}) as Record<string, unknown>;
   const patch: Record<string, unknown> = {};
-  for (const key of ["name", "persona", "model", "autonomy", "schedule"]) {
+  for (const key of ["name", "persona", "model", "autonomy", "schedule", "toolGrants"]) {
     if (key in body) patch[key] = body[key];
   }
   await updateAgent(db, id, patch);
@@ -319,6 +350,7 @@ app.get("/api/events", { websocket: true }, (socket) => {
 async function shutdown() {
   app.log.info("shutting down");
   await runner.close();
+  for (const conn of mcpConnections) await conn.close().catch(() => {});
   await bus.close?.();
   await handle.close();
   await app.close();

@@ -248,6 +248,11 @@ export function App() {
             <span>MISSION TRACE</span>
             {mission && <span className={`mstatus st-${mission.status}`}>{mission.status.toUpperCase()}</span>}
           </div>
+          {mission?.parentMissionId && (
+            <button className="chip tiny parent-chip" onClick={() => track(mission.parentMissionId!)}>
+              ↑ NESTED · VIEW PARENT MISSION
+            </button>
+          )}
           {!mission && <p className="muted pad">Run a workflow to see its live trace.</p>}
           {mission && (
             <>

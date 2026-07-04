@@ -70,6 +70,8 @@ them in your shell or prefix the run command:
 | `ANTHROPIC_API_KEY` | *(unset)*          | enables agents on `claude-*` models                     |
 | `OPENAI_BASE_URL` / `OPENAI_API_KEY` | *(unset)* | enables `openai/<model>` agents (or any OpenAI-compatible runtime, e.g. vLLM) |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | used by `ollama/<model>` agents                     |
+| `MCP_SERVERS` | *(unset → bundled utils connector)* | JSON array of MCP servers to spawn over stdio, e.g. `[{"name":"gh","command":"npx","args":["-y","@modelcontextprotocol/server-github"],"tier":"write_approved"}]` |
+| `MCP_DISABLE_BUNDLED` | *(unset)* | set to `1` to skip the bundled demo MCP connector      |
 
 Without any provider keys, agents on the `mock` model still work — a scripted provider used
 for demos and tests.

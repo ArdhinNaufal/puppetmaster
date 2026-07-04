@@ -23,7 +23,7 @@ const DEFAULT_CONFIG: Record<NodeKind, Record<string, unknown>> = {
   action: { server: "util", tool: "echo", args: { value: "hello" } },
   logic: { op: "passthrough" },
   code: { source: "return input;" },
-  agent: {},
+  agent: { agentId: "", message: "{{input}}" },
   approval: { prompt: "Approve this step?" },
 };
 

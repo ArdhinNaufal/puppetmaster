@@ -1,6 +1,7 @@
 import vm from "node:vm";
 import {
   ActionConfig,
+  AgentNodeConfig,
   ApprovalConfig,
   CodeConfig,
   LogicConfig,
@@ -72,6 +73,14 @@ function topoSort(nodes: WorkflowNode[], edges: { from: string; to: string }[]):
   return order;
 }
 
+/** Bridge (workflow → agent): dispatch a task to an agent and await its result.
+ *  Wired by the host after both engines exist, to avoid a construction cycle. */
+export type AgentInvoker = (input: {
+  agentId: string;
+  message: string;
+  parentMissionId: string;
+}) => Promise<{ missionId: string; status: MissionStatus; output: unknown }>;
+
 export interface ExecutorDeps {
   db: Db;
   bus: EventBus;
@@ -88,11 +97,17 @@ export class WorkflowExecutor {
   private readonly db: Db;
   private readonly bus: EventBus;
   private readonly tools: ToolRegistry;
+  private agentInvoker: AgentInvoker | null = null;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
     this.bus = deps.bus;
     this.tools = deps.tools ?? new BuiltinToolRegistry();
+  }
+
+  /** Wire the workflow → agent bridge (docs/ARCHITECTURE.md §3.3). */
+  setAgentInvoker(invoker: AgentInvoker): void {
+    this.agentInvoker = invoker;
   }
 
   async runMission(missionId: string): Promise<MissionStatus> {
@@ -204,7 +219,7 @@ export class WorkflowExecutor {
         await this.recordStep(missionId, node, "running", attempt, nodeInput ?? null, null, null, stepIdByNode);
         try {
           output = await withTimeout(
-            this.executeNode(node, nodeInput, outputs),
+            this.executeNode(node, nodeInput, outputs, missionId),
             node.timeoutMs ?? 30_000,
             `node ${node.id}`,
           );
@@ -240,6 +255,7 @@ export class WorkflowExecutor {
     node: WorkflowNode,
     input: unknown,
     outputs: Record<string, unknown>,
+    missionId: string,
   ): Promise<unknown> {
     switch (node.kind) {
       case "trigger":
@@ -264,9 +280,23 @@ export class WorkflowExecutor {
         const cfg = CodeConfig.parse(node.config);
         return runCodeNode(cfg.source, outputs, input, cfg.timeoutMs);
       }
-      case "agent":
-        // Agent nodes land in M3 (the bridge); no-op passthrough for now.
-        return input ?? null;
+      case "agent": {
+        // The bridge, workflow → agent: dispatch a task and await the result.
+        if (!this.agentInvoker) throw new Error("agent nodes require the agent runtime (bridge not wired)");
+        const cfg = AgentNodeConfig.parse(node.config);
+        const message = cfg.message.replace(/\{\{\s*input\s*\}\}/g, () =>
+          typeof input === "string" ? input : JSON.stringify(input ?? null),
+        );
+        const result = await this.agentInvoker({
+          agentId: cfg.agentId,
+          message,
+          parentMissionId: missionId,
+        });
+        if (result.status !== "succeeded") {
+          throw new Error(`agent mission ${result.missionId} ended ${result.status}`);
+        }
+        return { agentMissionId: result.missionId, result: result.output };
+      }
       default:
         throw new Error(`unsupported node kind: ${node.kind}`);
     }
