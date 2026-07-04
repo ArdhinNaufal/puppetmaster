@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M3 complete
+**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M4 core complete
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -54,14 +54,33 @@ decisions; this file only captures state and next steps.
 
 ## 3. Next steps (roadmap)
 
-1. Owner review of M1 + M2 + M3 on `claude/kickoff-prompt-continuation-cy021r` (manual
-   review pending).
-2. **M4 — FUI shell** (ARCHITECTURE.md §5, DESIGN-LANGUAGE.md): full design system in
-   `packages/ui` (Panel with corner brackets/title rail, telemetry stat, mission timeline,
-   agent card, live log stream), Missions view (list + nested trace navigation — the trace
-   panel already links child → parent), Agents view (roster + memory inspector), Tools view
-   (MCP catalog), role dashboards + arrangeable panels + branding, auth/RBAC (§6).
-3. M5 ecosystem: templates/marketplace, RAG pipeline, adaptive UI, Tauri desktop.
+1. Owner review of M1–M4 on `claude/kickoff-prompt-continuation-cy021r` (manual review
+   pending).
+2. **Remaining M4 items (deferred, need auth first)**: session auth + users/memberships +
+   RBAC at the gateway (ARCHITECTURE.md §6), then role-based dashboards and per-user
+   arrangeable panel layouts (`ui_preferences`). Branding is done; the layout engine and
+   role presets should build on the `packages/ui` Panel primitives.
+3. **M5 — ecosystem**: templates/marketplace, RAG pipeline (pgvector column is ready),
+   adaptive UI, Tauri desktop.
+
+### M4 — FUI shell core (verified in the browser)
+
+- **`packages/ui` (new)**: the design system package (ARCHITECTURE.md §7) — `Panel`
+  (corner brackets + small-caps title rail), `Stat` telemetry tile, `StatusDot`/`StatusText`
+  (shared mission palette), `Chip`, `TierBadge`; tokens + component styles ship as
+  `@puppetmaster/ui/styles.css` (imported once in `apps/web/src/main.tsx`).
+- **Missions view**: stat tiles (total/running/gated/failed), mission log table (kind,
+  status, duration, nested `↳ parent` linkage), row click loads the trace panel; the trace
+  shows **token cost** summed from the tick's model-call steps.
+- **Agents view**: roster cards (status ring, model, tier badge) + inspector — edit persona,
+  model, autonomy, cron schedule, and tool grants inline; scratchpad and long-term memory
+  displayed; "open channel" jumps to Command chat.
+- **Tools view**: the shared catalog grouped by server/namespace with autonomy tier badges —
+  built-ins, bridge workflow tools, and MCP connector tools all visible.
+- **Admin view**: workspace-scoped white-label branding (brand name + accent hue) persisted
+  in `workspaces.branding` (jsonb, server-side merge) and applied to the shell on load.
+  Verified: rename to "ACME OPS" with an amber accent survives reload.
+- Nav rail: COMMAND · CANVAS · MISSIONS · AGENTS · TOOLS · ADMIN.
 
 ### M3 — the bridge (verified end-to-end)
 

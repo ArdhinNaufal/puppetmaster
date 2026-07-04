@@ -13,6 +13,7 @@ import {
   getMission,
   getMissionSteps,
   getWorkflowWithGraph,
+  getWorkspace,
   listAgents,
   listApprovals,
   listMemories,
@@ -22,6 +23,7 @@ import {
   resolveApproval,
   saveWorkflowVersion,
   updateAgent,
+  updateWorkspace,
   type DbHandle,
 } from "@puppetmaster/db";
 import {
@@ -149,6 +151,22 @@ app.get("/api/bootstrap", async () => ({
 }));
 
 app.get("/api/tools", async () => tools.list());
+
+// --- Workspace / branding (M4) ------------------------------------------------
+app.get("/api/workspace", async () => getWorkspace(db, workspaceId));
+
+app.put("/api/workspace", async (req) => {
+  const body = (req.body ?? {}) as { name?: string; branding?: Record<string, unknown> };
+  const patch: Record<string, unknown> = {};
+  if (typeof body.name === "string" && body.name.trim()) patch.name = body.name.trim();
+  if (body.branding && typeof body.branding === "object") {
+    // Merge so concurrent editors of different branding keys don't clobber each other.
+    const current = await getWorkspace(db, workspaceId);
+    patch.branding = { ...((current?.branding as object) ?? {}), ...body.branding };
+  }
+  if (Object.keys(patch).length > 0) await updateWorkspace(db, workspaceId, patch);
+  return getWorkspace(db, workspaceId);
+});
 
 // --- Workflows ---------------------------------------------------------------
 app.get("/api/workflows", async () => listWorkflows(db, workspaceId));

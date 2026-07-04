@@ -135,6 +135,7 @@ const DDL: string[] = [
   // pgvector column for semantic memory; separate statement so the rest of the
   // schema still applies when the vector extension is unavailable.
   `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS embedding vector(1024)`,
+  `ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS branding jsonb NOT NULL DEFAULT '{}'`,
   `CREATE INDEX IF NOT EXISTS mission_steps_mission_idx ON mission_steps(mission_id)`,
   `CREATE INDEX IF NOT EXISTS missions_workspace_idx ON missions(workspace_id)`,
   `CREATE INDEX IF NOT EXISTS approvals_status_idx ON approvals(status)`,

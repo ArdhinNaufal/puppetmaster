@@ -141,6 +141,22 @@ export interface AgentMemory {
   createdAt: string;
 }
 
+export interface Workspace {
+  id: string;
+  name: string;
+  branding: { brandName?: string; accent?: string };
+}
+
+export const workspaceApi = {
+  get: () => fetch("/api/workspace").then(json<Workspace>),
+  update: (patch: { name?: string; branding?: Workspace["branding"] }) =>
+    fetch("/api/workspace", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json<Workspace>),
+};
+
 export const agentApi = {
   list: () => fetch("/api/agents").then(json<Agent[]>),
   create: (input: { name: string; persona?: string; model?: string; autonomy?: string }) =>

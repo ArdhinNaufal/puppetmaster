@@ -1,0 +1,109 @@
+/* Puppetmaster FUI design tokens + component styles — docs/DESIGN-LANGUAGE.md */
+:root {
+  --bg-void: #05080a;
+  --panel: #0a1014;
+  --panel-hi: #0d161b;
+  --stroke: #1d2b33;
+  --stroke-hi: #2a3f49;
+  --accent: #35d0e0;
+  --accent-dim: #1c6b74;
+  --warn: #e0a835;
+  --danger: #e04a4a;
+  --ok: #4ad08a;
+  --text-hi: #d7e4e8;
+  --text-lo: #5f7680;
+  --radius: 2px;
+}
+
+/* ---- Panel -------------------------------------------------------------- */
+.fui-panel {
+  position: relative;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.fui-bracket { position: absolute; width: 7px; height: 7px; border: 1px solid var(--stroke-hi); z-index: 1; }
+.fui-bracket.tl { top: -1px; left: -1px; border-right: none; border-bottom: none; }
+.fui-bracket.tr { top: -1px; right: -1px; border-left: none; border-bottom: none; }
+.fui-bracket.bl { bottom: -1px; left: -1px; border-right: none; border-top: none; }
+.fui-bracket.br { bottom: -1px; right: -1px; border-left: none; border-top: none; }
+.fui-panel-rail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.64rem;
+  letter-spacing: 0.22em;
+  color: var(--text-lo);
+  border-bottom: 1px solid var(--stroke);
+  background: var(--panel-hi);
+}
+.fui-panel-actions { display: flex; gap: 0.3rem; }
+.fui-panel-body { flex: 1; min-height: 0; }
+.fui-panel-body.scroll { overflow-y: auto; }
+
+/* ---- Stat --------------------------------------------------------------- */
+.fui-stat { display: flex; flex-direction: column; gap: 0.15rem; padding: 0.6rem 0.8rem; }
+.fui-stat-value { font-size: 1.3rem; color: var(--text-hi); font-variant-numeric: tabular-nums; }
+.fui-stat-label { font-size: 0.56rem; letter-spacing: 0.2em; color: var(--text-lo); }
+.fui-stat.tone-accent .fui-stat-value { color: var(--accent); }
+.fui-stat.tone-warn .fui-stat-value { color: var(--warn); }
+.fui-stat.tone-danger .fui-stat-value { color: var(--danger); }
+.fui-stat.tone-ok .fui-stat-value { color: var(--ok); }
+
+/* ---- Status ------------------------------------------------------------- */
+.fui-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-lo); display: inline-block; flex: none; }
+.fui-status { font-size: 0.6rem; letter-spacing: 0.12em; color: var(--text-lo); }
+.fui-dot.st-running, .fui-status.st-running { background-color: var(--accent); color: var(--accent); }
+.fui-status.st-running { background: none; }
+.fui-dot.st-succeeded { background: var(--ok); }
+.fui-status.st-succeeded { color: var(--ok); }
+.fui-dot.st-failed { background: var(--danger); }
+.fui-status.st-failed { color: var(--danger); }
+.fui-dot.st-queued { background: var(--text-lo); }
+.fui-dot.st-awaiting_approval { background: var(--warn); }
+.fui-status.st-awaiting_approval { color: var(--warn); }
+.fui-dot.st-skipped { background: #29343a; }
+.fui-dot.st-cancelled { background: #29343a; }
+
+/* ---- Chip --------------------------------------------------------------- */
+.fui-chip {
+  background: var(--panel-hi);
+  border: 1px solid var(--stroke-hi);
+  color: var(--text-hi);
+  border-radius: var(--radius);
+  padding: 0.32rem 0.55rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  font-family: inherit;
+  cursor: pointer;
+}
+.fui-chip:hover { border-color: var(--accent-dim); }
+.fui-chip.tiny { padding: 0.2rem 0.4rem; font-size: 0.58rem; }
+.fui-chip.tone-solid { background: #12222a; }
+.fui-chip.tone-accent { color: #04141a; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+.fui-chip.tone-accent:hover { filter: brightness(1.08); }
+.fui-chip.tone-danger { color: var(--danger); border-color: #45272a; }
+.fui-chip.tone-danger:hover { background: #1e1113; }
+.fui-chip:disabled { opacity: 0.5; cursor: default; }
+
+/* ---- Tier badge ---------------------------------------------------------- */
+.fui-tier {
+  font-size: 0.54rem;
+  letter-spacing: 0.14em;
+  padding: 0.12rem 0.4rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--stroke-hi);
+  color: var(--text-lo);
+}
+.fui-tier.t-read { color: var(--ok); border-color: #1e3d2e; }
+.fui-tier.t-write { color: var(--warn); border-color: #46381d; }
+.fui-tier.t-destructive { color: var(--danger); border-color: #45272a; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .fui-dot.pulse { animation: fui-pulse 1.2s ease-in-out infinite; }
+  @keyframes fui-pulse { 50% { opacity: 0.45; } }
+}

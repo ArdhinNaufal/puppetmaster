@@ -17,6 +17,8 @@ import {
 export const workspaces = pgTable("workspaces", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: text("name").notNull(),
+  /** White-label branding: { brandName?, accent? } (DESIGN-LANGUAGE.md §6). */
+  branding: jsonb("branding").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

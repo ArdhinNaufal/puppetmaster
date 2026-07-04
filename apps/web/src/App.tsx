@@ -11,8 +11,19 @@ import {
 } from "./api.js";
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
+import { AdminView, AgentsView, MissionsView, ToolsView } from "./Views.js";
+import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 import { NODE_META } from "./FlowNode.js";
+
+const VIEWS = ["command", "canvas", "missions", "agents", "tools", "admin"] as const;
+type View = (typeof VIEWS)[number];
+
+function applyBranding(ws: Workspace) {
+  if (ws.branding?.accent) {
+    document.documentElement.style.setProperty("--accent", ws.branding.accent);
+  }
+}
 
 const SAMPLE_GRAPH = {
   nodes: [
@@ -42,7 +53,8 @@ const STATUS_LABEL: Record<StepStatus, string> = {
 };
 
 export function App() {
-  const [view, setView] = useState<"command" | "canvas">("command");
+  const [view, setView] = useState<View>("command");
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -53,6 +65,7 @@ export function App() {
   const [mission, setMission] = useState<Mission | null>(null);
   const [steps, setSteps] = useState<MissionStep[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [missionsRefresh, setMissionsRefresh] = useState(0);
   const [info, setInfo] = useState<{ dbDriver: string; queue: string } | null>(null);
 
   const trackedRef = useRef<string | null>(null);
@@ -72,6 +85,13 @@ export function App() {
 
   useEffect(() => {
     api.bootstrap().then(setInfo).catch(() => setInfo(null));
+    workspaceApi
+      .get()
+      .then((ws) => {
+        setWorkspace(ws);
+        applyBranding(ws);
+      })
+      .catch(() => {});
     refreshWorkflows();
     refreshAgents();
     refreshApprovals();
@@ -88,6 +108,9 @@ export function App() {
           setNodeStatus({});
         } else if (event.type === "mission.finished" && event.missionId === active) {
           refreshTrace(active);
+        }
+        if (event.type === "mission.started" || event.type === "mission.finished") {
+          setMissionsRefresh((n) => n + 1);
         }
         if (event.type === "approval.requested" || event.type === "approval.resolved") {
           refreshApprovals();
@@ -147,14 +170,13 @@ export function App() {
   return (
     <div className="app">
       <header className="rail">
-        <span className="brand">PUPPETMASTER</span>
+        <span className="brand">{workspace?.branding?.brandName || "PUPPETMASTER"}</span>
         <nav className="view-switch">
-          <button className={`vs ${view === "command" ? "on" : ""}`} onClick={() => setView("command")}>
-            COMMAND
-          </button>
-          <button className={`vs ${view === "canvas" ? "on" : ""}`} onClick={() => setView("canvas")}>
-            CANVAS
-          </button>
+          {VIEWS.map((v) => (
+            <button key={v} className={`vs ${view === v ? "on" : ""}`} onClick={() => setView(v)}>
+              {v.toUpperCase()}
+            </button>
+          ))}
         </nav>
         <span className="rail-meta">
           {info && <span className="tag-lo">DB {info.dbDriver.toUpperCase()} · Q {info.queue.toUpperCase()}</span>}
@@ -166,7 +188,7 @@ export function App() {
 
       <div className="grid">
         <aside className="panel side">
-          {view === "command" ? (
+          {view === "command" && (
             <>
               <div className="panel-head">
                 <span>AGENTS</span>
@@ -189,7 +211,8 @@ export function App() {
                 ))}
               </ul>
             </>
-          ) : (
+          )}
+          {view === "canvas" && (
             <>
               <div className="panel-head">
                 <span>WORKFLOWS</span>
@@ -231,14 +254,28 @@ export function App() {
         </aside>
 
         <main className="panel canvas-panel">
-          {view === "command" ? (
-            <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} />
-          ) : (
-            <Canvas
-              workflowId={selected}
-              nodeStatus={nodeStatus}
-              onRan={track}
-              onSaved={refreshWorkflows}
+          {view === "command" && <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} />}
+          {view === "canvas" && (
+            <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
+          )}
+          {view === "missions" && (
+            <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />
+          )}
+          {view === "agents" && (
+            <AgentsView
+              onOpenChat={(id) => {
+                setSelectedAgent(id);
+                setView("command");
+              }}
+            />
+          )}
+          {view === "tools" && <ToolsView />}
+          {view === "admin" && (
+            <AdminView
+              onBrandingChange={(ws) => {
+                setWorkspace(ws);
+                applyBranding(ws);
+              }}
             />
           )}
         </main>
@@ -256,6 +293,22 @@ export function App() {
           {!mission && <p className="muted pad">Run a workflow to see its live trace.</p>}
           {mission && (
             <>
+              {(() => {
+                const t = steps.reduce(
+                  (acc, s) => {
+                    const u = (s.output as { usage?: { inputTokens?: number; outputTokens?: number } } | null)?.usage;
+                    if (u) {
+                      acc.in += u.inputTokens ?? 0;
+                      acc.out += u.outputTokens ?? 0;
+                    }
+                    return acc;
+                  },
+                  { in: 0, out: 0 },
+                );
+                return t.in + t.out > 0 ? (
+                  <div className="trace-cost tag-lo">COST · {t.in} TOK IN · {t.out} TOK OUT</div>
+                ) : null;
+              })()}
               <ul className="step-list">
                 {steps.map((s) => (
                   <li key={s.id} className={`step st-${s.status}`}>

@@ -18,6 +18,19 @@ export async function ensureDefaultWorkspace(db: Db, name = "Default"): Promise<
   return created!.id;
 }
 
+export async function getWorkspace(db: Db, id: string) {
+  const [row] = await db.select().from(workspaces).where(eq(workspaces.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function updateWorkspace(
+  db: Db,
+  id: string,
+  patch: Partial<typeof workspaces.$inferInsert>,
+) {
+  await db.update(workspaces).set(patch).where(eq(workspaces.id, id));
+}
+
 export async function createWorkflow(
   db: Db,
   input: { workspaceId: string; name: string; graph: WorkflowGraph },
