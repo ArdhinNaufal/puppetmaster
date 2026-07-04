@@ -1,0 +1,296 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  addEdge,
+  Background,
+  BackgroundVariant,
+  Controls,
+  MarkerType,
+  ReactFlow,
+  useEdgesState,
+  useNodesState,
+  type Connection,
+  type Edge,
+  type Node,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { api, type NodeKind, type StepStatus, type WorkflowGraph } from "./api.js";
+import { FlowNode, NODE_META, type FlowNodeData } from "./FlowNode.js";
+
+const nodeTypes = { fui: FlowNode };
+
+const DEFAULT_CONFIG: Record<NodeKind, Record<string, unknown>> = {
+  trigger: { mode: "manual" },
+  action: { server: "util", tool: "echo", args: { value: "hello" } },
+  logic: { op: "passthrough" },
+  code: { source: "return input;" },
+  agent: {},
+  approval: { prompt: "Approve this step?" },
+};
+
+function graphToFlow(graph: WorkflowGraph): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = graph.nodes.map((n) => ({
+    id: n.id,
+    type: "fui",
+    position: n.position ?? { x: 0, y: 0 },
+    data: { kind: n.kind, label: n.label, config: n.config } as FlowNodeData,
+  }));
+  const edges: Edge[] = graph.edges.map((e, i) => ({
+    id: `e${i}-${e.from}-${e.to}`,
+    source: e.from,
+    target: e.to,
+    label: e.condition ?? undefined,
+    data: { condition: e.condition ?? null },
+    markerEnd: { type: MarkerType.ArrowClosed },
+  }));
+  return { nodes, edges };
+}
+
+function flowToGraph(nodes: Node[], edges: Edge[]): WorkflowGraph {
+  return {
+    nodes: nodes.map((n) => {
+      const d = n.data as FlowNodeData;
+      return { id: n.id, kind: d.kind, label: d.label, config: d.config, position: n.position };
+    }),
+    edges: edges.map((e) => ({
+      from: e.source,
+      to: e.target,
+      condition: ((e.data as { condition?: string | null })?.condition ?? null) || null,
+    })),
+  };
+}
+
+export function Canvas(props: {
+  workflowId: string | null;
+  nodeStatus: Record<string, StepStatus>;
+  onRan: (missionId: string) => void;
+  onSaved: () => void;
+}) {
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [selNode, setSelNode] = useState<string | null>(null);
+  const [selEdge, setSelEdge] = useState<string | null>(null);
+  const [runInput, setRunInput] = useState('{ "n": 10 }');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  // Load the selected workflow's graph.
+  useEffect(() => {
+    if (!props.workflowId) {
+      setNodes([]);
+      setEdges([]);
+      return;
+    }
+    api.getWorkflow(props.workflowId).then(({ version }) => {
+      const flow = graphToFlow(version.graph);
+      setNodes(flow.nodes);
+      setEdges(flow.edges);
+      setSelNode(null);
+      setSelEdge(null);
+    });
+  }, [props.workflowId, setNodes, setEdges]);
+
+  // Overlay live step status coming from the event stream onto the nodes.
+  useEffect(() => {
+    setNodes((nds) =>
+      nds.map((n) => {
+        const status = props.nodeStatus[n.id];
+        const d = n.data as FlowNodeData;
+        return status === d.status ? n : { ...n, data: { ...d, status } };
+      }),
+    );
+  }, [props.nodeStatus, setNodes]);
+
+  const onConnect = useCallback(
+    (c: Connection) =>
+      setEdges((eds) =>
+        addEdge({ ...c, data: { condition: null }, markerEnd: { type: MarkerType.ArrowClosed } }, eds),
+      ),
+    [setEdges],
+  );
+
+  const addNode = (kind: NodeKind) => {
+    const id = crypto.randomUUID().slice(0, 8);
+    setNodes((nds) => [
+      ...nds,
+      {
+        id,
+        type: "fui",
+        position: { x: 120 + Math.random() * 260, y: 80 + Math.random() * 220 },
+        data: { kind, label: NODE_META[kind].tag[0] + NODE_META[kind].tag.slice(1).toLowerCase(), config: { ...DEFAULT_CONFIG[kind] } },
+      },
+    ]);
+  };
+
+  const save = useCallback(async () => {
+    if (!props.workflowId) return null;
+    const graph = flowToGraph(nodes, edges);
+    const v = await api.saveWorkflow(props.workflowId, graph);
+    props.onSaved();
+    setMsg(`saved v${v.version}`);
+    return graph;
+  }, [props, nodes, edges]);
+
+  const run = async () => {
+    if (!props.workflowId) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      await save();
+      let input: unknown = {};
+      try {
+        input = runInput.trim() ? JSON.parse(runInput) : {};
+      } catch {
+        setMsg("run input is not valid JSON");
+        setBusy(false);
+        return;
+      }
+      const { missionId } = await api.runWorkflow(props.workflowId, input);
+      props.onRan(missionId);
+      setMsg("mission launched");
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : "run failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const selectedNode = nodes.find((n) => n.id === selNode);
+  const selectedEdge = edges.find((e) => e.id === selEdge);
+
+  const patchNode = (patch: Partial<FlowNodeData>) => {
+    setNodes((nds) =>
+      nds.map((n) => (n.id === selNode ? { ...n, data: { ...(n.data as FlowNodeData), ...patch } } : n)),
+    );
+  };
+  const patchEdgeCondition = (condition: string) => {
+    setEdges((eds) =>
+      eds.map((e) =>
+        e.id === selEdge ? { ...e, label: condition || undefined, data: { condition: condition || null } } : e,
+      ),
+    );
+  };
+  const deleteSelected = () => {
+    if (selNode) {
+      setNodes((nds) => nds.filter((n) => n.id !== selNode));
+      setEdges((eds) => eds.filter((e) => e.source !== selNode && e.target !== selNode));
+      setSelNode(null);
+    }
+    if (selEdge) {
+      setEdges((eds) => eds.filter((e) => e.id !== selEdge));
+      setSelEdge(null);
+    }
+  };
+
+  const kinds = useMemo(() => Object.keys(NODE_META) as NodeKind[], []);
+
+  if (!props.workflowId) {
+    return <div className="canvas-empty">Select or create a workflow to edit its graph.</div>;
+  }
+
+  return (
+    <div className="canvas-wrap">
+      <div className="canvas-toolbar">
+        <span className="tb-label">ADD</span>
+        {kinds.map((k) => (
+          <button key={k} className="chip" onClick={() => addNode(k)}>
+            {NODE_META[k].glyph} {NODE_META[k].tag}
+          </button>
+        ))}
+        <span className="tb-sep" />
+        <input
+          className="run-input"
+          value={runInput}
+          onChange={(e) => setRunInput(e.target.value)}
+          spellCheck={false}
+          aria-label="Run input JSON"
+        />
+        <button className="chip solid" onClick={save}>
+          SAVE
+        </button>
+        <button className="chip accent" onClick={run} disabled={busy}>
+          {busy ? "…" : "▶ RUN"}
+        </button>
+        {msg && <span className="tb-msg">{msg}</span>}
+      </div>
+
+      <div className="canvas-body">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          onNodeClick={(_, n) => {
+            setSelNode(n.id);
+            setSelEdge(null);
+          }}
+          onEdgeClick={(_, e) => {
+            setSelEdge(e.id);
+            setSelNode(null);
+          }}
+          onPaneClick={() => {
+            setSelNode(null);
+            setSelEdge(null);
+          }}
+          fitView
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#16232a" />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+
+        {(selectedNode || selectedEdge) && (
+          <aside className="inspector">
+            <div className="ins-head">
+              <span>{selectedNode ? "NODE" : "EDGE"}</span>
+              <button className="chip danger tiny" onClick={deleteSelected}>
+                DELETE
+              </button>
+            </div>
+            {selectedNode && (
+              <>
+                <label className="ins-field">
+                  <span>Label</span>
+                  <input
+                    value={(selectedNode.data as FlowNodeData).label}
+                    onChange={(e) => patchNode({ label: e.target.value })}
+                  />
+                </label>
+                <label className="ins-field">
+                  <span>Config (JSON)</span>
+                  <textarea
+                    rows={10}
+                    spellCheck={false}
+                    defaultValue={JSON.stringify((selectedNode.data as FlowNodeData).config, null, 2)}
+                    key={selectedNode.id}
+                    onBlur={(e) => {
+                      try {
+                        patchNode({ config: JSON.parse(e.target.value) });
+                        setMsg(null);
+                      } catch {
+                        setMsg("config is not valid JSON");
+                      }
+                    }}
+                  />
+                </label>
+                <p className="ins-hint">kind: {(selectedNode.data as FlowNodeData).kind}</p>
+              </>
+            )}
+            {selectedEdge && (
+              <label className="ins-field">
+                <span>Condition (JS on `out`)</span>
+                <input
+                  placeholder="e.g. out === true"
+                  defaultValue={(selectedEdge.data as { condition?: string | null })?.condition ?? ""}
+                  key={selectedEdge.id}
+                  onBlur={(e) => patchEdgeCondition(e.target.value)}
+                />
+              </label>
+            )}
+          </aside>
+        )}
+      </div>
+    </div>
+  );
+}

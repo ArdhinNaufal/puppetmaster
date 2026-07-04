@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-04 · **Branch:** `claude/ai-agent-automation-platform-e7nwzf` · **PR:** [#1](https://github.com/ArdhinNaufal/puppetmaster/pull/1)
+**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M1 complete
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -9,17 +9,34 @@ decisions; this file only captures state and next steps.
 
 ## 1. Current state
 
-- **PR #1 is open** against `main`, containing two commits: the full spec (PRD, architecture,
-  design language) and the **M0 monorepo skeleton**. Checks green, mergeable, awaiting the
-  owner's manual review. Nothing else exists on `main` beyond the initial README.
-- **M0 skeleton (verified working):** `pnpm install && pnpm build` is green;
-  `node apps/server/dist/main.js` serves `/api/health` and a WebSocket event stream at `/api/events`.
-  - `apps/server` — Fastify 5 + @fastify/websocket, port 4000.
-  - `apps/web` — Vite + React 19 shell with FUI CSS tokens (proxying `/api` → :4000, port 3000).
-  - `packages/kernel` — `EventBus` interface + `InMemoryEventBus` (Redis streams planned for M1).
-  - `packages/shared` — zod schemas: `AgentDefinition`, `WorkflowDefinition` (nodes/edges),
-    `Mission`, `MissionStatus`, `AutonomyTier`.
-  - `docker/` — Compose stack (pgvector Postgres 17, Redis 7, server) + `server.Dockerfile`.
+- **M0 skeleton** (spec + monorepo) shipped on branch `claude/ai-agent-automation-platform-e7nwzf`
+  (PR #1). **M1 — workflow engine + canvas — is now built on branch
+  `claude/kickoff-prompt-continuation-cy021r`.**
+- **M1 (verified end-to-end):** `pnpm install && pnpm build && pnpm typecheck` all green. A sample
+  workflow (trigger → sandboxed code → branch → approval gate → action) was run through the
+  browser UI and the REST API: it halted at the approval gate (`awaiting_approval`), resumed on
+  approval, routed the branch correctly (false path skipped), and finished `succeeded` with the
+  expected output. Verified against **real Redis (BullMQ + streams bus)** and **PGlite** persistence.
+  - `packages/shared` — zod schemas extended: `WorkflowGraph`, `WorkflowNode` (+ position/retries/
+    timeoutMs), per-kind configs (`TriggerConfig`/`ActionConfig`/`LogicConfig`/`CodeConfig`/
+    `ApprovalConfig`), `MissionStep`, `StepStatus`, `Approval`.
+  - `packages/db` **(new)** — Drizzle schema for `workspaces`, `workflows`, `workflow_versions`,
+    `missions`, `mission_steps`, `approvals`; idempotent `migrate()` with `CREATE EXTENSION vector`
+    (pgvector-ready). Dual driver: **node-postgres** when `DATABASE_URL` is set, else embedded
+    **PGlite** (local/desktop/e2e). Repository functions in `repo.ts`.
+  - `packages/kernel` — `RedisEventBus` (Redis streams) behind the existing `EventBus` interface;
+    resumable **DAG executor** (topo order, per-node IO snapshots, retries + timeouts, edge-condition
+    branching, approval gates with a persisted resume cursor); node handlers for trigger/action/
+    logic/code/approval; worker-thread JS **sandbox** for code nodes; `BuiltinToolRegistry`
+    (MCP-shaped `callTool`); **BullMQ** `QueueRunner` (+ cron job scheduler) and an `InlineRunner`
+    fallback for Redis-free dev; `startWorkflow` orchestrator helper.
+  - `apps/server` — wires DB+migrate, bus, executor, runner; REST for workflow CRUD, run, webhook
+    trigger (`/api/hooks/:id`), missions + traces, approvals inbox/resolve, tools list, bootstrap;
+    WS event stream. Chooses Redis/BullMQ when `REDIS_URL` is set, else in-memory + inline.
+  - `apps/web` — React Flow (`@xyflow/react`) canvas with FUI node skins (corner brackets, kind
+    glyphs, live status rings), node/edge inspector, add-node palette, save/run, workflow list,
+    live mission trace, and approvals inbox — all wired to the WebSocket bus.
+  - `docker/` — Compose stack (pgvector Postgres 17, Redis 7, server) + `server.Dockerfile` (M0).
 
 ## 2. Product decisions locked in interview (do not re-ask)
 
@@ -35,17 +52,27 @@ decisions; this file only captures state and next steps.
 - **Autonomy:** human-in-the-loop by default; tiers read=auto / write=approved / destructive=confirmed.
 - **Name:** Puppetmaster (final).
 
-## 3. Next steps (roadmap M1, in order)
+## 3. Next steps (roadmap)
 
-1. Merge PR #1 (owner review pending).
-2. **M1 — workflow engine + canvas:**
-   - DAG executor on BullMQ (queue: workflow steps; per-node IO snapshots for traces).
-   - Node types: trigger (cron/webhook/manual), action (MCP tool call), logic (branch/wait),
-     code (sandboxed JS worker), approval. Agent node comes in M3.
-   - Persist workflows/missions in Postgres (see schema list in ARCHITECTURE.md §4); add drizzle or prisma.
-   - Canvas: React Flow editor in `apps/web`, node skins per DESIGN-LANGUAGE.md.
-   - Replace `InMemoryEventBus` with Redis-streams implementation behind the same interface.
-3. M2 agent runtime → M3 bridge → M4 FUI shell → M5 ecosystem (see ARCHITECTURE.md §8).
+1. Owner review of M1 on `claude/kickoff-prompt-continuation-cy021r` (manual review pending).
+2. **M2 — agent runtime** (see ARCHITECTURE.md §3.1): agent definitions + persistent state,
+   the agentic tick loop (LLM ↔ tools) resumable to an approval gate, agent memory
+   (short-term window + pgvector long-term — the `vector` extension is already enabled),
+   schedules/event subscriptions, and the Command (chat) view. The model router (§3.5) and
+   policy/approval engine (§3.6, already partially present via approval nodes) land here too.
+3. M3 bridge (agent↔workflow, `agent` node is currently a passthrough stub) → M4 FUI shell →
+   M5 ecosystem (see ARCHITECTURE.md §8).
+
+### M1 runtime notes for the next session
+
+- Run locally: `pnpm build`, then `REDIS_URL=redis://127.0.0.1:6379 node apps/server/dist/main.js`
+  (PGlite is in-memory unless a `dataDir` is wired; set `DATABASE_URL` to use Postgres). Web:
+  `pnpm --filter @puppetmaster/web dev` (proxies `/api` → :4000). Without `REDIS_URL` the server
+  falls back to the in-memory bus + inline runner (no cron).
+- Built-in tools for action nodes live in `BuiltinToolRegistry` (`util.echo/now/merge`, `math.sum`,
+  `http.get`); real MCP servers replace these in M3 behind the same `callTool` surface.
+- Code-node sandbox is a worker thread + `node:vm` with a termination deadline; upgrade to
+  `isolated-vm` if stronger isolation is needed.
 
 ## 4. Conventions
 

@@ -1,5 +1,5 @@
 {
-  "name": "@puppetmaster/kernel",
+  "name": "@puppetmaster/db",
   "version": "0.0.1",
   "type": "module",
   "main": "dist/index.js",
@@ -10,13 +10,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@puppetmaster/db": "workspace:*",
+    "@electric-sql/pglite": "^0.2.17",
     "@puppetmaster/shared": "workspace:*",
-    "bullmq": "^5.34.0",
-    "ioredis": "^5.4.2"
+    "drizzle-orm": "^0.38.3",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
-    "@types/node": "^22.20.0",
+    "@types/pg": "^8.11.10",
     "typescript": "^5.7.0"
   }
 }
