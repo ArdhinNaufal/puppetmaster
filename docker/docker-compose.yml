@@ -1,0 +1,43 @@
+name: puppetmaster
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: puppetmaster
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-puppetmaster}
+      POSTGRES_DB: puppetmaster
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U puppetmaster"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: ..
+      dockerfile: docker/server.Dockerfile
+    environment:
+      DATABASE_URL: postgres://puppetmaster:${POSTGRES_PASSWORD:-puppetmaster}@postgres:5432/puppetmaster
+      REDIS_URL: redis://redis:6379
+      PORT: "4000"
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

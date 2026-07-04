@@ -1,0 +1,16 @@
+{
+  "name": "puppetmaster",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Local-first platform unifying an AI Agent OS and AI workflow automation",
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  }
+}
