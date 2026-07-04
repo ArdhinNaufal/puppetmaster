@@ -1,0 +1,79 @@
+/* Puppetmaster FUI tokens — see docs/DESIGN-LANGUAGE.md */
+:root {
+  --bg-void: #05080a;
+  --panel: #0a1014;
+  --stroke: #1d2b33;
+  --accent: #35d0e0;
+  --warn: #e0a835;
+  --danger: #e04a4a;
+  --text-hi: #d7e4e8;
+  --text-lo: #5f7680;
+  --radius: 2px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-void);
+  color: var(--text-hi);
+  font-family: "Söhne Mono", "IBM Plex Mono", ui-monospace, monospace;
+  min-height: 100vh;
+}
+
+.shell {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+.rail {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--stroke);
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.brand {
+  letter-spacing: 0.35em;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+
+.status {
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+}
+.status.ok { color: var(--accent); }
+.status.down { color: var(--danger); }
+
+.panel {
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 1.25rem 1.5rem;
+}
+
+.panel h1 {
+  font-size: 0.8rem;
+  letter-spacing: 0.3em;
+  color: var(--text-lo);
+  margin-bottom: 0.75rem;
+}
+
+.panel p {
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: var(--text-hi);
+}
+
+code { color: var(--warn); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .status.ok { animation: pulse 3s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.55; } }
+}
