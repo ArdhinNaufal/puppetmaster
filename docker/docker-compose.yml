@@ -7,6 +7,8 @@ services:
       POSTGRES_USER: puppetmaster
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-puppetmaster}
       POSTGRES_DB: puppetmaster
+    ports:
+      - "5432:5432" # <-- THIS LINE IS REQUIRED TO CONNECT VIA LOCALHOST
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
