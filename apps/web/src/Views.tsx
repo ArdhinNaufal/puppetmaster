@@ -4,12 +4,15 @@ import {
   agentApi,
   api,
   auditApi,
+  kbApi,
   memberApi,
   templateApi,
   workspaceApi,
   type Agent,
   type AgentMemory,
   type AuditEntry,
+  type KbDocument,
+  type KbSearchHit,
   type MemberRow,
   type MemoryHit,
   type Mission,
@@ -624,6 +627,147 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
           plus auth and membership changes.
         </p>
       </Panel>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- Knowledge */
+
+/** KNOWLEDGE view (Stage 3): upload md/txt documents, browse them, and
+ *  search-test the same hybrid retrieval the kb.search tool uses. */
+export function KnowledgeView(props: { canBuild: boolean }) {
+  const [docs, setDocs] = useState<KbDocument[]>([]);
+  const [hits, setHits] = useState<KbSearchHit[]>([]);
+  const [query, setQuery] = useState("");
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  const refresh = () => kbApi.list().then(setDocs).catch(() => {});
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  const upload = async () => {
+    if (!title.trim() || !content.trim()) return;
+    setBusy(true);
+    try {
+      const res = await kbApi.upload({ title: title.trim(), content });
+      setNotice(`Ingested "${res.document.title}" — ${res.chunkCount} chunks, ${res.embedded} embedded.`);
+      setTitle("");
+      setContent("");
+      refresh();
+    } catch {
+      setNotice("Upload failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onFile = (file: File) => {
+    file.text().then((text) => {
+      setContent(text);
+      if (!title.trim()) setTitle(file.name.replace(/\.(md|txt|markdown)$/i, ""));
+    });
+  };
+
+  const search = () => {
+    if (!query.trim()) return setHits([]);
+    kbApi.search(query, 8).then(setHits).catch(() => setHits([]));
+  };
+
+  return (
+    <div className="view-wrap">
+      <div className="stat-row">
+        <Panel><Stat label="DOCUMENTS" value={docs.length} tone="accent" /></Panel>
+        <Panel><Stat label="CHUNKS" value={docs.reduce((a, d) => a + d.chunkCount, 0)} /></Panel>
+      </div>
+
+      <div className="tool-grid">
+        <Panel title="SEARCH TEST" scroll>
+          <div className="pad" style={{ display: "flex", gap: 8 }}>
+            <input
+              className="text-input"
+              placeholder="Ask the knowledge base…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && search()}
+              style={{ flex: 1 }}
+            />
+            <button className="chip" onClick={search}>SEARCH</button>
+          </div>
+          <ul className="tool-list">
+            {hits.map((h) => (
+              <li key={h.chunkId} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">{h.citation}</span>
+                  <span className="tag-lo">{h.score.toFixed(3)}</span>
+                </div>
+                <p className="tool-desc">{h.content.slice(0, 280)}{h.content.length > 280 ? "…" : ""}</p>
+              </li>
+            ))}
+            {hits.length === 0 && query && <li className="dim pad">No matches.</li>}
+          </ul>
+        </Panel>
+
+        <Panel title="DOCUMENTS" scroll>
+          <ul className="tool-list">
+            {docs.map((d) => (
+              <li key={d.id} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">{d.title}</span>
+                  <span className="tag-lo">{d.chunkCount} CHUNKS</span>
+                </div>
+                <p className="tool-desc">
+                  {d.source || d.mime} · {new Date(d.createdAt).toLocaleString()}
+                  {props.canBuild && (
+                    <>
+                      {" "}
+                      <button
+                        className="chip tiny"
+                        onClick={() => kbApi.remove(d.id).then(refresh)}
+                      >
+                        DELETE
+                      </button>
+                    </>
+                  )}
+                </p>
+              </li>
+            ))}
+            {docs.length === 0 && <li className="dim pad">No documents yet — upload md/txt to give agents a knowledge base.</li>}
+          </ul>
+        </Panel>
+
+        {props.canBuild && (
+          <Panel title="UPLOAD" scroll>
+            <div className="pad" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <input
+                className="text-input"
+                placeholder="Document title"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+              />
+              <input
+                type="file"
+                accept=".md,.txt,.markdown,text/plain,text/markdown"
+                onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
+              />
+              <textarea
+                className="text-input"
+                rows={10}
+                placeholder="…or paste markdown/plain text here"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+              />
+              <button className="chip" disabled={busy || !title.trim() || !content.trim()} onClick={upload}>
+                {busy ? "INGESTING…" : "INGEST DOCUMENT"}
+              </button>
+              {notice && <p className="dim">{notice}</p>}
+            </div>
+          </Panel>
+        )}
+      </div>
     </div>
   );
 }

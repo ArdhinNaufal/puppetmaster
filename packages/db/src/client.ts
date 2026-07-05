@@ -242,6 +242,27 @@ const DDL: string[] = [
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
   `CREATE INDEX IF NOT EXISTS node_executions_mission_idx ON node_executions(mission_id, node_id)`,
+  `CREATE TABLE IF NOT EXISTS documents (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     title text NOT NULL,
+     source text NOT NULL DEFAULT '',
+     mime text NOT NULL DEFAULT 'text/markdown',
+     content text NOT NULL,
+     chunk_count integer NOT NULL DEFAULT 0,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS document_chunks (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+     idx integer NOT NULL,
+     heading text NOT NULL DEFAULT '',
+     content text NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding vector(1024)`,
+  `CREATE INDEX IF NOT EXISTS document_chunks_document_idx ON document_chunks(document_id)`,
+  `CREATE INDEX IF NOT EXISTS documents_workspace_idx ON documents(workspace_id)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

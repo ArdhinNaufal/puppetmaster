@@ -18,20 +18,20 @@ import {
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
 import { Login } from "./Login.js";
-import { AdminView, AgentsView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
+import { AdminView, AgentsView, KnowledgeView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 import { NODE_META } from "./FlowNode.js";
 
-const VIEWS = ["command", "canvas", "templates", "missions", "agents", "tools", "admin"] as const;
+const VIEWS = ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "admin"] as const;
 type View = (typeof VIEWS)[number];
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
 
 /** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
 const ROLE_VIEWS: Record<Role, View[]> = {
-  member: ["command", "templates", "missions", "agents", "tools"],
-  builder: ["command", "canvas", "templates", "missions", "agents", "tools"],
+  member: ["command", "templates", "knowledge", "missions", "agents", "tools"],
+  builder: ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools"],
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
@@ -463,6 +463,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               }}
             />
           )}
+          {view === "knowledge" && <KnowledgeView canBuild={canBuild} />}
           {view === "missions" && (
             <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />
           )}

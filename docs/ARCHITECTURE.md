@@ -102,6 +102,21 @@
 - **Egress allowlist**: with `HTTP_ALLOWED_HOSTS` set (comma-separated hostnames; subdomains
   match), `http.get` refuses any other host.
 
+### 3.8 Knowledge base / RAG (Stage 3)
+- Per-workspace document store (`documents` + `document_chunks(embedding vector)`); md/txt
+  ingest with **heading-aware chunking** (breadcrumbs like "Handbook › Ops › Escalation",
+  ~1.4k-char chunks split on paragraph boundaries), embedded at ingest.
+- **Hybrid retrieval** per §1.6 best practices: pgvector cosine (dense) + Postgres full-text
+  `ts_rank` (sparse, ILIKE fallback) → top-50 each → **reciprocal-rank fusion** → top-k with
+  citations (`Title#chunk (breadcrumb)`); an optional reranker hook slots between fusion and
+  the final cut.
+- `kb.search` / `kb.read` are read-tier tools in the shared catalog — agents and workflow
+  action nodes cite the same knowledge base, and results flow through the untrusted-data
+  envelope like any tool output.
+- KNOWLEDGE view: upload (file or paste), browse/delete, and a search-test panel that hits
+  the same retrieval path as the tool. REST: `/api/kb/documents[...]`, `/api/kb/search`
+  (upload/delete builder+).
+
 ## 4. Data model (core tables)
 
 `users`, `workspaces`, `memberships(role)`, `agents`, `agent_memories`, `workflows`,

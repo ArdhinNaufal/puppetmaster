@@ -316,6 +316,43 @@ export const prefsApi = {
     }).then(json<{ layout: { panels?: PanelLayout } }>),
 };
 
+// --- Knowledge base (Stage 3) ---------------------------------------------------
+
+export interface KbDocument {
+  id: string;
+  title: string;
+  source: string;
+  mime: string;
+  chunkCount: number;
+  createdAt: string;
+}
+
+export interface KbSearchHit {
+  chunkId: string;
+  documentId: string;
+  title: string;
+  idx: number;
+  heading: string;
+  content: string;
+  score: number;
+  citation: string;
+}
+
+export const kbApi = {
+  list: () => fetch("/api/kb/documents").then(json<KbDocument[]>),
+  upload: (input: { title: string; content: string; source?: string; mime?: string }) =>
+    post("/api/kb/documents", input).then(
+      json<{ document: KbDocument; chunkCount: number; embedded: number }>,
+    ),
+  get: (id: string) =>
+    fetch(`/api/kb/documents/${id}`).then(
+      json<{ document: KbDocument & { content: string }; chunks: { idx: number; heading: string; content: string }[] }>,
+    ),
+  remove: (id: string) => fetch(`/api/kb/documents/${id}`, { method: "DELETE" }),
+  search: (q: string, limit = 5) =>
+    fetch(`/api/kb/search?q=${encodeURIComponent(q)}&limit=${limit}`).then(json<KbSearchHit[]>),
+};
+
 export type BusEvent =
   | { type: "mission.started"; missionId: string; agentId?: string; at: string }
   | { type: "agent.message"; agentId: string; missionId: string; role: string; text: string; at: string }

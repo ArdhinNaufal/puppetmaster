@@ -236,6 +236,36 @@ export const auditLog = pgTable("audit_log", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Knowledge base documents (Stage 3, G5 / PRD use-case 4). Raw content is
+ *  kept for `kb.read`; retrieval happens over `document_chunks`. */
+export const documents = pgTable("documents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  title: text("title").notNull(),
+  /** Original filename or origin label. */
+  source: text("source").notNull().default(""),
+  mime: text("mime").notNull().default("text/markdown"),
+  content: text("content").notNull(),
+  chunkCount: integer("chunk_count").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Heading-aware chunks with pgvector embeddings (added via ALTER, like
+ *  agent_memories). Hybrid retrieval = Postgres full-text + cosine, fused
+ *  by reciprocal rank (§1.6). `heading` is the breadcrumb ("A › B"). */
+export const documentChunks = pgTable("document_chunks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  documentId: uuid("document_id")
+    .notNull()
+    .references(() => documents.id, { onDelete: "cascade" }),
+  idx: integer("idx").notNull(),
+  heading: text("heading").notNull().default(""),
+  content: text("content").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 /** Idempotency ledger for side-effectful node executions (Stage 2, G4).
  *  A row is written *before* the tool call and committed with the output
  *  after it; a retried mission reuses any committed output for a node
@@ -329,4 +359,6 @@ export const schema = {
   mcpToolPins,
   approvalPolicies,
   nodeExecutions,
+  documents,
+  documentChunks,
 };

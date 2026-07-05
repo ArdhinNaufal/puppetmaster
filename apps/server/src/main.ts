@@ -9,11 +9,14 @@ import {
   createTemplate,
   createWorkflow,
   deleteAgent,
+  deleteDocument,
   deleteTemplate,
   ensureDefaultWorkspace,
   getAgent,
   getAgentMessages,
   getApproval,
+  getDocument,
+  getDocumentChunks,
   getMission,
   getMissionSteps,
   getTemplate,
@@ -25,6 +28,7 @@ import {
   listApprovals,
   listAudit,
   listDeadLetterMissions,
+  listDocuments,
   listMemories,
   listMissions,
   listPoliciesForAgent,
@@ -56,9 +60,12 @@ import {
   ModelRouter,
   toVectorLiteral,
   parseMcpServersEnv,
+  kbIngest,
+  kbSearch,
   QueueRunner,
   RedisEventBus,
   registerBridgeTools,
+  registerKbTools,
   replayMission,
   resolveCredentialEnv,
   startAgentTick,
@@ -153,6 +160,11 @@ if (seededTemplates > 0) app.log.info({ seededTemplates }, "seeded builtin templ
 executor.setAgentInvoker(createAgentInvoker({ db, runtime: agentRuntime }));
 // Agent → workflow: workflows join the shared tool catalog (workflow.list/run/create_draft).
 registerBridgeTools(tools, { db, workspaceId, executor });
+
+// Knowledge base (Stage 3): kb.search / kb.read join the shared catalog so
+// agents and workflow nodes retrieve cited chunks from workspace documents.
+const kbDeps = { db, workspaceId, embedder };
+registerKbTools(tools, kbDeps);
 
 // --- Tool layer: MCP servers (ARCHITECTURE.md §3.4) ---------------------------
 // Bundled utils connector by default; extend/override via MCP_SERVERS JSON.
@@ -598,6 +610,65 @@ app.get("/api/agents/:id/memory-search", async (req) => {
   }
   const rows = await searchMemories(db, id, query, 10);
   return rows.map((r) => ({ id: r.id, content: r.content, score: null }));
+});
+
+// --- Knowledge base (Stage 3, PRD use-case 4) ----------------------------------
+app.get("/api/kb/documents", async () => listDocuments(db, workspaceId));
+
+/** Upload a md/txt document: heading-aware chunking + embedding at ingest. */
+app.post("/api/kb/documents", async (req, reply) => {
+  const body = (req.body ?? {}) as { title?: string; content?: string; source?: string; mime?: string };
+  if (!body.title?.trim() || typeof body.content !== "string" || !body.content.trim()) {
+    return reply.code(400).send({ error: "title and content are required" });
+  }
+  const result = await kbIngest(kbDeps, {
+    title: body.title.trim(),
+    content: body.content,
+    source: body.source,
+    mime: body.mime,
+  });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "kb.upload",
+    target: result.document.title,
+    detail: { documentId: result.document.id, chunks: result.chunkCount, embedded: result.embedded },
+  });
+  return reply.code(201).send(result);
+});
+
+app.get("/api/kb/documents/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const doc = await getDocument(db, id);
+  if (!doc || doc.workspaceId !== workspaceId) return reply.code(404).send({ error: "document not found" });
+  const chunks = await getDocumentChunks(db, id);
+  return { document: doc, chunks };
+});
+
+app.delete("/api/kb/documents/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const doc = await getDocument(db, id);
+  if (!doc || doc.workspaceId !== workspaceId) return reply.code(404).send({ error: "document not found" });
+  await deleteDocument(db, id);
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "kb.delete",
+    target: doc.title,
+    detail: { documentId: id },
+  });
+  return reply.code(204).send();
+});
+
+/** Search-test surface for the KNOWLEDGE view (same path the kb.search tool uses). */
+app.get("/api/kb/search", async (req) => {
+  const { q, limit } = req.query as { q?: string; limit?: string };
+  if (!q?.trim()) return [];
+  return kbSearch(kbDeps, q, limit ? Math.min(Number(limit), 20) : 5);
 });
 
 // --- Missions & traces -------------------------------------------------------
