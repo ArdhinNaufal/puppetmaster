@@ -500,7 +500,14 @@ export class AgentRuntime {
         ...auditActor,
         action: "llm.call",
         target: agent.model,
-        detail: { iteration: iterations, usage: response.usage, toolCalls: response.toolCalls.length },
+        detail: {
+          iteration: iterations,
+          usage: response.usage,
+          toolCalls: response.toolCalls.length,
+          ...(response.servedBy && response.servedBy !== agent.model
+            ? { servedBy: response.servedBy }
+            : {}),
+        },
       });
 
       // Persist the assistant turn (text and/or tool calls).

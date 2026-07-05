@@ -41,6 +41,8 @@ export interface ChatResponse {
   toolCalls: { id: string; name: string; args: Record<string, unknown> }[];
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "refusal" | "other";
   usage: ChatUsage;
+  /** Which candidate of a fallback chain actually served the call (Stage 8). */
+  servedBy?: string;
 }
 
 export type StreamDelta = (textDelta: string) => void;
@@ -303,13 +305,54 @@ export interface RouterConfig {
   ollamaBaseUrl?: string;
 }
 
-/** Routes by model string and accumulates per-call token usage. */
+/**
+ * Routes by model string and accumulates per-call token usage.
+ *
+ * Fallback chains (Stage 8): a model string may list candidates separated by
+ * `|` — `"claude-sonnet-5|openai/gpt-5|mock"` tries each in order, recording
+ * per-model failure counts (`failureStats()`); the response carries
+ * `servedBy` so audits show which candidate answered.
+ */
 export class ModelRouter {
   private readonly config: RouterConfig;
+  private readonly failures = new Map<string, number>();
   totalUsage: ChatUsage = { inputTokens: 0, outputTokens: 0 };
 
   constructor(config: RouterConfig = {}) {
     this.config = config;
+  }
+
+  /** Per-model failure counts across fallback attempts (reliability signal). */
+  failureStats(): Record<string, number> {
+    return Object.fromEntries(this.failures);
+  }
+
+  private candidatesOf(model: string): string[] {
+    const parts = model.split("|").map((s) => s.trim()).filter(Boolean);
+    return parts.length > 0 ? parts : [model];
+  }
+
+  private async withFallback(
+    model: string,
+    run: (candidate: string) => Promise<ChatResponse>,
+  ): Promise<ChatResponse> {
+    const candidates = this.candidatesOf(model);
+    let lastErr: unknown = null;
+    for (const candidate of candidates) {
+      try {
+        const res = await run(candidate);
+        res.servedBy = candidate;
+        this.totalUsage.inputTokens += res.usage.inputTokens;
+        this.totalUsage.outputTokens += res.usage.outputTokens;
+        return res;
+      } catch (err) {
+        lastErr = err;
+        this.failures.set(candidate, (this.failures.get(candidate) ?? 0) + 1);
+      }
+    }
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(`all model candidates failed: ${candidates.join(", ")}`);
   }
 
   providerFor(model: string): ModelProvider {
@@ -332,10 +375,9 @@ export class ModelRouter {
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    const res = await this.providerFor(req.model).chat(req);
-    this.totalUsage.inputTokens += res.usage.inputTokens;
-    this.totalUsage.outputTokens += res.usage.outputTokens;
-    return res;
+    return this.withFallback(req.model, (candidate) =>
+      this.providerFor(candidate).chat({ ...req, model: candidate }),
+    );
   }
 
   /**
@@ -344,16 +386,12 @@ export class ModelRouter {
    * UX contract (progressive `agent.message.delta` events) holds everywhere.
    */
   async chatStream(req: ChatRequest, onDelta: StreamDelta): Promise<ChatResponse> {
-    const provider = this.providerFor(req.model);
-    let res: ChatResponse;
-    if (provider.chatStream) {
-      res = await provider.chatStream(req, onDelta);
-    } else {
-      res = await provider.chat(req);
+    return this.withFallback(req.model, async (candidate) => {
+      const provider = this.providerFor(candidate);
+      if (provider.chatStream) return provider.chatStream({ ...req, model: candidate }, onDelta);
+      const res = await provider.chat({ ...req, model: candidate });
       for (let i = 0; i < res.text.length; i += 24) onDelta(res.text.slice(i, i + 24));
-    }
-    this.totalUsage.inputTokens += res.usage.inputTokens;
-    this.totalUsage.outputTokens += res.usage.outputTokens;
-    return res;
+      return res;
+    });
   }
 }

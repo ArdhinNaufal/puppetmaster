@@ -2,6 +2,7 @@ import {
   createWorkflow,
   getMission,
   getWorkflowWithGraph,
+  listAgents,
   listWorkflows,
   type Db,
 } from "@puppetmaster/db";
@@ -55,9 +56,19 @@ export function createAgentInvoker(deps: { db: Db; runtime: AgentRuntime }): Age
   };
 }
 
+/** Max delegation hops for agent.ask (Stage 8, §1.2 scoped multi-agent):
+ *  a mission already 2 hops deep may not delegate further. */
+const MAX_DELEGATION_DEPTH = 2;
+
 export function registerBridgeTools(
   registry: BuiltinToolRegistry,
-  deps: { db: Db; workspaceId: string; executor: WorkflowExecutor },
+  deps: {
+    db: Db;
+    workspaceId: string;
+    executor: WorkflowExecutor;
+    /** Enables agent.ask (agent → agent delegation via nested missions). */
+    agentInvoker?: AgentInvoker;
+  },
 ): void {
   registry.register(
     "workflow",
@@ -133,4 +144,62 @@ export function registerBridgeTools(
       return { workflowId: created.workflow.id, version: created.version.version };
     },
   );
+
+  // Agent-as-tool delegation (Stage 8, G12-lite): agent.ask runs another
+  // agent's tick as a nested mission and returns its reply. Depth-capped so
+  // delegation chains stay shallow (§1.2: strong single agents over deep
+  // teams); risky tools inside the child still gate on their own tiers.
+  if (deps.agentInvoker) {
+    const invoker = deps.agentInvoker;
+    registry.register(
+      "agent",
+      "ask",
+      `Delegate a task to another agent by id or exact name and await its reply (nested mission, max ${MAX_DELEGATION_DEPTH} hops).`,
+      "read_auto",
+      {
+        type: "object",
+        properties: {
+          agent: { type: "string", description: "Agent id (preferred) or exact name" },
+          message: { type: "string", description: "The task or question for that agent" },
+        },
+        required: ["agent", "message"],
+      },
+      async (args, ctx) => {
+        const callerMissionId = ctx.missionId;
+        if (!callerMissionId) throw new Error("agent.ask requires a mission context");
+        // Depth = number of mission ancestors of the caller.
+        let depth = 0;
+        let cursor: string | null = callerMissionId;
+        while (cursor && depth <= MAX_DELEGATION_DEPTH) {
+          const m = await getMission(deps.db, cursor);
+          cursor = m?.parentMissionId ?? null;
+          if (cursor) depth++;
+        }
+        if (depth >= MAX_DELEGATION_DEPTH) {
+          throw new Error(`agent.ask: delegation depth cap (${MAX_DELEGATION_DEPTH}) reached`);
+        }
+
+        const ref = String(args.agent ?? "");
+        const roster = await listAgents(deps.db, deps.workspaceId);
+        const target = roster.find((a) => a.id === ref) ?? roster.find((a) => a.name === ref);
+        if (!target) throw new Error(`agent "${ref}" not found`);
+        if (ctx.agentId && target.id === ctx.agentId) {
+          throw new Error("agent.ask: an agent cannot delegate to itself");
+        }
+
+        const result = await invoker({
+          agentId: target.id,
+          message: String(args.message ?? ""),
+          parentMissionId: callerMissionId,
+        });
+        return {
+          agentId: target.id,
+          agentName: target.name,
+          missionId: result.missionId,
+          status: result.status,
+          reply: result.output,
+        };
+      },
+    );
+  }
 }

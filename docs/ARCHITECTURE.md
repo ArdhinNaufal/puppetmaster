@@ -76,6 +76,10 @@
 - **Agent → workflow:** workflows are exposed to agents as MCP tools (`workflow.run`, `workflow.create_draft`), so an agent can launch or even draft workflows.
 - **Workflow → agent:** the Agent node sends a task to an agent and awaits its structured result (sync with timeout, or async continuation).
 - Shared mission context: a workflow started by an agent carries the agent's mission ID; traces nest.
+- **Agent → agent (Stage 8, G12-lite)**: `agent.ask` delegates a task to another agent by
+  id/name as a nested mission and returns its reply. Delegation depth is capped at 2 hops
+  (§1.2: strong single agents over deep team hierarchies), self-delegation is refused, and
+  risky tools inside the child still gate on their own tiers.
 
 ### 3.4 Tool Layer (MCP)
 - One catalog of MCP servers per workspace; per-agent and per-workflow **tool grants**.
@@ -94,6 +98,10 @@
 
 ### 3.5 Model Router
 - Provider abstraction (Anthropic / OpenAI / Ollama / vLLM) with per-agent model choice, fallbacks, token accounting, and streaming.
+- **Fallback chains (Stage 8)**: a model string may list candidates separated by `|`
+  (`"claude-sonnet-5|openai/gpt-5|mock"`); candidates are tried in order, per-model failure
+  counts are exposed at `GET /api/usage` (`routerFailures`), and llm.call audit entries record
+  `servedBy` when a fallback answered. Streaming (Stage 6) rides the same chain.
 
 ### 3.6 Policy & Approval Engine
 - Autonomy tiers per agent: **read = auto, write = approval, destructive = always confirm** (defaults; configurable per tool/action).

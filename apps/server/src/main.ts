@@ -215,9 +215,11 @@ if (seededTemplates > 0) app.log.info({ seededTemplates }, "seeded builtin templ
 
 // --- The bridge (ARCHITECTURE.md §3.3) ----------------------------------------
 // Workflow → agent: agent nodes dispatch a task and await the child mission.
-executor.setAgentInvoker(createAgentInvoker({ db, runtime: agentRuntime }));
-// Agent → workflow: workflows join the shared tool catalog (workflow.list/run/create_draft).
-registerBridgeTools(tools, { db, workspaceId, executor });
+const agentInvoker = createAgentInvoker({ db, runtime: agentRuntime });
+executor.setAgentInvoker(agentInvoker);
+// Agent → workflow: workflows join the shared tool catalog (workflow.list/run/
+// create_draft). Stage 8: agentInvoker also enables agent.ask delegation.
+registerBridgeTools(tools, { db, workspaceId, executor, agentInvoker });
 
 // Knowledge base (Stage 3): kb.search / kb.read join the shared catalog so
 // agents and workflow nodes retrieve cited chunks from workspace documents.
@@ -943,9 +945,11 @@ app.get("/api/usage", async () => {
     monthUsageBreakdown(db, workspaceId),
     monthTokens(db, workspaceId),
   ]);
+  const routerFailures = router.failureStats();
   const names = new Map((await listAgents(db, workspaceId)).map((a) => [a.id, a.name]));
   return {
     monthTokens: total,
+    routerFailures,
     breakdown: rows.map((r) => ({
       ...r,
       inputTokens: Number(r.inputTokens),
