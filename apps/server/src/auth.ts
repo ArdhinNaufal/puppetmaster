@@ -85,6 +85,10 @@ const POLICY: PolicyRule[] = [
   { methods: ["POST"], path: /^\/api\/missions(\/|$)/, role: "builder" },
   // Knowledge base (Stage 3): browsing/search is member; upload/delete is builder+.
   { methods: ["POST", "DELETE"], path: /^\/api\/kb(\/|$)/, role: "builder" },
+  // Stage 5: running evals and managing budgets/usage are admin operations.
+  { methods: ["GET", "POST"], path: /^\/api\/evals(\/|$)/, role: "admin" },
+  { methods: ["GET"], path: /^\/api\/usage$/, role: "admin" },
+  { methods: ["GET", "POST", "DELETE"], path: /^\/api\/budgets(\/|$)/, role: "admin" },
   // Templates: browsing is open (member); instantiate/publish/delete are builder+.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/templates(\/|$)/, role: "builder" },
   // Agent CRUD is builder-tier, but chatting with an agent is core member UX.

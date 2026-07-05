@@ -127,6 +127,21 @@
   the same retrieval path as the tool. REST: `/api/kb/documents[...]`, `/api/kb/search`
   (upload/delete builder+).
 
+### 3.9 Evals & observability (Stage 5)
+- **Eval harness** (τ-bench style, §1.5): golden tasks run k× against a fresh ephemeral PGlite
+  with the deterministic mock provider; grading = mission outcome + output predicate +
+  **DB-state predicate** + **trajectory assertions** (must-call / may-call-only over the step
+  log, catching "corrupt success"). pass^k requires all k runs green. CLI `pnpm eval [--k N]`;
+  `POST /api/evals/run` stores results in `eval_runs` for the EVALS view (admin).
+- **OTel GenAI export**: with `OTEL_EXPORTER_OTLP_ENDPOINT` set, every finished mission is
+  exported as one OTLP/HTTP JSON trace — root mission span + child spans per step, `gen_ai.*`
+  semantic-convention attributes (operation name, request model, token usage). Spans are built
+  from the persisted step log, so durations are real and the hot path pays nothing.
+- **Cost ledger + budgets**: every `llm.call` audit entry also lands in `usage_ledger`;
+  `GET /api/usage` aggregates month-to-date by agent + model. `budgets` (workspace-wide or
+  per-agent monthly token limits, admin CRUD at `/api/budgets`) gate new agent ticks behind an
+  approval when exhausted — the operator can approve a one-off override or reject the tick.
+
 ## 4. Data model (core tables)
 
 `users`, `workspaces`, `memberships(role)`, `agents`, `agent_memories`, `workflows`,

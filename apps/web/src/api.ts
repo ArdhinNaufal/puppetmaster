@@ -365,6 +365,44 @@ export const kbApi = {
     fetch(`/api/kb/search?q=${encodeURIComponent(q)}&limit=${limit}`).then(json<KbSearchHit[]>),
 };
 
+// --- Evals & observability (Stage 5) ----------------------------------------------
+
+export interface EvalRun {
+  id: string;
+  suite: string;
+  k: number;
+  passed: number;
+  total: number;
+  results: { id: string; description: string; passes: boolean[]; pass: boolean; trajectoryOk: boolean; notes: string[] }[];
+  createdAt: string;
+}
+
+export interface UsageBreakdownRow {
+  agentId: string | null;
+  agentName: string | null;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  calls: number;
+}
+
+export interface Budget {
+  id: string;
+  agentId: string | null;
+  monthlyTokenLimit: number;
+  createdAt: string;
+}
+
+export const opsApi = {
+  listEvals: () => fetch("/api/evals").then(json<EvalRun[]>),
+  runEvals: (k = 3) => post("/api/evals/run", { k }).then(json<EvalRun>),
+  usage: () => fetch("/api/usage").then(json<{ monthTokens: number; breakdown: UsageBreakdownRow[] }>),
+  listBudgets: () => fetch("/api/budgets").then(json<Budget[]>),
+  createBudget: (input: { agentId?: string | null; monthlyTokenLimit: number }) =>
+    post("/api/budgets", input).then(json<Budget>),
+  deleteBudget: (id: string) => fetch(`/api/budgets/${id}`, { method: "DELETE" }),
+};
+
 export type BusEvent =
   | { type: "mission.started"; missionId: string; agentId?: string; at: string }
   | { type: "agent.message"; agentId: string; missionId: string; role: string; text: string; at: string }

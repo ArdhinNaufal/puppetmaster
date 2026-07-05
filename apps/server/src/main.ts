@@ -3,7 +3,10 @@ import websocket from "@fastify/websocket";
 import { WorkflowGraph } from "@puppetmaster/shared";
 import {
   appendAudit,
+  budgetsForAgent,
   checkAndPinToolHash,
+  createBudget,
+  deleteBudget,
   createAgent,
   createDb,
   createTemplate,
@@ -29,8 +32,11 @@ import {
   listAgents,
   listApprovals,
   listAudit,
+  insertEvalRun,
+  listBudgets,
   listDeadLetterMissions,
   listDocuments,
+  listEvalRuns,
   listMemories,
   listMissions,
   listPoliciesForAgent,
@@ -38,6 +44,9 @@ import {
   listWorkflows,
   migrate,
   missionUsage,
+  monthTokens,
+  monthUsageBreakdown,
+  recordUsage,
   requestMissionCancel,
   resetMissionForRetry,
   resolveApproval,
@@ -70,6 +79,7 @@ import {
   registerBridgeTools,
   registerKbTools,
   replayMission,
+  startOtelExporter,
   resolveCredentialEnv,
   startAgentTick,
   startWorkflow,
@@ -82,6 +92,7 @@ import {
 import { utilsServerPath } from "@puppetmaster/mcp-connectors";
 import { registerAuth } from "./auth.js";
 import { makeCredentialLookup, registerSecurityRoutes } from "./security.js";
+import { runSuite } from "./eval/harness.js";
 import { BUILTIN_TEMPLATES } from "./seeds.js";
 import { createAuditSink, startAuditProjector } from "./audit.js";
 import {
@@ -134,7 +145,24 @@ const embedder = createEmbedder({
 // Append-only audit log (ARCHITECTURE.md §3.6): the kernel writes LLM/tool
 // calls through this sink; a bus projector adds mission lifecycle + approval
 // requests; endpoints add approval decisions and auth/member actions.
-const auditSink = createAuditSink(db);
+// Stage 5: llm.call entries also feed the usage ledger (cost/budgets).
+const baseAuditSink = createAuditSink(db);
+const auditSink: typeof baseAuditSink = async (entry) => {
+  await baseAuditSink(entry);
+  if (entry.action === "llm.call" && entry.detail && typeof entry.detail === "object") {
+    const usage = (entry.detail as { usage?: { inputTokens?: number; outputTokens?: number } }).usage;
+    if (usage) {
+      recordUsage(db, {
+        workspaceId: entry.workspaceId,
+        agentId: entry.actorKind === "agent" ? entry.actorId : null,
+        missionId: entry.missionId ?? null,
+        model: entry.target ?? "",
+        inputTokens: usage.inputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0,
+      }).catch(() => {});
+    }
+  }
+};
 const executor = new WorkflowExecutor({ db, bus, tools, audit: auditSink });
 const agentRuntime = new AgentRuntime({
   db,
@@ -146,6 +174,17 @@ const agentRuntime = new AgentRuntime({
   // Approval auto-allow policies (Stage 1): matching gated calls skip the
   // human gate and are audited as approval.auto.
   policyLookup: (agentId) => listPoliciesForAgent(db, workspaceId, agentId),
+  // Budget gate (Stage 5): an exhausted monthly token budget pauses new
+  // ticks behind an approval instead of silently burning tokens.
+  budgetGate: async (wsId, agentId) => {
+    for (const b of await budgetsForAgent(db, wsId, agentId)) {
+      const used = await monthTokens(db, wsId, b.agentId ? agentId : undefined);
+      if (used >= b.monthlyTokenLimit) {
+        return `${used}/${b.monthlyTokenLimit} tokens used${b.agentId ? "" : " across the workspace"}`;
+      }
+    }
+    return null;
+  },
 });
 
 // Credentials vault (Stage 1): AES-256-GCM under PUPPETMASTER_MASTER_KEY.
@@ -153,6 +192,13 @@ const agentRuntime = new AgentRuntime({
 const masterKey = process.env.PUPPETMASTER_MASTER_KEY?.trim() || null;
 const credentialLookup = makeCredentialLookup(db, workspaceId, masterKey);
 const auditUnsub = startAuditProjector(bus, db);
+
+// OTel GenAI export (Stage 5): finished missions become gen_ai.* traces
+// POSTed as OTLP/HTTP JSON — pluggable into any observability stack.
+const otelEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim();
+const otelUnsub = otelEndpoint
+  ? startOtelExporter(bus, db, otelEndpoint, { log: (msg, err) => app.log.warn({ err }, msg) })
+  : null;
 
 // Seed the first-party template catalog (PRD §6 marketplace), idempotently.
 const seededTemplates = await seedBuiltinTemplates(db, BUILTIN_TEMPLATES);
@@ -639,6 +685,77 @@ app.get("/api/agents/:id/memory-search", async (req) => {
   return rows.map((r) => ({ id: r.id, content: r.content, score: null }));
 });
 
+// --- Evals & observability (Stage 5) --------------------------------------------
+app.get("/api/evals", async () => listEvalRuns(db, workspaceId));
+
+/** Run the golden suite (ephemeral PGlite per run, mock provider) and store
+ *  the pass^k results for the EVALS panel. */
+app.post("/api/evals/run", async (req) => {
+  const body = (req.body ?? {}) as { k?: number };
+  const k = Math.min(Math.max(Number(body.k ?? 3), 1), 10);
+  const suite = await runSuite(k);
+  const row = await insertEvalRun(db, { workspaceId, ...suite });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "eval.run",
+    detail: { k, passed: suite.passed, total: suite.total },
+  });
+  return row;
+});
+
+/** Month-to-date cost ledger, grouped by agent + model. */
+app.get("/api/usage", async () => {
+  const [rows, total] = await Promise.all([
+    monthUsageBreakdown(db, workspaceId),
+    monthTokens(db, workspaceId),
+  ]);
+  const names = new Map((await listAgents(db, workspaceId)).map((a) => [a.id, a.name]));
+  return {
+    monthTokens: total,
+    breakdown: rows.map((r) => ({
+      ...r,
+      inputTokens: Number(r.inputTokens),
+      outputTokens: Number(r.outputTokens),
+      calls: Number(r.calls),
+      agentName: r.agentId ? (names.get(r.agentId) ?? null) : null,
+    })),
+  };
+});
+
+app.get("/api/budgets", async () => listBudgets(db, workspaceId));
+
+app.post("/api/budgets", async (req, reply) => {
+  const body = (req.body ?? {}) as { agentId?: string | null; monthlyTokenLimit?: number };
+  const limit = Number(body.monthlyTokenLimit);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return reply.code(400).send({ error: "monthlyTokenLimit must be a positive number" });
+  }
+  const row = await createBudget(db, {
+    workspaceId,
+    agentId: body.agentId ?? null,
+    monthlyTokenLimit: Math.floor(limit),
+  });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "budget.create",
+    target: body.agentId ?? "workspace",
+    detail: { monthlyTokenLimit: Math.floor(limit) },
+  });
+  return reply.code(201).send(row);
+});
+
+app.delete("/api/budgets/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  await deleteBudget(db, id);
+  return reply.code(204).send();
+});
+
 // --- Knowledge base (Stage 3, PRD use-case 4) ----------------------------------
 app.get("/api/kb/documents", async () => listDocuments(db, workspaceId));
 
@@ -847,6 +964,7 @@ app.get("/api/events", { websocket: true }, (socket) => {
 async function shutdown() {
   app.log.info("shutting down");
   auditUnsub();
+  otelUnsub?.();
   await runner.close();
   for (const conn of mcpConnections) await conn.close().catch(() => {});
   await bus.close?.();

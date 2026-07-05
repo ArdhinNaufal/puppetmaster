@@ -8,3 +8,4 @@ export * from "./audit-repo.js";
 export * from "./security-repo.js";
 export * from "./durability-repo.js";
 export * from "./kb-repo.js";
+export * from "./ops-repo.js";

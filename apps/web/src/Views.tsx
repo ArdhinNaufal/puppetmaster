@@ -6,11 +6,14 @@ import {
   auditApi,
   kbApi,
   memberApi,
+  opsApi,
   templateApi,
   workspaceApi,
   type Agent,
   type AgentMemory,
   type AuditEntry,
+  type Budget,
+  type EvalRun,
   type KbDocument,
   type KbSearchHit,
   type MemberRow,
@@ -18,6 +21,7 @@ import {
   type Mission,
   type Role,
   type Template,
+  type UsageBreakdownRow,
   type Workflow,
   type Workspace,
 } from "./api.js";
@@ -808,6 +812,135 @@ export function KnowledgeView(props: { canBuild: boolean }) {
             </div>
           </Panel>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- Evals */
+
+/** EVALS view (Stage 5): run the golden suite (pass^k, trajectory checks),
+ *  browse past runs, and manage the cost ledger + monthly token budgets. */
+export function EvalsView(props: { agents: Agent[] }) {
+  const [runs, setRuns] = useState<EvalRun[]>([]);
+  const [usage, setUsage] = useState<{ monthTokens: number; breakdown: UsageBreakdownRow[] } | null>(null);
+  const [budgets, setBudgets] = useState<Budget[]>([]);
+  const [running, setRunning] = useState(false);
+  const [limit, setLimit] = useState("");
+  const [budgetAgent, setBudgetAgent] = useState("");
+
+  const refresh = () => {
+    opsApi.listEvals().then(setRuns).catch(() => {});
+    opsApi.usage().then(setUsage).catch(() => {});
+    opsApi.listBudgets().then(setBudgets).catch(() => {});
+  };
+  useEffect(refresh, []);
+
+  const run = async () => {
+    setRunning(true);
+    try {
+      await opsApi.runEvals(3);
+      refresh();
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const agentName = (id: string | null) =>
+    id ? (props.agents.find((a) => a.id === id)?.name ?? id.slice(0, 8)) : "workspace";
+
+  return (
+    <div className="view-wrap">
+      <div className="stat-row">
+        <Panel><Stat label="LAST SUITE" value={runs[0] ? `${runs[0].passed}/${runs[0].total}` : "—"} tone="accent" /></Panel>
+        <Panel><Stat label="TOKENS THIS MONTH" value={usage?.monthTokens ?? 0} /></Panel>
+        <Panel><Stat label="BUDGETS" value={budgets.length} /></Panel>
+      </div>
+
+      <div className="tool-grid">
+        <Panel title="GOLDEN SUITE (pass^3 + trajectory)" scroll
+          actions={<Chip tiny tone="accent" onClick={run}>{running ? "RUNNING…" : "RUN SUITE"}</Chip>}>
+          <ul className="tool-list">
+            {runs.map((r) => (
+              <li key={r.id} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">{r.passed}/{r.total} PASSED · k={r.k}</span>
+                  <span className="tag-lo">{new Date(r.createdAt).toLocaleString()}</span>
+                </div>
+                {r.results.map((t) => (
+                  <p key={t.id} className="tool-desc">
+                    {t.pass ? "✅" : "❌"} {t.id} [{t.passes.map((p) => (p ? "✓" : "✗")).join("")}]
+                    {!t.trajectoryOk && " · trajectory violation"}
+                    {t.notes.length > 0 && ` — ${t.notes[0]}`}
+                  </p>
+                ))}
+              </li>
+            ))}
+            {runs.length === 0 && <li className="dim pad">No eval runs yet.</li>}
+          </ul>
+        </Panel>
+
+        <Panel title="COST LEDGER (MONTH TO DATE)" scroll>
+          <ul className="tool-list">
+            {(usage?.breakdown ?? []).map((row, i) => (
+              <li key={i} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">{row.agentName ?? "system"} · {row.model || "?"}</span>
+                  <span className="tag-lo">{row.inputTokens + row.outputTokens} TOK</span>
+                </div>
+                <p className="tool-desc">{row.calls} calls · {row.inputTokens} in / {row.outputTokens} out</p>
+              </li>
+            ))}
+            {(usage?.breakdown ?? []).length === 0 && <li className="dim pad">No LLM usage recorded this month.</li>}
+          </ul>
+        </Panel>
+
+        <Panel title="MONTHLY TOKEN BUDGETS" scroll>
+          <div className="pad" style={{ display: "flex", gap: 8 }}>
+            <select value={budgetAgent} onChange={(e) => setBudgetAgent(e.target.value)}>
+              <option value="">whole workspace</option>
+              {props.agents.map((a) => (
+                <option key={a.id} value={a.id}>{a.name}</option>
+              ))}
+            </select>
+            <input
+              className="text-input"
+              placeholder="token limit e.g. 100000"
+              value={limit}
+              onChange={(e) => setLimit(e.target.value)}
+              style={{ width: 160 }}
+            />
+            <button
+              className="chip"
+              onClick={() => {
+                const n = Number(limit);
+                if (Number.isFinite(n) && n > 0) {
+                  opsApi.createBudget({ agentId: budgetAgent || null, monthlyTokenLimit: n }).then(() => {
+                    setLimit("");
+                    refresh();
+                  });
+                }
+              }}
+            >
+              ADD BUDGET
+            </button>
+          </div>
+          <ul className="tool-list">
+            {budgets.map((b) => (
+              <li key={b.id} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">{agentName(b.agentId)}</span>
+                  <span className="tag-lo">{b.monthlyTokenLimit} TOK/MO</span>
+                </div>
+                <p className="tool-desc">
+                  Exceeding this pauses new ticks behind an approval.{" "}
+                  <button className="chip tiny" onClick={() => opsApi.deleteBudget(b.id).then(refresh)}>REMOVE</button>
+                </p>
+              </li>
+            ))}
+            {budgets.length === 0 && <li className="dim pad">No budgets — ticks run ungated.</li>}
+          </ul>
+        </Panel>
       </div>
     </div>
   );

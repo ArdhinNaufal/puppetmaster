@@ -350,6 +350,49 @@ export const approvalPolicies = pgTable("approval_policies", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Eval harness results (Stage 5, G7): one row per suite run — per-task
+ *  pass^k outcomes and trajectory verdicts, shown in the EVALS view. */
+export const evalRuns = pgTable("eval_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  suite: text("suite").notNull().default("golden"),
+  k: integer("k").notNull().default(3),
+  passed: integer("passed").notNull().default(0),
+  total: integer("total").notNull().default(0),
+  /** Per-task detail: [{ id, passes: bool[], passK, trajectoryOk, notes }]. */
+  results: jsonb("results").notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Cost ledger (Stage 5, G8): one row per LLM call, aggregated into monthly
+ *  workspace/agent usage for the budgets below. */
+export const usageLedger = pgTable("usage_ledger", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  agentId: uuid("agent_id"),
+  missionId: uuid("mission_id"),
+  model: text("model").notNull().default(""),
+  inputTokens: integer("input_tokens").notNull().default(0),
+  outputTokens: integer("output_tokens").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Monthly token budgets; agentId null = whole workspace. When month-to-date
+ *  usage exceeds the limit, new agent ticks gate behind an approval. */
+export const budgets = pgTable("budgets", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+  monthlyTokenLimit: integer("monthly_token_limit").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const schema = {
   users,
   sessions,
@@ -372,4 +415,7 @@ export const schema = {
   nodeExecutions,
   documents,
   documentChunks,
+  evalRuns,
+  usageLedger,
+  budgets,
 };

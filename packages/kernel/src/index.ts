@@ -20,3 +20,4 @@ export * from "./untrusted.js";
 export * from "./policy.js";
 export * from "./replay.js";
 export * from "./kb.js";
+export * from "./otel.js";

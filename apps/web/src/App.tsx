@@ -18,12 +18,12 @@ import {
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
 import { Login } from "./Login.js";
-import { AdminView, AgentsView, KnowledgeView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
+import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 import { NODE_META } from "./FlowNode.js";
 
-const VIEWS = ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "admin"] as const;
+const VIEWS = ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
 type View = (typeof VIEWS)[number];
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
@@ -477,6 +477,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             />
           )}
           {view === "tools" && <ToolsView />}
+          {view === "evals" && RANK[me.role] >= RANK.admin && <EvalsView agents={agents} />}
           {view === "admin" && RANK[me.role] >= RANK.admin && (
             <AdminView
               meId={me.user.id}

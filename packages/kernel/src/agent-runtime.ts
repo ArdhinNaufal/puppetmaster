@@ -91,6 +91,9 @@ export interface AgentRuntimeDeps {
   /** Approval auto-allow policies for an agent (own + workspace-wide); a
    *  matching gated call executes without pausing, audited as approval.auto. */
   policyLookup?: (agentId: string) => Promise<ApprovalPolicyLike[]>;
+  /** Budget gate (Stage 5, G8): non-null reason = month-to-date tokens exceed
+   *  a budget → the tick pauses behind an approval before any LLM call. */
+  budgetGate?: (workspaceId: string, agentId: string) => Promise<string | null>;
 }
 
 /** Tool results are external data: wrap them in untrusted-data delimiters
@@ -117,6 +120,7 @@ export class AgentRuntime {
   private readonly embedder: EmbeddingProvider | null;
   private readonly audit: AuditSink | null;
   private readonly policyLookup: AgentRuntimeDeps["policyLookup"] | null;
+  private readonly budgetGate: AgentRuntimeDeps["budgetGate"] | null;
 
   constructor(deps: AgentRuntimeDeps) {
     this.db = deps.db;
@@ -126,6 +130,7 @@ export class AgentRuntime {
     this.embedder = deps.embedder ?? null;
     this.audit = deps.audit ?? null;
     this.policyLookup = deps.policyLookup ?? null;
+    this.budgetGate = deps.budgetGate ?? null;
   }
 
   /** Best-effort audit; never let a logging failure break the tick. */
@@ -273,6 +278,56 @@ export class AgentRuntime {
     // procedural memories written when the tick succeeds.
     const taskMessage = ((mission.input ?? {}) as { message?: string }).message ?? "";
     const toolsUsed: string[] = [];
+
+    // Budget gate (Stage 5, G8): a new tick whose agent/workspace is over a
+    // monthly token budget pauses behind an approval before any LLM call; the
+    // operator may approve to run anyway or reject to stop it.
+    const budgetCursor = cursor as typeof cursor & { budgetApprovalId?: string; budgetCleared?: boolean };
+    if (!resuming) {
+      if (budgetCursor.budgetApprovalId && !budgetCursor.budgetCleared) {
+        const approval = await getApproval(this.db, budgetCursor.budgetApprovalId);
+        if (!approval || approval.status === "pending") return "awaiting_approval";
+        if (approval.status === "rejected") {
+          return this.finish(missionId, "failed", null, "budget-exceeded tick rejected by operator");
+        }
+        budgetCursor.budgetCleared = true;
+        await updateMission(this.db, missionId, { cursor: { ...budgetCursor } });
+      } else if (!budgetCursor.budgetApprovalId && this.budgetGate) {
+        let reason: string | null = null;
+        try {
+          reason = await this.budgetGate(mission.workspaceId, agent.id);
+        } catch {
+          reason = null; /* a broken gate must not block normal operation */
+        }
+        if (reason) {
+          const approval = await createApproval(this.db, {
+            missionId,
+            nodeId: "budget",
+            prompt: `Token budget exceeded for agent "${agent.name}" (${reason}). Run this tick anyway?`,
+            tier: "write_approved",
+          });
+          await updateMission(this.db, missionId, {
+            status: "awaiting_approval",
+            cursor: { ...budgetCursor, budgetApprovalId: approval.id },
+          });
+          await this.recordAudit({
+            ...auditActor,
+            action: "budget.gate",
+            target: agent.id,
+            detail: { reason },
+          });
+          await this.bus.publish({
+            type: "approval.requested",
+            missionId,
+            nodeId: "budget",
+            approvalId: approval.id,
+            prompt: approval.prompt,
+            at: now().toISOString(),
+          });
+          return "awaiting_approval";
+        }
+      }
+    }
 
     if (!resuming) {
       await updateMission(this.db, missionId, { status: "running", startedAt: now() });

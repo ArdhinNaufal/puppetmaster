@@ -22,8 +22,11 @@ export interface DbHandle {
 export async function createDb(opts?: {
   databaseUrl?: string | null;
   dataDir?: string;
+  /** Ignore DATABASE_URL/PGLITE_DATA_DIR: always a fresh in-memory PGlite
+   *  (the eval harness's isolated per-run store). */
+  ephemeral?: boolean;
 }): Promise<DbHandle> {
-  const url = opts?.databaseUrl ?? process.env.DATABASE_URL ?? null;
+  const url = opts?.ephemeral ? null : (opts?.databaseUrl ?? process.env.DATABASE_URL ?? null);
 
   if (url) {
     const { Pool } = await import("pg");
@@ -36,7 +39,9 @@ export async function createDb(opts?: {
   const { vector } = await import("@electric-sql/pglite/vector");
   // A dataDir persists PGlite to disk — set PGLITE_DATA_DIR to share one store
   // between the demo seeder and the server (both keyless).
-  const dataDir = opts?.dataDir ?? process.env.PGLITE_DATA_DIR ?? undefined;
+  const dataDir = opts?.ephemeral
+    ? undefined
+    : (opts?.dataDir ?? process.env.PGLITE_DATA_DIR ?? undefined);
   const client = await PGlite.create({
     dataDir,
     extensions: { vector },
@@ -268,6 +273,34 @@ const DDL: string[] = [
   `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS importance real NOT NULL DEFAULT 0.5`,
   `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false`,
   `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS last_accessed_at timestamptz`,
+  `CREATE TABLE IF NOT EXISTS eval_runs (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     suite text NOT NULL DEFAULT 'golden',
+     k integer NOT NULL DEFAULT 3,
+     passed integer NOT NULL DEFAULT 0,
+     total integer NOT NULL DEFAULT 0,
+     results jsonb NOT NULL DEFAULT '[]',
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS usage_ledger (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     agent_id uuid,
+     mission_id uuid,
+     model text NOT NULL DEFAULT '',
+     input_tokens integer NOT NULL DEFAULT 0,
+     output_tokens integer NOT NULL DEFAULT 0,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS usage_ledger_workspace_idx ON usage_ledger(workspace_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS budgets (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     agent_id uuid REFERENCES agents(id) ON DELETE CASCADE,
+     monthly_token_limit integer NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {
