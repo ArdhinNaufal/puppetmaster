@@ -82,6 +82,7 @@ them in your shell or prefix the run command:
 | `PUPPETMASTER_MASTER_KEY` | *(unset → vault off)* | passphrase sealing the credentials vault (AES-256-GCM); required to store secrets and resolve `{{credential:NAME}}` refs in `MCP_SERVERS` env |
 | `HTTP_ALLOWED_HOSTS` | *(unset → unrestricted)* | comma-separated egress allowlist for the `http.get` tool, e.g. `api.github.com,acme.io` (subdomains match) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset → off)* | OTLP/HTTP collector base URL; finished missions are exported as gen_ai.* traces to `<base>/v1/traces` |
+| `MCP_REGISTRY_URL` | `https://registry.modelcontextprotocol.io` | registry endpoint proxied by `GET /api/mcp/registry` |
 | `COPILOT_MODEL` | `mock` | model used for NL→workflow drafts and failure diagnoses (heuristic/deterministic under `mock`) |
 | `MEMORY_CAP` | `200` | per-agent long-term memory cap; overflow evicts the lowest importance×recency-decay unpinned memories |
 

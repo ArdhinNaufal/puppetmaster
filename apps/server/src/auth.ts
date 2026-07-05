@@ -85,6 +85,8 @@ const POLICY: PolicyRule[] = [
   { methods: ["POST"], path: /^\/api\/missions(\/|$)/, role: "builder" },
   // Knowledge base (Stage 3): browsing/search is member; upload/delete is builder+.
   { methods: ["POST", "DELETE"], path: /^\/api\/kb(\/|$)/, role: "builder" },
+  // Stage 7: MCP server management is admin (configs can carry credential refs).
+  { methods: ["GET", "POST", "DELETE"], path: /^\/api\/mcp(\/|$)/, role: "admin" },
   // Stage 5: running evals and managing budgets/usage are admin operations.
   { methods: ["GET", "POST"], path: /^\/api\/evals(\/|$)/, role: "admin" },
   { methods: ["GET"], path: /^\/api\/usage$/, role: "admin" },

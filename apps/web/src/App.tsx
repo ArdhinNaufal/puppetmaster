@@ -485,7 +485,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               }}
             />
           )}
-          {view === "tools" && <ToolsView />}
+          {view === "tools" && <ToolsView isAdmin={RANK[me.role] >= RANK.admin} />}
           {view === "evals" && RANK[me.role] >= RANK.admin && <EvalsView agents={agents} />}
           {view === "admin" && RANK[me.role] >= RANK.admin && (
             <AdminView

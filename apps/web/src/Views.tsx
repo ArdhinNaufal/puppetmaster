@@ -5,6 +5,7 @@ import {
   api,
   auditApi,
   kbApi,
+  mcpApi,
   memberApi,
   opsApi,
   templateApi,
@@ -16,6 +17,8 @@ import {
   type EvalRun,
   type KbDocument,
   type KbSearchHit,
+  type McpRegistryEntry,
+  type McpServerRow,
   type MemberRow,
   type MemoryHit,
   type Mission,
@@ -299,11 +302,39 @@ interface ToolInfo {
   tier: string;
 }
 
-export function ToolsView() {
+export function ToolsView(props: { isAdmin?: boolean }) {
   const [toolsList, setToolsList] = useState<ToolInfo[]>([]);
-  useEffect(() => {
+  const [mcpRows, setMcpRows] = useState<McpServerRow[]>([]);
+  const [regQuery, setRegQuery] = useState("");
+  const [regResults, setRegResults] = useState<McpRegistryEntry[] | null>(null);
+  const [regError, setRegError] = useState("");
+  const [addName, setAddName] = useState("");
+  const [addUrl, setAddUrl] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const refresh = () => {
     api.tools().then((t) => setToolsList(t as ToolInfo[])).catch(() => {});
-  }, []);
+    if (props.isAdmin) mcpApi.list().then(setMcpRows).catch(() => {});
+  };
+  useEffect(refresh, [props.isAdmin]);
+
+  const addServer = async (name: string, url: string) => {
+    if (!name.trim() || !url.trim()) return;
+    const res = await mcpApi.add({ name: name.trim().replace(/[^\w-]+/g, "-").slice(0, 40), url: url.trim() }).catch((e) => ({ connected: false, error: String(e) }) as { connected: boolean; error?: string });
+    setNotice(res.connected ? `connected (${(res as { toolCount?: number }).toolCount ?? 0} tools)` : `saved but not connected: ${res.error ?? "connect failed"}`);
+    refresh();
+  };
+
+  const searchRegistry = async () => {
+    setRegError("");
+    try {
+      const { servers } = await mcpApi.registry(regQuery);
+      setRegResults(servers);
+    } catch (e) {
+      setRegResults([]);
+      setRegError(e instanceof Error ? e.message : "registry unreachable");
+    }
+  };
 
   const servers = [...new Set(toolsList.map((t) => t.server))];
 
@@ -313,6 +344,63 @@ export function ToolsView() {
         <Panel><Stat label="MCP SERVERS / NAMESPACES" value={servers.length} tone="accent" /></Panel>
         <Panel><Stat label="TOOLS IN CATALOG" value={toolsList.length} /></Panel>
       </div>
+      {props.isAdmin && (
+        <div className="tool-grid">
+          <Panel title="WORKSPACE MCP SERVERS (streamable HTTP / stdio)" scroll>
+            <div className="pad" style={{ display: "flex", gap: 8 }}>
+              <input className="text-input" placeholder="name" value={addName}
+                onChange={(e) => setAddName(e.target.value)} style={{ width: 120 }} />
+              <input className="text-input" placeholder="https://example.com/mcp" value={addUrl}
+                onChange={(e) => setAddUrl(e.target.value)} style={{ flex: 1 }} />
+              <button className="chip" onClick={() => addServer(addName, addUrl)}>ADD</button>
+            </div>
+            {notice && <p className="dim pad">{notice}</p>}
+            <ul className="tool-list">
+              {mcpRows.map((r) => (
+                <li key={r.id} className="tool-row">
+                  <div className="tool-row-head">
+                    <span className="tool-name">{r.name} · {r.transport.toUpperCase()}</span>
+                    <span className="tag-lo">{r.connected ? `${r.toolCount} TOOLS` : "OFFLINE"}</span>
+                  </div>
+                  <p className="tool-desc">
+                    {r.url ?? r.command}{" "}
+                    <button className="chip tiny" onClick={() => mcpApi.remove(r.id).then(refresh)}>REMOVE</button>
+                  </p>
+                </li>
+              ))}
+              {mcpRows.length === 0 && <li className="dim pad">No workspace MCP servers — add one or search the registry.</li>}
+            </ul>
+          </Panel>
+          <Panel title="MCP REGISTRY" scroll>
+            <div className="pad" style={{ display: "flex", gap: 8 }}>
+              <input className="text-input" placeholder="Search the public registry…" value={regQuery}
+                onChange={(e) => setRegQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && searchRegistry()} style={{ flex: 1 }} />
+              <button className="chip" onClick={searchRegistry}>SEARCH</button>
+            </div>
+            {regError && <p className="dim pad">{regError}</p>}
+            <ul className="tool-list">
+              {(regResults ?? []).map((r, i) => (
+                <li key={i} className="tool-row">
+                  <div className="tool-row-head">
+                    <span className="tool-name">{r.name}</span>
+                    {r.remoteUrl ? (
+                      <button className="chip tiny"
+                        onClick={() => addServer(r.name.split("/").pop() ?? r.name, r.remoteUrl!)}>
+                        + ADD
+                      </button>
+                    ) : (
+                      <span className="tag-lo">NO REMOTE</span>
+                    )}
+                  </div>
+                  <p className="tool-desc">{r.description.slice(0, 160)}</p>
+                </li>
+              ))}
+              {regResults !== null && regResults.length === 0 && !regError && <li className="dim pad">No results.</li>}
+            </ul>
+          </Panel>
+        </div>
+      )}
       <div className="tool-grid">
         {servers.map((server) => (
           <Panel key={server} title={server.toUpperCase()} scroll>

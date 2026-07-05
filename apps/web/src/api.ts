@@ -420,6 +420,45 @@ export const opsApi = {
   deleteBudget: (id: string) => fetch(`/api/budgets/${id}`, { method: "DELETE" }),
 };
 
+// --- MCP servers & registry (Stage 7) ----------------------------------------------
+
+export interface McpServerRow {
+  id: string;
+  name: string;
+  transport: string;
+  url: string | null;
+  command: string | null;
+  tier: string;
+  enabled: boolean;
+  connected: boolean;
+  toolCount: number;
+  createdAt: string;
+}
+
+export interface McpRegistryEntry {
+  name: string;
+  description: string;
+  version: string;
+  remoteUrl: string | null;
+  remoteType: string | null;
+}
+
+export const mcpApi = {
+  list: () => fetch("/api/mcp/servers").then(json<McpServerRow[]>),
+  add: (input: {
+    name: string;
+    transport?: string;
+    url?: string;
+    command?: string;
+    args?: string[];
+    headers?: Record<string, string>;
+    tier?: string;
+  }) => post("/api/mcp/servers", input).then(json<{ id: string; connected: boolean; toolCount?: number; error?: string }>),
+  remove: (id: string) => fetch(`/api/mcp/servers/${id}`, { method: "DELETE" }),
+  registry: (q: string) =>
+    fetch(`/api/mcp/registry?q=${encodeURIComponent(q)}`).then(json<{ servers: McpRegistryEntry[] }>),
+};
+
 export type BusEvent =
   | { type: "mission.started"; missionId: string; agentId?: string; at: string }
   | { type: "agent.message"; agentId: string; missionId: string; role: string; text: string; at: string }

@@ -117,6 +117,19 @@ export class BuiltinToolRegistry implements ToolRegistry {
     this.tools.set(`${server}.${tool}`, { server, tool, description, tier, inputSchema, fn });
   }
 
+  /** Remove every tool registered under a server namespace (Stage 7: used
+   *  when a workspace MCP server is removed or reconnected). */
+  unregister(server: string): number {
+    let removed = 0;
+    for (const key of [...this.tools.keys()]) {
+      if (key.startsWith(`${server}.`)) {
+        this.tools.delete(key);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
   async callTool(
     server: string,
     tool: string,

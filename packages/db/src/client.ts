@@ -301,6 +301,21 @@ const DDL: string[] = [
      monthly_token_limit integer NOT NULL,
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     name text NOT NULL,
+     transport text NOT NULL DEFAULT 'http',
+     url text,
+     command text,
+     args jsonb NOT NULL DEFAULT '[]',
+     env jsonb NOT NULL DEFAULT '{}',
+     headers jsonb NOT NULL DEFAULT '{}',
+     tier text NOT NULL DEFAULT 'read_auto',
+     enabled boolean NOT NULL DEFAULT true,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (workspace_id, name)
+   )`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

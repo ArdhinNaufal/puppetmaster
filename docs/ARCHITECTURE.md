@@ -81,6 +81,16 @@
 - One catalog of MCP servers per workspace; per-agent and per-workflow **tool grants**.
 - Bundled connectors (Gmail, Slack, Sheets, HTTP/webhook, filesystem) run as sidecar MCP servers.
 - Credentials encrypted at rest (per-workspace key), injected into MCP servers at spawn.
+- **MCP 2026 reach (Stage 7)**: alongside stdio, a **streamable-HTTP client** — workspace
+  servers are stored in `mcp_servers` (added from the Tools view, not env) and reconnected on
+  boot; auth headers may reference the vault (`Authorization: Bearer {{credential:NAME}}`),
+  resolved only at connect. The public **MCP registry** is browsable
+  (`GET /api/mcp/registry?q=`, proxying registry.modelcontextprotocol.io) with one-click add.
+  Server **elicitation** requests are mapped into the approval inbox: the asking tool call
+  blocks while an `elicitation` approval is pending; approve → accept, reject/timeout →
+  decline, and requests outside any mission context are declined. Removing a server closes
+  the connection and unregisters its tools. (Full OAuth resource-server flows are not wired
+  yet — bearer tokens via the vault cover the common case.)
 
 ### 3.5 Model Router
 - Provider abstraction (Anthropic / OpenAI / Ollama / vLLM) with per-agent model choice, fallbacks, token accounting, and streaming.

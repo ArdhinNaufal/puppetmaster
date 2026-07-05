@@ -5,7 +5,12 @@ import {
   appendAudit,
   budgetsForAgent,
   checkAndPinToolHash,
+  createApproval,
   createBudget,
+  createMcpServer,
+  deleteMcpServer,
+  getMcpServer,
+  listMcpServers,
   deleteBudget,
   createAgent,
   createDb,
@@ -89,6 +94,7 @@ import {
   WorkflowExecutor,
   type EventBus,
   type McpConnection,
+  type McpServerConfig,
   type MissionDispatcher,
   type WorkflowRunner,
 } from "@puppetmaster/kernel";
@@ -242,20 +248,89 @@ const checkPin = async (server: string, tool: string, hash: string) => {
   return result;
 };
 
-const mcpConnections: McpConnection[] = [];
+// Elicitation → approvals (Stage 7): a server-initiated question pauses in
+// the approval inbox of the mission whose tool call triggered it; the tool
+// call blocks until the operator decides (bounded by the caller's timeout).
+const elicitation = async (missionId: string, message: string): Promise<boolean> => {
+  const approval = await createApproval(db, {
+    missionId,
+    nodeId: "elicitation",
+    prompt: message,
+    tier: "write_approved",
+  });
+  await bus.publish({
+    type: "approval.requested",
+    missionId,
+    nodeId: "elicitation",
+    approvalId: approval.id,
+    prompt: message,
+    at: new Date().toISOString(),
+  });
+  const deadline = Date.now() + 10 * 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 500));
+    const current = await getApproval(db, approval.id);
+    if (current?.status === "approved") return true;
+    if (current?.status === "rejected") return false;
+  }
+  return false;
+};
+
+/** Live MCP connections by catalog name (env-configured + workspace-added). */
+const mcpConnections = new Map<string, McpConnection>();
+
+async function connectConfiguredMcp(cfg: McpServerConfig): Promise<McpConnection> {
+  // Resolve {{credential:NAME}} refs from the vault; a missing credential
+  // fails this server's connect loudly rather than passing a placeholder.
+  const env = cfg.env ? await resolveCredentialEnv(cfg.env, credentialLookup) : cfg.env;
+  const headers = cfg.headers
+    ? await resolveCredentialEnv(cfg.headers, credentialLookup)
+    : cfg.headers;
+  const conn = await connectMcpServer(tools, { ...cfg, env, headers }, { checkPin, elicitation });
+  mcpConnections.set(cfg.name, conn);
+  app.log.info(
+    { server: cfg.name, transport: conn.transport, tools: conn.toolCount, drifted: conn.driftedTools },
+    "mcp server connected",
+  );
+  return conn;
+}
+
 for (const cfg of mcpConfigs) {
   try {
-    // Resolve {{credential:NAME}} refs from the vault; a missing credential
-    // fails this server's connect loudly rather than passing a placeholder.
-    const env = cfg.env ? await resolveCredentialEnv(cfg.env, credentialLookup) : cfg.env;
-    const conn = await connectMcpServer(tools, { ...cfg, env }, { checkPin });
-    mcpConnections.push(conn);
-    app.log.info(
-      { server: cfg.name, tools: conn.toolCount, drifted: conn.driftedTools },
-      "mcp server connected",
-    );
+    await connectConfiguredMcp(cfg);
   } catch (err) {
     app.log.error({ server: cfg.name, err }, "mcp server failed to connect");
+  }
+}
+
+// Workspace-persisted MCP servers (Stage 7): added from the Tools view /
+// registry, stored in the DB rather than env, reconnected on boot.
+const workspaceMcpConfig = (row: {
+  name: string;
+  transport: string;
+  url: string | null;
+  command: string | null;
+  args: unknown;
+  env: unknown;
+  headers: unknown;
+  tier: string;
+}): McpServerConfig => ({
+  name: row.name,
+  transport: row.transport === "stdio" ? "stdio" : "http",
+  url: row.url ?? undefined,
+  command: row.command ?? undefined,
+  args: Array.isArray(row.args) ? (row.args as string[]) : [],
+  env: (row.env ?? {}) as Record<string, string>,
+  headers: (row.headers ?? {}) as Record<string, string>,
+  tier: (row.tier as McpServerConfig["tier"]) ?? "read_auto",
+});
+
+for (const row of await listMcpServers(db, workspaceId)) {
+  if (!row.enabled) continue;
+  try {
+    await connectConfiguredMcp(workspaceMcpConfig(row));
+  } catch (err) {
+    app.log.error({ server: row.name, err }, "workspace mcp server failed to connect");
   }
 }
 
@@ -704,6 +779,143 @@ app.get("/api/agents/:id/memory-search", async (req) => {
   return rows.map((r) => ({ id: r.id, content: r.content, score: null }));
 });
 
+// --- MCP servers & registry (Stage 7, G10) ---------------------------------------
+app.get("/api/mcp/servers", async () => {
+  const rows = await listMcpServers(db, workspaceId);
+  return rows.map((r) => {
+    const conn = mcpConnections.get(r.name);
+    return {
+      id: r.id,
+      name: r.name,
+      transport: r.transport,
+      url: r.url,
+      command: r.command,
+      tier: r.tier,
+      enabled: r.enabled,
+      connected: Boolean(conn),
+      toolCount: conn?.toolCount ?? 0,
+      createdAt: r.createdAt,
+    };
+  });
+});
+
+/** Add + connect a workspace MCP server (streamable HTTP or stdio). Header/env
+ *  values may reference the vault as {{credential:NAME}} — stored unresolved. */
+app.post("/api/mcp/servers", async (req, reply) => {
+  const body = (req.body ?? {}) as {
+    name?: string;
+    transport?: string;
+    url?: string;
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    headers?: Record<string, string>;
+    tier?: string;
+  };
+  if (!body.name?.trim() || !/^[\w-]{1,64}$/.test(body.name.trim())) {
+    return reply.code(400).send({ error: "name is required (1-64 chars of [A-Za-z0-9_-])" });
+  }
+  const transport = body.transport === "stdio" ? "stdio" : "http";
+  if (transport === "http" && !body.url?.trim()) {
+    return reply.code(400).send({ error: "url is required for http transport" });
+  }
+  if (transport === "stdio" && !body.command?.trim()) {
+    return reply.code(400).send({ error: "command is required for stdio transport" });
+  }
+  const name = body.name.trim();
+  if (mcpConnections.has(name)) return reply.code(409).send({ error: `server "${name}" already connected` });
+
+  const row = await createMcpServer(db, {
+    workspaceId,
+    name,
+    transport,
+    url: body.url?.trim() ?? null,
+    command: body.command?.trim() ?? null,
+    args: Array.isArray(body.args) ? body.args : [],
+    env: body.env ?? {},
+    headers: body.headers ?? {},
+    tier: body.tier,
+  });
+  try {
+    const conn = await connectConfiguredMcp(workspaceMcpConfig(row));
+    await appendAudit(db, {
+      workspaceId,
+      actorKind: "user",
+      actorId: req.authUser?.id ?? null,
+      actorLabel: req.authUser?.email ?? "unknown",
+      action: "mcp.server.add",
+      target: name,
+      detail: { transport, url: row.url, tools: conn.toolCount },
+    });
+    return reply.code(201).send({ id: row.id, name, connected: true, toolCount: conn.toolCount });
+  } catch (err) {
+    // Keep the config (it may need a credential added first) but report the failure.
+    return reply.code(201).send({
+      id: row.id,
+      name,
+      connected: false,
+      error: err instanceof Error ? err.message : "connect failed",
+    });
+  }
+});
+
+app.delete("/api/mcp/servers/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const row = await getMcpServer(db, id);
+  if (!row || row.workspaceId !== workspaceId) return reply.code(404).send({ error: "server not found" });
+  const conn = mcpConnections.get(row.name);
+  if (conn) {
+    await conn.close().catch(() => {});
+    mcpConnections.delete(row.name);
+  }
+  tools.unregister(row.name);
+  await deleteMcpServer(db, id);
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "mcp.server.remove",
+    target: row.name,
+  });
+  return reply.code(204).send();
+});
+
+/** Browse the public MCP registry (Stage 7): proxied search, one-click add. */
+app.get("/api/mcp/registry", async (req, reply) => {
+  const { q } = req.query as { q?: string };
+  const base = process.env.MCP_REGISTRY_URL ?? "https://registry.modelcontextprotocol.io";
+  try {
+    const url = `${base.replace(/\/$/, "")}/v0/servers?limit=20${q?.trim() ? `&search=${encodeURIComponent(q.trim())}` : ""}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return reply.code(502).send({ error: `registry responded ${res.status}` });
+    const data = (await res.json()) as { servers?: unknown[] };
+    const servers = (data.servers ?? []).map((s) => {
+      const entry = s as {
+        name?: string;
+        description?: string;
+        version?: string;
+        remotes?: { type?: string; url?: string }[];
+        server?: { name?: string; description?: string; version?: string; remotes?: { type?: string; url?: string }[] };
+      };
+      const info = entry.server ?? entry;
+      const remote = (info.remotes ?? []).find((r) => r.url);
+      return {
+        name: info.name ?? "unknown",
+        description: info.description ?? "",
+        version: info.version ?? "",
+        remoteUrl: remote?.url ?? null,
+        remoteType: remote?.type ?? null,
+      };
+    });
+    return { servers };
+  } catch (err) {
+    return reply.code(502).send({
+      error: `registry unreachable: ${err instanceof Error ? err.message : "unknown"}`,
+    });
+  }
+});
+
 // --- Evals & observability (Stage 5) --------------------------------------------
 app.get("/api/evals", async () => listEvalRuns(db, workspaceId));
 
@@ -976,8 +1188,14 @@ app.post("/api/approvals/:id", async (req, reply) => {
     approved,
     at: new Date().toISOString(),
   });
-  // Resume the mission from its approval gate.
-  await runner.enqueue(approval.missionId);
+  // Resume the mission from its approval gate — but only when it is actually
+  // paused. Elicitation approvals (Stage 7) resolve while the mission is still
+  // running (the tool call is blocked in-process); re-enqueueing would run it
+  // concurrently with itself.
+  const gated = await getMission(db, approval.missionId);
+  if (gated?.status === "awaiting_approval" || gated?.status === "queued") {
+    await runner.enqueue(approval.missionId);
+  }
   return { ok: true, approved };
 });
 
@@ -999,7 +1217,7 @@ async function shutdown() {
   auditUnsub();
   otelUnsub?.();
   await runner.close();
-  for (const conn of mcpConnections) await conn.close().catch(() => {});
+  for (const conn of mcpConnections.values()) await conn.close().catch(() => {});
   await bus.close?.();
   await handle.close();
   await app.close();

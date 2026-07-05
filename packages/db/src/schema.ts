@@ -393,6 +393,32 @@ export const budgets = pgTable("budgets", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Workspace-persisted MCP server configs (Stage 7, G10): stdio commands or
+ *  streamable-HTTP endpoints, added from the Tools view / MCP registry (not
+ *  env). `headers`/`env` values may reference the vault as
+ *  `{{credential:NAME}}` — resolved at connect, never stored resolved. */
+export const mcpServers = pgTable(
+  "mcp_servers",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    /** "stdio" | "http" (streamable HTTP). */
+    transport: text("transport").notNull().default("http"),
+    url: text("url"),
+    command: text("command"),
+    args: jsonb("args").notNull().default([]),
+    env: jsonb("env").notNull().default({}),
+    headers: jsonb("headers").notNull().default({}),
+    tier: text("tier").notNull().default("read_auto"),
+    enabled: boolean("enabled").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqName: unique().on(t.workspaceId, t.name) }),
+);
+
 export const schema = {
   users,
   sessions,
@@ -418,4 +444,5 @@ export const schema = {
   evalRuns,
   usageLedger,
   budgets,
+  mcpServers,
 };
