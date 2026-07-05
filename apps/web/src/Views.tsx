@@ -4,12 +4,16 @@ import {
   agentApi,
   api,
   memberApi,
+  templateApi,
   workspaceApi,
   type Agent,
   type AgentMemory,
   type MemberRow,
+  type MemoryHit,
   type Mission,
   type Role,
+  type Template,
+  type Workflow,
   type Workspace,
 } from "./api.js";
 
@@ -83,6 +87,8 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [memories, setMemories] = useState<AgentMemory[]>([]);
+  const [memQuery, setMemQuery] = useState("");
+  const [memHits, setMemHits] = useState<MemoryHit[] | null>(null);
   const [saving, setSaving] = useState(false);
 
   const refresh = () => agentApi.list().then(setAgents).catch(() => {});
@@ -93,8 +99,20 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
   const agent = agents.find((a) => a.id === selected) ?? null;
 
   useEffect(() => {
+    setMemQuery("");
+    setMemHits(null);
     if (selected) agentApi.memories(selected).then(setMemories).catch(() => setMemories([]));
   }, [selected]);
+
+  const runMemSearch = async () => {
+    if (!selected) return;
+    const q = memQuery.trim();
+    if (!q) {
+      setMemHits(null);
+      return;
+    }
+    setMemHits(await agentApi.searchMemories(selected, q).catch(() => []));
+  };
 
   const patch = async (p: Record<string, unknown>) => {
     if (!agent || props.readOnly) return;
@@ -178,12 +196,40 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
               </div>
               <div>
                 <h3 className="ins-h">LONG-TERM MEMORY ({memories.length})</h3>
-                {memories.length === 0 && <p className="dim">Nothing remembered yet.</p>}
-                <ul className="mem-list">
-                  {memories.map((m) => (
-                    <li key={m.id}>▸ {m.content}</li>
-                  ))}
-                </ul>
+                <div className="mem-search">
+                  <input
+                    placeholder="Semantic recall…"
+                    value={memQuery}
+                    onChange={(e) => setMemQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && runMemSearch()}
+                  />
+                  <Chip tiny tone="accent" onClick={runMemSearch}>SEARCH</Chip>
+                  {memHits !== null && (
+                    <Chip tiny onClick={() => { setMemQuery(""); setMemHits(null); }}>CLEAR</Chip>
+                  )}
+                </div>
+                {memHits !== null ? (
+                  <>
+                    {memHits.length === 0 && <p className="dim">No matches.</p>}
+                    <ul className="mem-list">
+                      {memHits.map((m) => (
+                        <li key={m.id}>
+                          {m.score !== null && <span className="mem-score">{m.score.toFixed(2)}</span>}
+                          {m.content}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                ) : (
+                  <>
+                    {memories.length === 0 && <p className="dim">Nothing remembered yet.</p>}
+                    <ul className="mem-list">
+                      {memories.map((m) => (
+                        <li key={m.id}>▸ {m.content}</li>
+                      ))}
+                    </ul>
+                  </>
+                )}
               </div>
             </div>
             {saving && <span className="dim">saving…</span>}
@@ -233,6 +279,141 @@ export function ToolsView() {
                   </li>
                 ))}
             </ul>
+          </Panel>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- Templates */
+
+export function TemplatesView(props: {
+  canBuild: boolean;
+  onInstantiated: (kind: "workflow" | "agent", id: string) => void;
+}) {
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [wfs, setWfs] = useState<Workflow[]>([]);
+  const [ags, setAgs] = useState<Agent[]>([]);
+  const [pubRef, setPubRef] = useState("");
+  const [pubName, setPubName] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const refresh = () => templateApi.list().then(setTemplates).catch(() => {});
+  useEffect(() => {
+    refresh();
+    if (props.canBuild) {
+      api.listWorkflows().then(setWfs).catch(() => {});
+      agentApi.list().then(setAgs).catch(() => {});
+    }
+  }, [props.canBuild]);
+
+  const flash = (m: string) => {
+    setMsg(m);
+    setTimeout(() => setMsg(null), 2000);
+  };
+
+  const instantiate = async (t: Template) => {
+    try {
+      const r = await templateApi.instantiate(t.id);
+      flash(`Created ${r.kind} from “${t.name}”`);
+      props.onInstantiated(r.kind, r.id);
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "instantiate failed");
+    }
+  };
+
+  const remove = async (t: Template) => {
+    if (!confirm(`Delete template “${t.name}”?`)) return;
+    await templateApi.remove(t.id).catch(() => {});
+    refresh();
+  };
+
+  const publish = async () => {
+    if (!pubRef) return;
+    const [kind, sourceId] = pubRef.split(":") as ["workflow" | "agent", string];
+    try {
+      await templateApi.publish({ kind, sourceId, name: pubName.trim() || undefined });
+      setPubRef("");
+      setPubName("");
+      flash("Published to the workspace catalog");
+      refresh();
+    } catch (err) {
+      flash(err instanceof Error ? err.message : "publish failed");
+    }
+  };
+
+  const groups: { kind: "workflow" | "agent"; title: string }[] = [
+    { kind: "workflow", title: "WORKFLOW TEMPLATES" },
+    { kind: "agent", title: "AGENT TEMPLATES" },
+  ];
+
+  return (
+    <div className="view-wrap">
+      <div className="stat-row">
+        <Panel><Stat label="TEMPLATES" value={templates.length} tone="accent" /></Panel>
+        <Panel><Stat label="FIRST-PARTY" value={templates.filter((t) => t.builtin).length} /></Panel>
+        <Panel><Stat label="PUBLISHED" value={templates.filter((t) => !t.builtin).length} /></Panel>
+      </div>
+
+      {props.canBuild && (
+        <Panel title="PUBLISH A TEMPLATE" actions={msg ? <span className="dim">{msg}</span> : undefined}>
+          <div className="ins-row pad">
+            <label className="ins-field">
+              <span>Source workflow or agent</span>
+              <select value={pubRef} onChange={(e) => setPubRef(e.target.value)}>
+                <option value="">— select —</option>
+                {wfs.length > 0 && (
+                  <optgroup label="Workflows">
+                    {wfs.map((w) => <option key={w.id} value={`workflow:${w.id}`}>{w.name}</option>)}
+                  </optgroup>
+                )}
+                {ags.length > 0 && (
+                  <optgroup label="Agents">
+                    {ags.map((a) => <option key={a.id} value={`agent:${a.id}`}>{a.name}</option>)}
+                  </optgroup>
+                )}
+              </select>
+            </label>
+            <label className="ins-field">
+              <span>Template name (optional)</span>
+              <input value={pubName} onChange={(e) => setPubName(e.target.value)} placeholder="defaults to source name" />
+            </label>
+            <Chip tone="accent" onClick={publish}>PUBLISH</Chip>
+          </div>
+        </Panel>
+      )}
+
+      <div className="tool-grid">
+        {groups.map((g) => (
+          <Panel key={g.kind} title={g.title} scroll>
+            <div className="tpl-cards">
+              {templates.filter((t) => t.kind === g.kind).map((t) => (
+                <div key={t.id} className="tpl-card">
+                  <div className="tpl-head">
+                    <span className="tpl-name">{t.name}</span>
+                    <span className={`tpl-tag ${t.builtin ? "builtin" : "pub"}`}>
+                      {t.builtin ? "FIRST-PARTY" : "PUBLISHED"}
+                    </span>
+                  </div>
+                  <Chip tiny>{t.category}</Chip>
+                  <p className="tpl-desc">{t.description}</p>
+                  <div className="tpl-actions">
+                    {props.canBuild ? (
+                      <Chip tiny tone="accent" onClick={() => instantiate(t)}>USE THIS</Chip>
+                    ) : (
+                      <span className="tag-lo">BUILDER+ TO USE</span>
+                    )}
+                    {props.canBuild && !t.builtin && (
+                      <Chip tiny tone="danger" onClick={() => remove(t)}>DELETE</Chip>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {templates.filter((t) => t.kind === g.kind).length === 0 && (
+                <p className="dim pad">No {g.kind} templates.</p>
+              )}
+            </div>
           </Panel>
         ))}
       </div>

@@ -8,6 +8,8 @@ import {
   insertStep,
   saveMemory,
   searchMemories,
+  searchMemoriesByVector,
+  setMemoryEmbedding,
   updateAgent,
   updateMission,
   updateStep,
@@ -15,6 +17,7 @@ import {
 } from "@puppetmaster/db";
 import type { MissionStatus } from "@puppetmaster/shared";
 import type { EventBus } from "./bridge.js";
+import { toVectorLiteral, type EmbeddingProvider } from "./embeddings.js";
 import { ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
 
@@ -64,6 +67,9 @@ export interface AgentRuntimeDeps {
   bus: EventBus;
   router: ModelRouter;
   tools?: ToolRegistry;
+  /** When set, memories are embedded on save and recalled by pgvector cosine
+   *  similarity (RAG); otherwise recall falls back to keyword search. */
+  embedder?: EmbeddingProvider | null;
 }
 
 /**
@@ -79,12 +85,30 @@ export class AgentRuntime {
   private readonly bus: EventBus;
   private readonly router: ModelRouter;
   private readonly tools: ToolRegistry;
+  private readonly embedder: EmbeddingProvider | null;
 
   constructor(deps: AgentRuntimeDeps) {
     this.db = deps.db;
     this.bus = deps.bus;
     this.router = deps.router;
     this.tools = deps.tools ?? new BuiltinToolRegistry();
+    this.embedder = deps.embedder ?? null;
+  }
+
+  /** Long-term recall: pgvector cosine similarity when an embedder is
+   *  configured (and any memory is embedded), else keyword search. */
+  private async recall(agentId: string, query: string, limit = 5): Promise<string[]> {
+    if (this.embedder && query.trim()) {
+      try {
+        const [qv] = await this.embedder.embed([query]);
+        const hits = await searchMemoriesByVector(this.db, agentId, toVectorLiteral(qv!), limit);
+        if (hits.length > 0) return hits.map((h) => h.content);
+      } catch {
+        /* pgvector unavailable — fall through to keyword */
+      }
+    }
+    const rows = await searchMemories(this.db, agentId, query, limit);
+    return rows.map((r) => r.content);
   }
 
   async runMission(missionId: string): Promise<MissionStatus> {
@@ -161,8 +185,8 @@ export class AgentRuntime {
       const messages = toChatMessages(history);
       const lastUserText =
         [...messages].reverse().find((m) => m.role === "user")?.text ?? "";
-      const memories = await searchMemories(this.db, agent.id, firstWords(lastUserText), 5);
-      const system = buildSystemPrompt(agent, memories.map((m) => m.content));
+      const memories = await this.recall(agent.id, lastUserText, 5);
+      const system = buildSystemPrompt(agent, memories);
 
       // Shared tool catalog filtered by this agent's grants (ARCHITECTURE.md
       // §3.4): empty grants = full catalog; entries like "util.echo" or
@@ -326,12 +350,20 @@ export class AgentRuntime {
     args: Record<string, unknown>,
   ): Promise<unknown> {
     if (toolName === "memory__save") {
-      const row = await saveMemory(this.db, agentId, String(args.content ?? ""));
+      const content = String(args.content ?? "");
+      const row = await saveMemory(this.db, agentId, content);
+      if (this.embedder && content.trim()) {
+        try {
+          const [emb] = await this.embedder.embed([content]);
+          await setMemoryEmbedding(this.db, row.id, toVectorLiteral(emb!));
+        } catch {
+          /* keyword recall still works without the vector */
+        }
+      }
       return { saved: true, id: row.id };
     }
     if (toolName === "memory__search") {
-      const rows = await searchMemories(this.db, agentId, String(args.query ?? ""));
-      return rows.map((r) => r.content);
+      return this.recall(agentId, String(args.query ?? ""));
     }
     if (toolName === "scratchpad__set") {
       const agent = await getAgent(this.db, agentId);
@@ -402,6 +434,8 @@ function buildSystemPrompt(
   return `You are ${agent.name}, an agent on the Puppetmaster platform.\n\n${agent.persona}${pad}${mem}\n\nUse tools when they help. Save durable facts with memory__save. Tools marked write/destructive pause for human approval.`;
 }
 
+
+
 /** Rebuild the provider-agnostic conversation from persisted rows, merging
  *  consecutive tool-result rows into one turn (providers require tool results
  *  grouped in a single message). */
@@ -432,8 +466,4 @@ function toChatMessages(
     }
   }
   return out;
-}
-
-function firstWords(text: string, n = 4): string {
-  return text.split(/\s+/).slice(0, n).join(" ");
 }

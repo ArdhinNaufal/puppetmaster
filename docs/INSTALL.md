@@ -72,6 +72,9 @@ them in your shell or prefix the run command:
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | used by `ollama/<model>` agents                     |
 | `MCP_SERVERS` | *(unset → bundled utils connector)* | JSON array of MCP servers to spawn over stdio, e.g. `[{"name":"gh","command":"npx","args":["-y","@modelcontextprotocol/server-github"],"tier":"write_approved"}]` |
 | `MCP_DISABLE_BUNDLED` | *(unset)* | set to `1` to skip the bundled demo MCP connector      |
+| `EMBEDDING_PROVIDER` | `mock`          | RAG memory embeddings: `mock` (keyless, deterministic), `openai` (needs a key/base URL), or `none` (keyword-only recall) |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | embedding model when `EMBEDDING_PROVIDER=openai` |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | *(fall back to `OPENAI_*`)* | override the embeddings endpoint independently of the chat provider |
 
 Without any provider keys, agents on the `mock` model still work — a scripted provider used
 for demos and tests.
@@ -133,14 +136,23 @@ Sessions are HttpOnly-cookie based and live 30 days. Additional users are create
    order and then pause on the amber approval gate.
 3. Click **APPROVE** in the Approvals panel (left) — the mission should finish
    `SUCCEEDED` with an output value.
+4. **Templates:** open **TEMPLATES**, click **USE THIS** on "Starter: transform & echo" —
+   it clones into a live workflow on the canvas; run it. Any workflow/agent can be published
+   back with **PUBLISH A TEMPLATE**.
+5. **Semantic memory:** instantiate the **Research Scout** agent, chat `remember: <fact>` a
+   few times, then in **AGENTS** → inspector use the memory **SEARCH** box — results come back
+   ranked by pgvector cosine similarity (scores shown).
+6. **Adaptive suggestions:** the **SUGGESTED** sidebar panel lists your most-run agents and
+   workflows, most-used first.
 
 ## Notes
 
 - **No `DATABASE_URL`/`REDIS_URL` set:** the server still runs, using an in-process PGlite
   database (data is lost on restart) and an in-memory event bus (single-process only, no
   cron scheduling). Fine for a quick local trial; not for anything you want to keep.
-- **pgvector** is used for agent long-term memory starting in M2; it's already enabled in the
-  schema migration but nothing reads/writes vectors yet.
+- **pgvector** backs agent long-term memory: memories are embedded on save (default keyless
+  `mock` embedder; set `EMBEDDING_PROVIDER=openai` for a real model) and recalled by cosine
+  similarity, with keyword search as the fallback when the extension is unavailable.
 - **Ports:** server `4000`, web dev server `3000`, Postgres `5432`, Redis `6379`. Change via
   the environment variables above (server) or `apps/web/vite.config.ts` (web dev server / proxy
   target).

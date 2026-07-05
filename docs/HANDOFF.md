@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-04 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M4 complete (incl. auth/RBAC)
+**Date:** 2026-07-05 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M5 core complete (templates + RAG + adaptive UI)
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -54,12 +54,45 @@ decisions; this file only captures state and next steps.
 
 ## 3. Next steps (roadmap)
 
-1. Owner review of M1–M4 on `claude/kickoff-prompt-continuation-cy021r` (manual review
+1. Owner review of M1–M5 on `claude/kickoff-prompt-continuation-cy021r` (manual review
    pending).
-2. **M5 — ecosystem**: templates/marketplace, RAG pipeline (pgvector column is ready),
-   adaptive UI, Tauri desktop.
+2. **M5 remaining**: Tauri desktop client (Phase 2 packaging — needs the desktop
+   toolchain, not present in this env; the server core it wraps is ready).
 3. Security hardening candidates (later): per-webhook signing secrets (`/api/hooks/:id` is
    deliberately public), OIDC (ARCHITECTURE.md §6 "later"), append-only audit log surface.
+
+### M5 — ecosystem: templates, RAG, adaptive UI (verified in the browser)
+
+- **Templates / marketplace** (PRD §6): new `templates` table (`kind` workflow|agent,
+  `spec` jsonb, `builtin`, nullable `workspace_id` — null = first-party catalog, set =
+  workspace-published) + `template-repo.ts`. Five first-party templates seeded idempotently
+  on boot (`apps/server/src/seeds.ts`: three workflows, two agents). REST: `GET
+  /api/templates`, `POST /api/templates/:id/instantiate` (clone → live workflow/agent),
+  `POST /api/templates` (publish an existing workflow/agent), `DELETE /api/templates/:id`
+  (published only; builtins protected). Browsing is member-open; instantiate/publish/delete
+  are builder+ (RBAC rule added). **Web**: TEMPLATES view — cards grouped by kind with
+  category + first-party/published tags, "USE THIS" (routes to canvas/command), a publish
+  picker, and delete for published.
+- **RAG semantic memory** (PRD §5, ARCHITECTURE.md §3.1): `packages/kernel/src/embeddings.ts`
+  — `EmbeddingProvider` with a keyless deterministic `MockEmbeddingProvider` (stopword-filtered
+  bag-of-words hashing, default) and `OpenAICompatEmbeddingProvider` (`/v1/embeddings`,
+  requests `dimensions:1024`); every vector is `resizeTo(1024)` to fit the column. Memories
+  are embedded on `memory__save` and recalled by pgvector cosine (`<=>`) — `saveMemory` +
+  new `setMemoryEmbedding` / `searchMemoriesByVector` in the db package; the runtime's
+  `recall()` prefers vector search and falls back to keyword. Config: `EMBEDDING_PROVIDER`
+  (`mock`|`openai`|`none`), `EMBEDDING_MODEL`, `EMBEDDING_BASE_URL`/`_API_KEY`. **Web**: a
+  ranked memory **SEARCH** box in the agent inspector (scores shown), backed by
+  `GET /api/agents/:id/memory-search`.
+- **Adaptive UI** (PRD §5 "surface frequently used"): `GET /api/suggestions` derives the
+  most-run agents/workflows from mission counts (`missionUsage` repo). **Web**: a SUGGESTED
+  sidebar panel (arrangeable like the others; per-role preset placement) that jumps to the
+  agent/workflow on click, refreshed on every mission start/finish.
+- **Deferred**: Tauri desktop (Phase 2 packaging).
+- **Verified** (API + Playwright, real Redis + PGlite): 5 builtin templates seeded;
+  instantiate starter workflow → runs green (`HELLO, PUPPET`); publish → appears as a
+  workspace template; member gets 403 on instantiate but can browse; instantiate Research
+  Scout agent → teach 3 facts → semantic search ranks the DB fact top with a cosine score;
+  SUGGESTED lists the used agent/workflow with run counts.
 
 ### M4b — auth, members & RBAC (verified in the browser)
 

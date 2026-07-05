@@ -509,3 +509,27 @@ button { font-family: inherit; cursor: pointer; }
 }
 .role-badge.r-owner { color: var(--warn); border-color: var(--warn); }
 .inspector-grid.readonly { opacity: 0.75; pointer-events: none; }
+
+/* ---- Templates / marketplace (M5) --------------------------------------- */
+.tpl-cards { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem 0.7rem; }
+.tpl-card { border: 1px solid var(--stroke); border-radius: var(--radius); padding: 0.6rem 0.7rem; background: #070d11; }
+.tpl-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+.tpl-name { font-size: 0.78rem; color: var(--text-hi, #cfe9ee); }
+.tpl-tag { font-size: 0.54rem; letter-spacing: 0.14em; padding: 0.1rem 0.35rem; border-radius: var(--radius); border: 1px solid var(--stroke); color: var(--text-lo); }
+.tpl-tag.builtin { color: var(--accent); border-color: var(--accent); }
+.tpl-tag.pub { color: var(--warn); border-color: var(--warn); }
+.tpl-card .fui-chip { margin-top: 0.35rem; }
+.tpl-desc { font-size: 0.66rem; color: var(--text-lo); line-height: 1.5; margin: 0.35rem 0; }
+.tpl-actions { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.3rem; }
+
+/* ---- Semantic memory search (M5 RAG) ------------------------------------- */
+.mem-search { display: flex; gap: 0.35rem; align-items: center; margin-bottom: 0.5rem; }
+.mem-search input { flex: 1; }
+.mem-score {
+  display: inline-block;
+  min-width: 2.4em;
+  margin-right: 0.4rem;
+  font-size: 0.6rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}

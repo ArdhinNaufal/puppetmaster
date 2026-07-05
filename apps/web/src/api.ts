@@ -183,6 +183,49 @@ export const agentApi = {
     }).then(json<{ missionId: string }>),
   messages: (id: string) => fetch(`/api/agents/${id}/messages`).then(json<AgentMessage[]>),
   memories: (id: string) => fetch(`/api/agents/${id}/memories`).then(json<AgentMemory[]>),
+  searchMemories: (id: string, q: string) =>
+    fetch(`/api/agents/${id}/memory-search?q=${encodeURIComponent(q)}`).then(json<MemoryHit[]>),
+};
+
+/* ------------------------------------------------------ Templates & signals */
+
+export interface Template {
+  id: string;
+  workspaceId: string | null;
+  kind: "workflow" | "agent";
+  name: string;
+  description: string;
+  category: string;
+  builtin: boolean;
+  createdAt: string;
+}
+/** A ranked memory recall result; `score` is null on the keyword fallback. */
+export interface MemoryHit {
+  id: string;
+  content: string;
+  score: number | null;
+}
+export interface Suggestion {
+  subjectId: string;
+  kind: string;
+  name: string;
+  runs: number;
+  lastRun: string;
+}
+
+export const templateApi = {
+  list: () => fetch("/api/templates").then(json<Template[]>),
+  instantiate: (id: string, name?: string) =>
+    post(`/api/templates/${id}/instantiate`, { name }).then(
+      json<{ kind: "workflow" | "agent"; id: string }>,
+    ),
+  publish: (input: { kind: "workflow" | "agent"; sourceId: string; name?: string; description?: string; category?: string }) =>
+    post("/api/templates", input).then(json<Template>),
+  remove: (id: string) => fetch(`/api/templates/${id}`, { method: "DELETE" }),
+};
+
+export const suggestionApi = {
+  get: () => fetch("/api/suggestions").then(json<Suggestion[]>),
 };
 
 /* ------------------------------------------------------------ Auth / members */

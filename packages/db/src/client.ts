@@ -162,6 +162,17 @@ const DDL: string[] = [
      updated_at timestamptz NOT NULL DEFAULT now(),
      UNIQUE (user_id, workspace_id)
    )`,
+  `CREATE TABLE IF NOT EXISTS templates (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid REFERENCES workspaces(id) ON DELETE CASCADE,
+     kind text NOT NULL,
+     name text NOT NULL,
+     description text NOT NULL DEFAULT '',
+     category text NOT NULL DEFAULT 'general',
+     spec jsonb NOT NULL,
+     builtin boolean NOT NULL DEFAULT false,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
   // pgvector column for semantic memory; separate statement so the rest of the
   // schema still applies when the vector extension is unavailable.
   `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS embedding vector(1024)`,
@@ -171,6 +182,7 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS approvals_status_idx ON approvals(status)`,
   `CREATE INDEX IF NOT EXISTS agent_messages_agent_idx ON agent_messages(agent_id)`,
   `CREATE INDEX IF NOT EXISTS agent_memories_agent_idx ON agent_memories(agent_id)`,
+  `CREATE INDEX IF NOT EXISTS templates_kind_idx ON templates(kind)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

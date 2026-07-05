@@ -1,4 +1,4 @@
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { WorkflowGraph } from "@puppetmaster/shared";
 import type { Db } from "./client.js";
 import {
@@ -170,6 +170,23 @@ export async function updateMission(
   patch: Partial<typeof missions.$inferInsert>,
 ) {
   await db.update(missions).set(patch).where(eq(missions.id, id));
+}
+
+/** Mission counts per subject (workflow/agent) — the signal behind the
+ *  adaptive "frequently used" suggestions (PRD §5 AI-adaptive UI). */
+export async function missionUsage(db: Db, workspaceId: string, limit = 20) {
+  return db
+    .select({
+      subjectId: missions.subjectId,
+      kind: missions.kind,
+      runs: sql<number>`count(*)`,
+      lastRun: sql<string>`max(${missions.createdAt})`,
+    })
+    .from(missions)
+    .where(eq(missions.workspaceId, workspaceId))
+    .groupBy(missions.subjectId, missions.kind)
+    .orderBy(desc(sql`count(*)`))
+    .limit(limit);
 }
 
 export async function getMissionSteps(db: Db, missionId: string) {

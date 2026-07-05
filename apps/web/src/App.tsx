@@ -4,6 +4,7 @@ import {
   api,
   authApi,
   prefsApi,
+  suggestionApi,
   type Agent,
   type Approval,
   type Me,
@@ -11,25 +12,26 @@ import {
   type MissionStep,
   type Role,
   type StepStatus,
+  type Suggestion,
   type Workflow,
 } from "./api.js";
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
 import { Login } from "./Login.js";
-import { AdminView, AgentsView, MissionsView, ToolsView } from "./Views.js";
+import { AdminView, AgentsView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 import { NODE_META } from "./FlowNode.js";
 
-const VIEWS = ["command", "canvas", "missions", "agents", "tools", "admin"] as const;
+const VIEWS = ["command", "canvas", "templates", "missions", "agents", "tools", "admin"] as const;
 type View = (typeof VIEWS)[number];
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
 
 /** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
 const ROLE_VIEWS: Record<Role, View[]> = {
-  member: ["command", "missions", "agents", "tools"],
-  builder: ["command", "canvas", "missions", "agents", "tools"],
+  member: ["command", "templates", "missions", "agents", "tools"],
+  builder: ["command", "canvas", "templates", "missions", "agents", "tools"],
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
@@ -43,10 +45,10 @@ const ROLE_HOME: Record<Role, View> = {
 
 /** Arrangeable side panels: default layout per role; users override via ui_preferences. */
 const PANEL_PRESET: Record<Role, { order: string[]; collapsed: Record<string, boolean> }> = {
-  member: { order: ["list", "approvals"], collapsed: { approvals: true } },
-  builder: { order: ["list", "approvals"], collapsed: {} },
-  admin: { order: ["approvals", "list"], collapsed: {} },
-  owner: { order: ["approvals", "list"], collapsed: {} },
+  member: { order: ["suggested", "list", "approvals"], collapsed: { approvals: true } },
+  builder: { order: ["list", "suggested", "approvals"], collapsed: {} },
+  admin: { order: ["approvals", "suggested", "list"], collapsed: {} },
+  owner: { order: ["approvals", "suggested", "list"], collapsed: {} },
 };
 
 function applyBranding(ws: Workspace) {
@@ -121,6 +123,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [mission, setMission] = useState<Mission | null>(null);
   const [steps, setSteps] = useState<MissionStep[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [missionsRefresh, setMissionsRefresh] = useState(0);
   const [info, setInfo] = useState<{ dbDriver: string; queue: string } | null>(null);
 
@@ -137,6 +140,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const refreshWorkflows = useCallback(() => api.listWorkflows().then(setWorkflows), []);
   const refreshAgents = useCallback(() => agentApi.list().then(setAgents), []);
   const refreshApprovals = useCallback(() => api.listApprovals("pending").then(setApprovals), []);
+  const refreshSuggestions = useCallback(
+    () => suggestionApi.get().then(setSuggestions).catch(() => {}),
+    [],
+  );
   const refreshTrace = useCallback((id: string) => {
     return api.getMission(id).then(({ mission, steps }) => {
       setMission(mission);
@@ -156,17 +163,23 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     refreshWorkflows();
     refreshAgents();
     refreshApprovals();
+    refreshSuggestions();
     prefsApi
       .get()
       .then(({ layout }) => {
-        if (layout.panels?.order?.length) setPanelOrder(layout.panels.order);
+        if (layout.panels?.order?.length) {
+          // Keep any newer section (e.g. "suggested") the saved layout predates.
+          const saved = layout.panels.order;
+          const merged = [...saved, ...PANEL_PRESET[me.role].order.filter((id) => !saved.includes(id))];
+          setPanelOrder(merged);
+        }
         if (layout.panels?.collapsed) setCollapsed(layout.panels.collapsed);
         prefsReady.current = true;
       })
       .catch(() => {
         prefsReady.current = true;
       });
-  }, [refreshWorkflows, refreshAgents, refreshApprovals]);
+  }, [refreshWorkflows, refreshAgents, refreshApprovals, refreshSuggestions]);
 
   // Debounced save of the panel arrangement, once initial prefs have loaded.
   useEffect(() => {
@@ -191,6 +204,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         }
         if (event.type === "mission.started" || event.type === "mission.finished") {
           setMissionsRefresh((n) => n + 1);
+          refreshSuggestions();
         }
         if (event.type === "approval.requested" || event.type === "approval.resolved") {
           refreshApprovals();
@@ -200,9 +214,21 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           setChatRefresh((n) => n + 1);
         }
       },
-      [refreshApprovals, refreshTrace],
+      [refreshApprovals, refreshTrace, refreshSuggestions],
     ),
   );
+
+  const openSuggestion = (s: Suggestion) => {
+    if (s.kind === "agent") {
+      setSelectedAgent(s.subjectId);
+      setView("command");
+    } else if (canBuild) {
+      setSelected(s.subjectId);
+      setView("canvas");
+    } else {
+      setView("missions");
+    }
+  };
 
   const track = (id: string) => {
     setTracked(id);
@@ -333,6 +359,30 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </section>
       );
     },
+    suggested: () => (
+      <section key="suggested">
+        <div className="panel-head">
+          <span>SUGGESTED</span>
+          <span className="head-actions">
+            <span className="tag-lo" title="Frequently used, from mission history">ADAPTIVE</span>
+            {panelControls("suggested")}
+          </span>
+        </div>
+        {!collapsed.suggested && (
+          <ul className="wf-list">
+            {suggestions.length === 0 && <li className="muted pad">Run agents or workflows to build suggestions.</li>}
+            {suggestions.map((s) => (
+              <li key={s.subjectId}>
+                <button className="wf-item" onClick={() => openSuggestion(s)}>
+                  <span className="wf-name">{s.kind === "agent" ? "◉" : "▤"} {s.name}</span>
+                  <span className="wf-ver">{s.runs}×</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    ),
     approvals: () => (
       <section key="approvals">
         <div className="panel-head">
@@ -396,6 +446,22 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           {view === "command" && <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} />}
           {view === "canvas" && canBuild && (
             <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
+          )}
+          {view === "templates" && (
+            <TemplatesView
+              canBuild={canBuild}
+              onInstantiated={(kind, id) => {
+                if (kind === "workflow") {
+                  refreshWorkflows();
+                  setSelected(id);
+                  if (canBuild) setView("canvas");
+                } else {
+                  refreshAgents();
+                  setSelectedAgent(id);
+                  setView("command");
+                }
+              }}
+            />
           )}
           {view === "missions" && (
             <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />

@@ -72,6 +72,8 @@ const POLICY: PolicyRule[] = [
   // Builder surface: authoring and operating workflows/agents, resolving approvals.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/workflows(\/|$)/, role: "builder" },
   { methods: ["POST"], path: /^\/api\/approvals(\/|$)/, role: "builder" },
+  // Templates: browsing is open (member); instantiate/publish/delete are builder+.
+  { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/templates(\/|$)/, role: "builder" },
   // Agent CRUD is builder-tier, but chatting with an agent is core member UX.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/agents(?!\/[^/]+\/chat$)(\/|$)/, role: "builder" },
 ];

@@ -4,24 +4,32 @@ import { WorkflowGraph } from "@puppetmaster/shared";
 import {
   createAgent,
   createDb,
+  createTemplate,
   createWorkflow,
   deleteAgent,
+  deleteTemplate,
   ensureDefaultWorkspace,
   getAgent,
   getAgentMessages,
   getApproval,
   getMission,
   getMissionSteps,
+  getTemplate,
   getWorkflowWithGraph,
   getWorkspace,
   listAgents,
   listApprovals,
   listMemories,
   listMissions,
+  listTemplates,
   listWorkflows,
   migrate,
+  missionUsage,
   resolveApproval,
   saveWorkflowVersion,
+  searchMemories,
+  searchMemoriesByVector,
+  seedBuiltinTemplates,
   updateAgent,
   updateWorkspace,
   type DbHandle,
@@ -31,9 +39,11 @@ import {
   BuiltinToolRegistry,
   connectMcpServer,
   createAgentInvoker,
+  createEmbedder,
   InlineRunner,
   InMemoryEventBus,
   ModelRouter,
+  toVectorLiteral,
   parseMcpServersEnv,
   QueueRunner,
   RedisEventBus,
@@ -48,6 +58,7 @@ import {
 } from "@puppetmaster/kernel";
 import { utilsServerPath } from "@puppetmaster/mcp-connectors";
 import { registerAuth } from "./auth.js";
+import { BUILTIN_TEMPLATES } from "./seeds.js";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -69,8 +80,21 @@ const router = new ModelRouter({
   openaiApiKey: process.env.OPENAI_API_KEY,
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL,
 });
+// RAG: embed agent memories into pgvector for semantic recall (PRD §5). Defaults
+// to the keyless mock embedder so the pipeline is live in dev; set
+// EMBEDDING_PROVIDER=openai (+ key) for a real model, or =none for keyword-only.
+const embedder = createEmbedder({
+  provider: process.env.EMBEDDING_PROVIDER,
+  model: process.env.EMBEDDING_MODEL,
+  baseUrl: process.env.EMBEDDING_BASE_URL ?? process.env.OPENAI_BASE_URL,
+  apiKey: process.env.EMBEDDING_API_KEY ?? process.env.OPENAI_API_KEY,
+});
 const executor = new WorkflowExecutor({ db, bus, tools });
-const agentRuntime = new AgentRuntime({ db, bus, router, tools });
+const agentRuntime = new AgentRuntime({ db, bus, router, tools, embedder });
+
+// Seed the first-party template catalog (PRD §6 marketplace), idempotently.
+const seededTemplates = await seedBuiltinTemplates(db, BUILTIN_TEMPLATES);
+if (seededTemplates > 0) app.log.info({ seededTemplates }, "seeded builtin templates");
 
 // --- The bridge (ARCHITECTURE.md §3.3) ----------------------------------------
 // Workflow → agent: agent nodes dispatch a task and await the child mission.
@@ -171,6 +195,116 @@ app.put("/api/workspace", async (req) => {
   }
   if (Object.keys(patch).length > 0) await updateWorkspace(db, workspaceId, patch);
   return getWorkspace(db, workspaceId);
+});
+
+// --- Templates / marketplace (M5, PRD §6) -------------------------------------
+app.get("/api/templates", async () => listTemplates(db, workspaceId));
+
+/** Instantiate a template into this workspace as a live workflow or agent. */
+app.post("/api/templates/:id/instantiate", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const tpl = await getTemplate(db, id);
+  if (!tpl) return reply.code(404).send({ error: "template not found" });
+  const body = (req.body ?? {}) as { name?: string };
+
+  if (tpl.kind === "workflow") {
+    const graph = WorkflowGraph.safeParse(tpl.spec);
+    if (!graph.success) return reply.code(400).send({ error: "template spec is not a valid workflow graph" });
+    const created = await createWorkflow(db, {
+      workspaceId,
+      name: body.name?.trim() || tpl.name,
+      graph: graph.data,
+    });
+    await scheduleCrons(created.workflow.id, graph.data);
+    return reply.code(201).send({ kind: "workflow", id: created.workflow.id, workflow: created.workflow });
+  }
+
+  const spec = (tpl.spec ?? {}) as {
+    name?: string; persona?: string; model?: string; autonomy?: string;
+    toolGrants?: unknown; schedule?: string | null;
+  };
+  const agent = await createAgent(db, {
+    workspaceId,
+    name: body.name?.trim() || spec.name || tpl.name,
+    persona: spec.persona ?? "You are a helpful assistant.",
+    model: spec.model ?? "mock",
+    autonomy: spec.autonomy,
+    toolGrants: Array.isArray(spec.toolGrants) ? (spec.toolGrants as string[]) : undefined,
+    schedule: spec.schedule ?? null,
+  });
+  if (agent.schedule) await scheduleAgentCron(agent.id, agent.schedule);
+  return reply.code(201).send({ kind: "agent", id: agent.id, agent });
+});
+
+/** Publish an existing workflow or agent as a workspace template. */
+app.post("/api/templates", async (req, reply) => {
+  const body = (req.body ?? {}) as {
+    kind?: string; sourceId?: string; name?: string; description?: string; category?: string;
+  };
+  if (!body.sourceId) return reply.code(400).send({ error: "sourceId is required" });
+
+  if (body.kind === "workflow") {
+    const wf = await getWorkflowWithGraph(db, body.sourceId);
+    if (!wf?.version) return reply.code(404).send({ error: "workflow not found" });
+    const created = await createTemplate(db, {
+      workspaceId,
+      kind: "workflow",
+      name: body.name?.trim() || wf.workflow.name,
+      description: body.description ?? "",
+      category: body.category?.trim() || "published",
+      spec: wf.version.graph,
+    });
+    return reply.code(201).send(created);
+  }
+  if (body.kind === "agent") {
+    const agent = await getAgent(db, body.sourceId);
+    if (!agent) return reply.code(404).send({ error: "agent not found" });
+    const created = await createTemplate(db, {
+      workspaceId,
+      kind: "agent",
+      name: body.name?.trim() || agent.name,
+      description: body.description ?? "",
+      category: body.category?.trim() || "published",
+      spec: {
+        name: agent.name,
+        persona: agent.persona,
+        model: agent.model,
+        autonomy: agent.autonomy,
+        toolGrants: agent.toolGrants,
+        schedule: agent.schedule,
+      },
+    });
+    return reply.code(201).send(created);
+  }
+  return reply.code(400).send({ error: "kind must be 'workflow' or 'agent'" });
+});
+
+app.delete("/api/templates/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const tpl = await getTemplate(db, id);
+  if (!tpl) return reply.code(404).send({ error: "template not found" });
+  if (tpl.builtin) return reply.code(400).send({ error: "cannot delete a built-in template" });
+  await deleteTemplate(db, id);
+  return reply.code(204).send();
+});
+
+// --- Adaptive suggestions (M5, PRD §5) ----------------------------------------
+// "Frequently used" agents/workflows, derived from mission counts.
+app.get("/api/suggestions", async () => {
+  const usage = await missionUsage(db, workspaceId, 20);
+  const [wfs, ags] = await Promise.all([listWorkflows(db, workspaceId), listAgents(db, workspaceId)]);
+  const wfName = new Map(wfs.map((w) => [w.id, w.name]));
+  const agName = new Map(ags.map((a) => [a.id, a.name]));
+  return usage
+    .map((u) => ({
+      subjectId: u.subjectId,
+      kind: u.kind,
+      runs: Number(u.runs),
+      lastRun: u.lastRun,
+      name: (u.kind === "agent" ? agName.get(u.subjectId) : wfName.get(u.subjectId)) ?? null,
+    }))
+    .filter((s) => s.name)
+    .slice(0, 6);
 });
 
 // --- Workflows ---------------------------------------------------------------
@@ -319,6 +453,25 @@ app.get("/api/agents/:id/messages", async (req) => {
 app.get("/api/agents/:id/memories", async (req) => {
   const { id } = req.params as { id: string };
   return listMemories(db, id);
+});
+
+/** Ranked recall for the inspector: pgvector semantic search when an embedder is
+ *  configured (scores included), else keyword match. */
+app.get("/api/agents/:id/memory-search", async (req) => {
+  const { id } = req.params as { id: string };
+  const query = String((req.query as { q?: string }).q ?? "").trim();
+  if (!query) return listMemories(db, id, 10);
+  if (embedder) {
+    try {
+      const [qv] = await embedder.embed([query]);
+      const hits = await searchMemoriesByVector(db, id, toVectorLiteral(qv!), 10);
+      if (hits.length > 0) return hits;
+    } catch {
+      /* fall back to keyword */
+    }
+  }
+  const rows = await searchMemories(db, id, query, 10);
+  return rows.map((r) => ({ id: r.id, content: r.content, score: null }));
 });
 
 // --- Missions & traces -------------------------------------------------------

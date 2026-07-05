@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, ilike } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, sql } from "drizzle-orm";
 import type { Db } from "./client.js";
 import { agentMemories, agentMessages, agents } from "./schema.js";
 
@@ -82,8 +82,52 @@ export async function saveMemory(db: Db, agentId: string, content: string) {
   return row!;
 }
 
-/** Long-term recall. Keyword search for now; pgvector similarity lands when an
- *  embedding provider is configured (the vector column already exists). */
+/** Persist a memory's embedding into the pgvector column (raw SQL: the column is
+ *  added by an ALTER outside the Drizzle schema). Best-effort — swallows the
+ *  error when pgvector is unavailable so keyword recall still works. */
+export async function setMemoryEmbedding(
+  db: Db,
+  memoryId: string,
+  vectorLiteral: string,
+): Promise<boolean> {
+  try {
+    await db.execute(
+      sql`UPDATE agent_memories SET embedding = ${vectorLiteral}::vector WHERE id = ${memoryId}`,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Semantic recall over the pgvector column (cosine distance). Returns rows with
+ * a `score` in [0,1]; throws when the vector column/extension is unavailable so
+ * the caller can fall back to keyword search.
+ */
+export async function searchMemoriesByVector(
+  db: Db,
+  agentId: string,
+  vectorLiteral: string,
+  limit = 5,
+): Promise<{ id: string; content: string; score: number }[]> {
+  const res = await db.execute(
+    sql`SELECT id, content, 1 - (embedding <=> ${vectorLiteral}::vector) AS score
+        FROM agent_memories
+        WHERE agent_id = ${agentId} AND embedding IS NOT NULL
+        ORDER BY embedding <=> ${vectorLiteral}::vector
+        LIMIT ${limit}`,
+  );
+  const rows = (res as unknown as { rows?: unknown[] }).rows ?? (res as unknown as unknown[]);
+  return (rows as { id: string; content: string; score: number | string }[]).map((r) => ({
+    id: r.id,
+    content: r.content,
+    score: Number(r.score),
+  }));
+}
+
+/** Long-term recall. Keyword search; pgvector similarity is preferred by the
+ *  runtime when an embedding provider is configured (see searchMemoriesByVector). */
 export async function searchMemories(db: Db, agentId: string, query: string, limit = 5) {
   if (!query.trim()) {
     return db

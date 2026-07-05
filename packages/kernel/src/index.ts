@@ -10,6 +10,7 @@ export * from "./executor.js";
 export * from "./orchestrator.js";
 export * from "./queue.js";
 export * from "./model-router.js";
+export * from "./embeddings.js";
 export * from "./agent-runtime.js";
 export * from "./bridge-tools.js";
 export * from "./mcp.js";

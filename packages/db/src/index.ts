@@ -3,3 +3,4 @@ export * from "./client.js";
 export * from "./repo.js";
 export * from "./agent-repo.js";
 export * from "./auth-repo.js";
+export * from "./template-repo.js";

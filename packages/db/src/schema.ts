@@ -1,4 +1,5 @@
 import {
+  boolean,
   integer,
   jsonb,
   pgTable,
@@ -191,11 +192,29 @@ export const agentMemories = pgTable("agent_memories", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Shareable agent + workflow templates (PRD §6 marketplace). First-party
+ *  templates are seeded on boot with `builtin=true`; users publish their own
+ *  from an existing workflow/agent. `spec` is the kind-specific payload:
+ *  a WorkflowGraph for kind="workflow", an agent definition for kind="agent". */
+export const templates = pgTable("templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  /** null = global/first-party catalog; set = published within a workspace. */
+  workspaceId: uuid("workspace_id").references(() => workspaces.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(), // "workflow" | "agent"
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  category: text("category").notNull().default("general"),
+  spec: jsonb("spec").notNull(),
+  builtin: boolean("builtin").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const schema = {
   users,
   sessions,
   memberships,
   uiPreferences,
+  templates,
   workspaces,
   workflows,
   workflowVersions,
