@@ -70,6 +70,28 @@
 - Autonomy tiers per agent: **read = auto, write = approval, destructive = always confirm** (defaults; configurable per tool/action).
 - Approval requests pause the mission and appear in the dashboard inbox (and later, notifications).
 - Every LLM call, tool call, and approval decision is written to an append-only audit log.
+- **Auto-allow policies** (`approval_policies`, admin-managed at `/api/policies`): per-agent or
+  workspace-wide rules — a tool pattern (`email.send` / `email.*`) plus argument predicates
+  (`to endsWith "@acme.io"`) — that let a matching gated call execute without pausing. Auto-approved
+  calls are audited as `approval.auto` with the policy id; anything unmatched still gates, and a
+  policy-lookup failure fails closed to the human gate.
+
+### 3.7 Trust boundary hardening (Stage 1)
+- **Credentials vault**: `credentials` stores AES-256-GCM envelopes sealed under
+  `PUPPETMASTER_MASTER_KEY` (scrypt-derived key). Write-only API at `/api/credentials` (admin) —
+  values are never returned after write. MCP server env may reference secrets as
+  `{{credential:NAME}}`; refs are resolved at spawn, and a missing credential fails that server's
+  connect loudly.
+- **Untrusted-data delimiters**: catalog tool results and webhook payloads are wrapped in
+  `<untrusted_data source="...">` envelopes before entering agent context (provenance separation
+  against indirect prompt injection); the system prompt instructs the model to treat the contents
+  as data, never instructions. Enforcement stays structural — tiers/approvals gate the resulting
+  actions regardless of what injected content asks for.
+- **MCP tool-description pinning**: each tool's description+schema sha-256 is pinned in
+  `mcp_tool_pins` at first connect; a changed hash on reconnect (tool-poisoning canary) is logged
+  and audited as `mcp.description.drift` before the pin updates.
+- **Egress allowlist**: with `HTTP_ALLOWED_HOSTS` set (comma-separated hostnames; subdomains
+  match), `http.get` refuses any other host.
 
 ## 4. Data model (core tables)
 

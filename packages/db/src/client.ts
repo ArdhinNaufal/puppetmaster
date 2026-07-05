@@ -200,6 +200,35 @@ const DDL: string[] = [
    )`,
   `CREATE INDEX IF NOT EXISTS audit_log_workspace_idx ON audit_log(workspace_id, created_at)`,
   `ALTER TABLE workflows ADD COLUMN IF NOT EXISTS webhook_secret text`,
+  `CREATE TABLE IF NOT EXISTS credentials (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     name text NOT NULL,
+     encrypted text NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (workspace_id, name)
+   )`,
+  `CREATE TABLE IF NOT EXISTS mcp_tool_pins (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     server text NOT NULL,
+     tool text NOT NULL,
+     hash text NOT NULL,
+     first_seen_at timestamptz NOT NULL DEFAULT now(),
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (server, tool)
+   )`,
+  `CREATE TABLE IF NOT EXISTS approval_policies (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     agent_id uuid REFERENCES agents(id) ON DELETE CASCADE,
+     tool text NOT NULL,
+     predicates jsonb NOT NULL DEFAULT '[]',
+     description text NOT NULL DEFAULT '',
+     enabled boolean NOT NULL DEFAULT true,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS approval_policies_workspace_idx ON approval_policies(workspace_id)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

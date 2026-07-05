@@ -15,3 +15,6 @@ export * from "./audit-sink.js";
 export * from "./agent-runtime.js";
 export * from "./bridge-tools.js";
 export * from "./mcp.js";
+export * from "./vault.js";
+export * from "./untrusted.js";
+export * from "./policy.js";

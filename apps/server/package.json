@@ -17,7 +17,8 @@
     "@puppetmaster/mcp-connectors": "workspace:*",
     "@puppetmaster/shared": "workspace:*",
     "fastify": "^5.2.0",
-    "jose": "^6.2.3"
+    "jose": "^6.2.3",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.0",

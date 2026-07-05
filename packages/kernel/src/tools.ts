@@ -42,6 +42,21 @@ const obj = (props: Record<string, unknown>, required: string[] = []) => ({
   required,
 });
 
+/**
+ * Egress allowlist (Stage 1, G1): with HTTP_ALLOWED_HOSTS set (comma-separated
+ * hostnames; subdomains of an entry match), http.get refuses any other host —
+ * an injected instruction can't exfiltrate context to an attacker's server.
+ * Unset = unrestricted, preserving the open default for local dev.
+ */
+export function assertEgressAllowed(url: string, allowedEnv = process.env.HTTP_ALLOWED_HOSTS): void {
+  const raw = allowedEnv?.trim();
+  if (!raw) return;
+  const allowed = raw.split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
+  const host = new URL(url).hostname.toLowerCase();
+  const ok = allowed.some((entry) => host === entry || host.endsWith(`.${entry}`));
+  if (!ok) throw new Error(`http.get: host "${host}" is not in HTTP_ALLOWED_HOSTS`);
+}
+
 export class BuiltinToolRegistry implements ToolRegistry {
   private tools = new Map<string, Registered>();
 
@@ -73,6 +88,7 @@ export class BuiltinToolRegistry implements ToolRegistry {
       async (args) => {
         const url = String(args.url ?? "");
         if (!/^https?:\/\//.test(url)) throw new Error(`http.get: invalid url ${url}`);
+        assertEgressAllowed(url);
         const res = await fetch(url, { method: "GET" });
         const text = await res.text();
         let body: unknown = text;

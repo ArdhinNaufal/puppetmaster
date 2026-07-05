@@ -20,7 +20,9 @@ import type { EventBus } from "./bridge.js";
 import type { AuditSink } from "./audit-sink.js";
 import { toVectorLiteral, type EmbeddingProvider } from "./embeddings.js";
 import { ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
+import { findMatchingPolicy, type ApprovalPolicyLike } from "./policy.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
+import { UNTRUSTED_PROMPT_NOTE, wrapUntrusted } from "./untrusted.js";
 
 const MAX_ITERATIONS = 8;
 const now = () => new Date();
@@ -72,6 +74,17 @@ export interface AgentRuntimeDeps {
    *  similarity (RAG); otherwise recall falls back to keyword search. */
   embedder?: EmbeddingProvider | null;
   audit?: AuditSink;
+  /** Approval auto-allow policies for an agent (own + workspace-wide); a
+   *  matching gated call executes without pausing, audited as approval.auto. */
+  policyLookup?: (agentId: string) => Promise<ApprovalPolicyLike[]>;
+}
+
+/** Tool results are external data: wrap them in untrusted-data delimiters
+ *  before they re-enter the model context (Stage 1, G1). First-party runtime
+ *  tools (memory/scratchpad) are exempt — their content is agent-authored. */
+function wrapToolResultForContext(toolName: string, result: unknown): unknown {
+  if (toolName.startsWith("memory__") || toolName.startsWith("scratchpad__")) return result;
+  return wrapUntrusted(`tool:${toolName.replace("__", ".")}`, result);
 }
 
 /**
@@ -89,6 +102,7 @@ export class AgentRuntime {
   private readonly tools: ToolRegistry;
   private readonly embedder: EmbeddingProvider | null;
   private readonly audit: AuditSink | null;
+  private readonly policyLookup: AgentRuntimeDeps["policyLookup"] | null;
 
   constructor(deps: AgentRuntimeDeps) {
     this.db = deps.db;
@@ -97,6 +111,7 @@ export class AgentRuntime {
     this.tools = deps.tools ?? new BuiltinToolRegistry();
     this.embedder = deps.embedder ?? null;
     this.audit = deps.audit ?? null;
+    this.policyLookup = deps.policyLookup ?? null;
   }
 
   /** Best-effort audit; never let a logging failure break the tick. */
@@ -201,7 +216,15 @@ export class AgentRuntime {
         agentId: agent.id,
         missionId,
         role: "tool",
-        content: { toolResults: [{ toolCallId: pending.toolCallId, result, isError }] },
+        content: {
+          toolResults: [
+            {
+              toolCallId: pending.toolCallId,
+              result: wrapToolResultForContext(pending.name, result),
+              isError,
+            },
+          ],
+        },
       });
     }
 
@@ -300,7 +323,29 @@ export class AgentRuntime {
       const toolResults: { toolCallId: string; result: unknown; isError?: boolean }[] = [];
       for (const call of response.toolCalls) {
         const tier = this.tierOf(call.name);
-        if (tier !== "read_auto") {
+        // Auto-allow policies (Stage 1, G2): a gated call matching a reviewed
+        // policy skips the human gate; a policy-lookup failure fails closed.
+        let autoPolicy: ApprovalPolicyLike | null = null;
+        if (tier !== "read_auto" && this.policyLookup) {
+          const [server, tool] = call.name.split("__");
+          if (server && tool) {
+            try {
+              const policies = await this.policyLookup(agent.id);
+              autoPolicy = findMatchingPolicy(policies, { server, tool, args: call.args });
+            } catch {
+              autoPolicy = null;
+            }
+          }
+        }
+        if (autoPolicy) {
+          await this.recordAudit({
+            ...auditActor,
+            action: "approval.auto",
+            target: call.name.replace("__", "."),
+            detail: { policyId: autoPolicy.id, tier, args: call.args },
+          });
+        }
+        if (tier !== "read_auto" && !autoPolicy) {
           const approval = await createApproval(this.db, {
             missionId,
             nodeId: call.name,
@@ -361,9 +406,13 @@ export class AgentRuntime {
           ...auditActor,
           action: "tool.call",
           target: call.name.replace("__", "."),
-          detail: { ok: !isError, args: call.args },
+          detail: { ok: !isError, args: call.args, ...(autoPolicy ? { autoApproved: true } : {}) },
         });
-        toolResults.push({ toolCallId: call.id, result, isError });
+        toolResults.push({
+          toolCallId: call.id,
+          result: wrapToolResultForContext(call.name, result),
+          isError,
+        });
       }
 
       await appendAgentMessage(this.db, {
@@ -472,7 +521,7 @@ function buildSystemPrompt(
   const mem = memories.length > 0
     ? `\n\nRelevant long-term memories:\n${memories.map((m) => `- ${m}`).join("\n")}`
     : "";
-  return `You are ${agent.name}, an agent on the Puppetmaster platform.\n\n${agent.persona}${pad}${mem}\n\nUse tools when they help. Save durable facts with memory__save. Tools marked write/destructive pause for human approval.`;
+  return `You are ${agent.name}, an agent on the Puppetmaster platform.\n\n${agent.persona}${pad}${mem}\n\nUse tools when they help. Save durable facts with memory__save. Tools marked write/destructive pause for human approval.\n\n${UNTRUSTED_PROMPT_NOTE}`;
 }
 
 

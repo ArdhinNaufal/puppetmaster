@@ -25,6 +25,7 @@ import type { EventBus } from "./bridge.js";
 import type { AuditSink } from "./audit-sink.js";
 import { runCodeNode } from "./sandbox.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
+import { wrapUntrusted } from "./untrusted.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date();
@@ -149,6 +150,10 @@ export class WorkflowExecutor {
       await updateMission(this.db, missionId, { status: "running" });
     }
 
+    // Webhook-triggered missions carry external payloads: agent nodes wrap
+    // them in untrusted-data delimiters before they enter model context.
+    const triggerMode = ((mission.trigger ?? {}) as { mode?: string }).mode ?? null;
+
     // Seed state from the resume cursor (nodeId -> output of completed nodes).
     const outputs: Record<string, unknown> = { ...((mission.cursor as Record<string, unknown>) ?? {}) };
     const completed = new Set(Object.keys(outputs));
@@ -233,7 +238,7 @@ export class WorkflowExecutor {
         await this.recordStep(missionId, node, "running", attempt, nodeInput ?? null, null, null, stepIdByNode);
         try {
           output = await withTimeout(
-            this.executeNode(node, nodeInput, outputs, missionId),
+            this.executeNode(node, nodeInput, outputs, missionId, triggerMode),
             node.timeoutMs ?? 30_000,
             `node ${node.id}`,
           );
@@ -282,6 +287,7 @@ export class WorkflowExecutor {
     input: unknown,
     outputs: Record<string, unknown>,
     missionId: string,
+    triggerMode: string | null,
   ): Promise<unknown> {
     switch (node.kind) {
       case "trigger":
@@ -310,9 +316,11 @@ export class WorkflowExecutor {
         // The bridge, workflow → agent: dispatch a task and await the result.
         if (!this.agentInvoker) throw new Error("agent nodes require the agent runtime (bridge not wired)");
         const cfg = AgentNodeConfig.parse(node.config);
-        const message = cfg.message.replace(/\{\{\s*input\s*\}\}/g, () =>
-          typeof input === "string" ? input : JSON.stringify(input ?? null),
-        );
+        // Webhook payloads are attacker-controllable: delimit them as
+        // untrusted data before they become part of an agent's task.
+        const rendered = typeof input === "string" ? input : JSON.stringify(input ?? null);
+        const interpolated = triggerMode === "webhook" ? wrapUntrusted("webhook", rendered) : rendered;
+        const message = cfg.message.replace(/\{\{\s*input\s*\}\}/g, () => interpolated);
         const result = await this.agentInvoker({
           agentId: cfg.agentId,
           message,

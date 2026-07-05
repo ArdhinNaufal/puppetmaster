@@ -3,6 +3,7 @@ import websocket from "@fastify/websocket";
 import { WorkflowGraph } from "@puppetmaster/shared";
 import {
   appendAudit,
+  checkAndPinToolHash,
   createAgent,
   createDb,
   createTemplate,
@@ -24,6 +25,7 @@ import {
   listAudit,
   listMemories,
   listMissions,
+  listPoliciesForAgent,
   listTemplates,
   listWorkflows,
   migrate,
@@ -52,6 +54,7 @@ import {
   QueueRunner,
   RedisEventBus,
   registerBridgeTools,
+  resolveCredentialEnv,
   startAgentTick,
   startWorkflow,
   WorkflowExecutor,
@@ -62,6 +65,7 @@ import {
 } from "@puppetmaster/kernel";
 import { utilsServerPath } from "@puppetmaster/mcp-connectors";
 import { registerAuth } from "./auth.js";
+import { makeCredentialLookup, registerSecurityRoutes } from "./security.js";
 import { BUILTIN_TEMPLATES } from "./seeds.js";
 import { createAuditSink, startAuditProjector } from "./audit.js";
 import {
@@ -116,7 +120,22 @@ const embedder = createEmbedder({
 // requests; endpoints add approval decisions and auth/member actions.
 const auditSink = createAuditSink(db);
 const executor = new WorkflowExecutor({ db, bus, tools, audit: auditSink });
-const agentRuntime = new AgentRuntime({ db, bus, router, tools, embedder, audit: auditSink });
+const agentRuntime = new AgentRuntime({
+  db,
+  bus,
+  router,
+  tools,
+  embedder,
+  audit: auditSink,
+  // Approval auto-allow policies (Stage 1): matching gated calls skip the
+  // human gate and are audited as approval.auto.
+  policyLookup: (agentId) => listPoliciesForAgent(db, workspaceId, agentId),
+});
+
+// Credentials vault (Stage 1): AES-256-GCM under PUPPETMASTER_MASTER_KEY.
+// Unset key = vault routes disabled (503 on write) and no credential refs.
+const masterKey = process.env.PUPPETMASTER_MASTER_KEY?.trim() || null;
+const credentialLookup = makeCredentialLookup(db, workspaceId, masterKey);
 const auditUnsub = startAuditProjector(bus, db);
 
 // Seed the first-party template catalog (PRD §6 marketplace), idempotently.
@@ -135,12 +154,36 @@ const mcpConfigs = parseMcpServersEnv(process.env.MCP_SERVERS);
 if (mcpConfigs.length === 0 && process.env.MCP_DISABLE_BUNDLED !== "1") {
   mcpConfigs.push({ name: "mcputil", command: process.execPath, args: [utilsServerPath] });
 }
+// Tool-description hash pinning (Stage 1): drift since the last connect is a
+// tool-poisoning canary — surfaced in the log and the audit trail.
+const checkPin = async (server: string, tool: string, hash: string) => {
+  const { result, previousHash } = await checkAndPinToolHash(db, server, tool, hash);
+  if (result === "drifted") {
+    app.log.warn({ server, tool }, "mcp tool description drifted since it was pinned");
+    await appendAudit(db, {
+      workspaceId,
+      actorKind: "system",
+      actorLabel: "mcp",
+      action: "mcp.description.drift",
+      target: `${server}.${tool}`,
+      detail: { previousHash, hash },
+    });
+  }
+  return result;
+};
+
 const mcpConnections: McpConnection[] = [];
 for (const cfg of mcpConfigs) {
   try {
-    const conn = await connectMcpServer(tools, cfg);
+    // Resolve {{credential:NAME}} refs from the vault; a missing credential
+    // fails this server's connect loudly rather than passing a placeholder.
+    const env = cfg.env ? await resolveCredentialEnv(cfg.env, credentialLookup) : cfg.env;
+    const conn = await connectMcpServer(tools, { ...cfg, env }, { checkPin });
     mcpConnections.push(conn);
-    app.log.info({ server: cfg.name, tools: conn.toolCount }, "mcp server connected");
+    app.log.info(
+      { server: cfg.name, tools: conn.toolCount, drifted: conn.driftedTools },
+      "mcp server connected",
+    );
   } catch (err) {
     app.log.error({ server: cfg.name, err }, "mcp server failed to connect");
   }
@@ -195,6 +238,9 @@ await app.register(websocket);
 // --- Auth + RBAC gateway (ARCHITECTURE.md §6) ---------------------------------
 // Must come before route definitions so the session/RBAC hook attaches to them.
 await registerAuth(app, { db, workspaceId });
+
+// --- Security surface: credentials vault + approval policies (Stage 1) --------
+registerSecurityRoutes(app, { db, workspaceId, masterKey });
 
 // --- Meta --------------------------------------------------------------------
 app.get("/api/health", async () => ({ ok: true, service: "puppetmaster-server", version: "0.0.1" }));

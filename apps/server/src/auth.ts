@@ -72,6 +72,10 @@ const POLICY: PolicyRule[] = [
   { methods: ["PUT"], path: /^\/api\/workspace$/, role: "admin" },
   { methods: ["GET", "POST", "PUT", "DELETE"], path: /^\/api\/members(\/|$)/, role: "admin" },
   { methods: ["GET"], path: /^\/api\/audit$/, role: "admin" },
+  // Stage 1 security surface: secrets and auto-approval rules are admin-only,
+  // including reads (credential names and policy predicates are sensitive).
+  { methods: ["GET", "PUT", "DELETE"], path: /^\/api\/credentials(\/|$)/, role: "admin" },
+  { methods: ["GET", "POST", "PUT", "DELETE"], path: /^\/api\/policies(\/|$)/, role: "admin" },
   // Builder surface: authoring and operating workflows/agents, resolving approvals.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/workflows(\/|$)/, role: "builder" },
   // The webhook secret is sensitive: revealing it is builder+, not an open GET.

@@ -232,6 +232,60 @@ export const auditLog = pgTable("audit_log", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Encrypted-at-rest secrets (ARCHITECTURE §4, Stage 1). `encrypted` is an
+ *  AES-256-GCM envelope (`v1:iv:tag:ciphertext`, hex) sealed with
+ *  PUPPETMASTER_MASTER_KEY; plaintext is never stored and never returned by
+ *  the API after write. Referenced from MCP server env as `{{credential:NAME}}`. */
+export const credentials = pgTable(
+  "credentials",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    encrypted: text("encrypted").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqName: unique().on(t.workspaceId, t.name) }),
+);
+
+/** Hash pins for MCP tool descriptions (Stage 1 injection defense): the
+ *  sha-256 of each tool's description+schema is recorded at first connect;
+ *  a changed hash on a later connect is surfaced + audited as description
+ *  drift (tool-poisoning canary) before the pin is updated. */
+export const mcpToolPins = pgTable(
+  "mcp_tool_pins",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    server: text("server").notNull(),
+    tool: text("tool").notNull(),
+    hash: text("hash").notNull(),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqTool: unique().on(t.server, t.tool) }),
+);
+
+/** Approval auto-allow policies (Stage 1, PRD §4 refinement): a gated tool
+ *  call matching a policy (tool pattern + every arg predicate) is executed
+ *  without pausing and audited as `approval.auto`. agentId null = whole
+ *  workspace. Predicates: [{ path, op, value }] evaluated against call args. */
+export const approvalPolicies = pgTable("approval_policies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+  /** `server.tool` or `server.*`. */
+  tool: text("tool").notNull(),
+  predicates: jsonb("predicates").notNull().default([]),
+  description: text("description").notNull().default(""),
+  enabled: boolean("enabled").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const schema = {
   users,
   sessions,
@@ -248,4 +302,7 @@ export const schema = {
   agents,
   agentMessages,
   agentMemories,
+  credentials,
+  mcpToolPins,
+  approvalPolicies,
 };
