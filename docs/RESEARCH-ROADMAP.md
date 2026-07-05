@@ -1,11 +1,13 @@
 # Puppetmaster — Research-Driven Roadmap
 
-**Date:** 2026-07-05 · **Status:** proposal awaiting owner review · **Method:** literature
-survey (arXiv 2024–2026) first, then industry/ecosystem sources, mapped against the shipped
-system (M0–M5 + audit + OIDC/webhook-signing on `claude/kickoff-prompt-continuation-cy021r`).
+**Date:** 2026-07-05 · **Status:** ✅ all 8 stages executed (owner-directed) on
+`claude/optimistic-euler-2r7v7t`, one commit per stage, each e2e-verified · **Method:**
+literature survey (arXiv 2024–2026) first, then industry/ecosystem sources, mapped against
+the shipped system (M0–M5 + audit + OIDC/webhook-signing on
+`claude/kickoff-prompt-continuation-cy021r`).
 
-Each stage at the end is independently shippable and sized; **no stage is executed without an
-explicit go-ahead from the owner.**
+Each stage below is independently shippable; implementation details live in
+ARCHITECTURE.md §3.1–§3.10 and the per-stage commit messages.
 
 ---
 
