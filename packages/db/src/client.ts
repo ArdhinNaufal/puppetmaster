@@ -34,8 +34,11 @@ export async function createDb(opts?: {
 
   const { PGlite } = await import("@electric-sql/pglite");
   const { vector } = await import("@electric-sql/pglite/vector");
+  // A dataDir persists PGlite to disk — set PGLITE_DATA_DIR to share one store
+  // between the demo seeder and the server (both keyless).
+  const dataDir = opts?.dataDir ?? process.env.PGLITE_DATA_DIR ?? undefined;
   const client = await PGlite.create({
-    dataDir: opts?.dataDir,
+    dataDir,
     extensions: { vector },
   });
   const db = drizzlePglite(client, { schema }) as unknown as Db;
@@ -196,6 +199,7 @@ const DDL: string[] = [
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
   `CREATE INDEX IF NOT EXISTS audit_log_workspace_idx ON audit_log(workspace_id, created_at)`,
+  `ALTER TABLE workflows ADD COLUMN IF NOT EXISTS webhook_secret text`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

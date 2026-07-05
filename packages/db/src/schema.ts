@@ -84,6 +84,9 @@ export const workflows = pgTable("workflows", {
     .references(() => workspaces.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   currentVersion: integer("current_version").notNull().default(1),
+  /** HMAC secret for signed webhook triggers; set when the graph has a webhook
+   *  trigger node (see /api/hooks/:id enforcement). Null = unsigned/open. */
+  webhookSecret: text("webhook_secret"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

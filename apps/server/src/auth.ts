@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import { Role, ROLE_RANK } from "@puppetmaster/shared";
+import { authorizationUrl, exchangeCode, oidcConfig } from "./oidc.js";
 import {
   appendAudit,
   countUsers,
@@ -73,6 +74,8 @@ const POLICY: PolicyRule[] = [
   { methods: ["GET"], path: /^\/api\/audit$/, role: "admin" },
   // Builder surface: authoring and operating workflows/agents, resolving approvals.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/workflows(\/|$)/, role: "builder" },
+  // The webhook secret is sensitive: revealing it is builder+, not an open GET.
+  { methods: ["GET"], path: /^\/api\/workflows\/[^/]+\/webhook$/, role: "builder" },
   { methods: ["POST"], path: /^\/api\/approvals(\/|$)/, role: "builder" },
   // Templates: browsing is open (member); instantiate/publish/delete are builder+.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/templates(\/|$)/, role: "builder" },
@@ -86,6 +89,7 @@ const POLICY: PolicyRule[] = [
 const PUBLIC: RegExp[] = [
   /^\/api\/health$/,
   /^\/api\/auth\/(status|setup|login)$/,
+  /^\/api\/auth\/oidc\/(login|callback)$/,
   /^\/api\/hooks\/[^/]+$/,
 ];
 
@@ -152,7 +156,65 @@ export async function registerAuth(
   // --- Auth handshake -------------------------------------------------------------
 
   /** First-run probe: the web app shows the setup screen while no users exist. */
-  app.get("/api/auth/status", async () => ({ needsSetup: (await countUsers(db)) === 0 }));
+  app.get("/api/auth/status", async () => ({
+    needsSetup: (await countUsers(db)) === 0,
+    oidcEnabled: Boolean(oidcConfig()),
+  }));
+
+  // --- OIDC (authorization-code flow) ---------------------------------------------
+  const OIDC_STATE_COOKIE = "pm_oidc_state";
+
+  app.get("/api/auth/oidc/login", async (req, reply) => {
+    const cfg = oidcConfig();
+    if (!cfg) return reply.code(404).send({ error: "OIDC is not configured" });
+    const state = randomBytes(16).toString("hex");
+    reply.setCookie(OIDC_STATE_COOKIE, state, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "lax",
+      maxAge: 600,
+    });
+    return reply.redirect(await authorizationUrl(cfg, state));
+  });
+
+  app.get("/api/auth/oidc/callback", async (req, reply) => {
+    const cfg = oidcConfig();
+    if (!cfg) return reply.code(404).send({ error: "OIDC is not configured" });
+    const { code, state } = req.query as { code?: string; state?: string };
+    const expected = parseCookies(req.headers.cookie)[OIDC_STATE_COOKIE];
+    if (!code || !state || !expected || state !== expected) {
+      return reply.code(400).send({ error: "invalid OIDC state or code" });
+    }
+    reply.clearCookie(OIDC_STATE_COOKIE, { path: "/" });
+
+    let claims;
+    try {
+      claims = await exchangeCode(cfg, code);
+    } catch (err) {
+      app.log.error({ err }, "OIDC callback failed");
+      return reply.code(401).send({ error: "OIDC verification failed" });
+    }
+
+    // Provision on first sight; the very first user of an empty instance is owner.
+    let user = await getUserByEmail(db, claims.email);
+    let provisioned = false;
+    if (!user) {
+      const randomPw = await hashPassword(randomBytes(24).toString("hex"));
+      user = await createUser(db, { email: claims.email, name: claims.name, passwordHash: randomPw });
+      provisioned = true;
+    }
+    if (!(await getMembership(db, user.id, workspaceId))) {
+      const role = (await countUsers(db)) === 1 ? "owner" : cfg.defaultRole;
+      await upsertMembership(db, { userId: user.id, workspaceId, role });
+    }
+    await setSessionCookie(reply, user.id);
+    await appendAudit(db, {
+      workspaceId, actorKind: "user", actorId: user.id, actorLabel: user.email,
+      action: provisioned ? "auth.oidc.provision" : "auth.oidc.login",
+      detail: { sub: claims.sub },
+    });
+    return reply.redirect("/");
+  });
 
   /** Create the founding owner account. Only valid while the instance has no users. */
   app.post("/api/auth/setup", async (req, reply) => {

@@ -547,3 +547,22 @@ button { font-family: inherit; cursor: pointer; }
 }
 .audit-actor.ak-user { color: var(--accent); border-color: var(--accent); }
 .audit-actor.ak-agent { color: var(--warn); border-color: var(--warn); }
+
+/* ---- Signed webhook reveal (Canvas) ------------------------------------- */
+.webhook-reveal {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--stroke);
+  background: #070d11;
+  font-size: 0.68rem;
+}
+.webhook-reveal code { color: var(--accent); font-size: 0.66rem; }
+.webhook-reveal .wh-secret { color: var(--warn); word-break: break-all; }
+.webhook-reveal .wh-hint { color: var(--text-lo); font-size: 0.6rem; }
+
+/* ---- OIDC / SSO login --------------------------------------------------- */
+.login-or { text-align: center; font-size: 0.6rem; letter-spacing: 0.2em; color: var(--text-lo); margin: 0.2rem 0; }
+.login-sso { justify-content: center; padding: 0.55rem; text-decoration: none; text-align: center; }

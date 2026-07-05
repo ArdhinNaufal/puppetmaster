@@ -75,6 +75,10 @@ them in your shell or prefix the run command:
 | `EMBEDDING_PROVIDER` | `mock`          | RAG memory embeddings: `mock` (keyless, deterministic), `openai` (needs a key/base URL), or `none` (keyword-only recall) |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | embedding model when `EMBEDDING_PROVIDER=openai` |
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | *(fall back to `OPENAI_*`)* | override the embeddings endpoint independently of the chat provider |
+| `PGLITE_DATA_DIR` | *(unset → in-memory)* | persist the keyless PGlite store to disk; share it between the demo seeder and the server |
+| `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` | *(unset → OIDC off)* | enable "Sign in with SSO" (OpenID Connect authorization-code flow); redirect URI is `<base>/api/auth/oidc/callback` |
+| `OIDC_SCOPES` | `openid email profile` | requested OIDC scopes |
+| `OIDC_DEFAULT_ROLE` | `member` | role granted to newly provisioned SSO users (the first user of an empty instance becomes owner) |
 
 Without any provider keys, agents on the `mock` model still work — a scripted provider used
 for demos and tests.
@@ -147,6 +151,22 @@ Sessions are HttpOnly-cookie based and live 30 days. Additional users are create
 7. **Audit log:** as an admin/owner, open **ADMIN** → **AUDIT LOG** — every LLM call, tool
    call, and approval decision (plus auth/membership changes) appears in an append-only trail,
    filterable by action.
+8. **Signed webhooks:** on a workflow with a webhook trigger, the Canvas shows a **⚿ WEBHOOK**
+   box with the URL and HMAC secret; calls to `/api/hooks/:id` must send
+   `X-Puppetmaster-Signature: sha256=HMAC_SHA256(secret, body)` or they're rejected 401.
+
+### Try the demo dataset
+
+To explore a fully populated system instead of an empty one:
+
+```bash
+pnpm build
+PGLITE_DATA_DIR=./.pmdata pnpm --filter @puppetmaster/server seed:demo   # populate
+PGLITE_DATA_DIR=./.pmdata pnpm --filter @puppetmaster/server start        # serve it
+```
+
+Sign in with `avery.owner@acme.io` / `demodemo123` (or the admin/builder/member accounts it
+prints) to browse seeded agents, workflows, missions, approvals, memories, and the audit log.
 
 ## Notes
 

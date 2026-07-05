@@ -109,6 +109,12 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ input }),
     }).then(json<{ missionId: string }>),
+  getWebhook: (id: string) =>
+    fetch(`/api/workflows/${id}/webhook`).then(
+      json<{ url: string; hasSecret: boolean; secret: string | null; header: string; scheme: string }>,
+    ),
+  rotateWebhook: (id: string) =>
+    fetch(`/api/workflows/${id}/webhook/rotate`, { method: "POST" }).then(json<{ secret: string }>),
   listMissions: () => fetch("/api/missions").then(json<Mission[]>),
   getMission: (id: string) =>
     fetch(`/api/missions/${id}`).then(json<{ mission: Mission; steps: MissionStep[] }>),
@@ -272,7 +278,7 @@ const post = (url: string, body: unknown) =>
   fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
 export const authApi = {
-  status: () => fetch("/api/auth/status").then(json<{ needsSetup: boolean }>),
+  status: () => fetch("/api/auth/status").then(json<{ needsSetup: boolean; oidcEnabled: boolean }>),
   setup: (input: { email: string; name: string; password: string }) =>
     post("/api/auth/setup", input).then(json<{ user: Me["user"]; role: Role }>),
   login: (email: string, password: string) =>

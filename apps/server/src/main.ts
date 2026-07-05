@@ -16,6 +16,7 @@ import {
   getMission,
   getMissionSteps,
   getTemplate,
+  getWorkflow,
   getWorkflowWithGraph,
   getWorkspace,
   listAgents,
@@ -32,6 +33,7 @@ import {
   searchMemories,
   searchMemoriesByVector,
   seedBuiltinTemplates,
+  setWebhookSecret,
   updateAgent,
   updateWorkspace,
   type DbHandle,
@@ -62,12 +64,29 @@ import { utilsServerPath } from "@puppetmaster/mcp-connectors";
 import { registerAuth } from "./auth.js";
 import { BUILTIN_TEMPLATES } from "./seeds.js";
 import { createAuditSink, startAuditProjector } from "./audit.js";
+import {
+  graphHasWebhookTrigger,
+  newWebhookSecret,
+  verifyWebhookSignature,
+  WEBHOOK_SIGNATURE_HEADER,
+} from "./webhooks.js";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const REDIS_URL = process.env.REDIS_URL ?? null;
 
 const app = Fastify({ logger: true });
+
+// Keep the raw JSON body around so webhook HMAC signatures verify against the
+// exact bytes the caller signed (re-serialising would change whitespace).
+app.addContentTypeParser("application/json", { parseAs: "string" }, (req, body, done) => {
+  (req as { rawBody?: string }).rawBody = body as string;
+  try {
+    done(null, body ? JSON.parse(body as string) : {});
+  } catch (err) {
+    done(err as Error, undefined);
+  }
+});
 
 // --- Kernel wiring -----------------------------------------------------------
 const handle: DbHandle = await createDb();
@@ -330,7 +349,9 @@ app.post("/api/workflows", async (req, reply) => {
   const graph = WorkflowGraph.safeParse(body.graph ?? { nodes: [], edges: [] });
   if (!graph.success) return reply.code(400).send({ error: "invalid graph", detail: graph.error.issues });
   const name = body.name?.trim() || "Untitled workflow";
-  const created = await createWorkflow(db, { workspaceId, name, graph: graph.data });
+  // Signed webhooks by default: a webhook-trigger workflow gets an HMAC secret.
+  const webhookSecret = graphHasWebhookTrigger(graph.data) ? newWebhookSecret() : null;
+  const created = await createWorkflow(db, { workspaceId, name, graph: graph.data, webhookSecret });
   await scheduleCrons(created.workflow.id, graph.data);
   return reply.code(201).send(created);
 });
@@ -350,10 +371,39 @@ app.put("/api/workflows/:id", async (req, reply) => {
   try {
     const version = await saveWorkflowVersion(db, id, graph.data);
     await scheduleCrons(id, graph.data);
+    // Mint a signing secret the first time a workflow gains a webhook trigger.
+    if (graphHasWebhookTrigger(graph.data)) {
+      const wf = await getWorkflow(db, id);
+      if (wf && !wf.webhookSecret) await setWebhookSecret(db, id, newWebhookSecret());
+    }
     return version;
   } catch {
     return reply.code(404).send({ error: "workflow not found" });
   }
+});
+
+/** Reveal the webhook URL + signing secret (builder+). */
+app.get("/api/workflows/:id/webhook", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const wf = await getWorkflow(db, id);
+  if (!wf) return reply.code(404).send({ error: "workflow not found" });
+  return {
+    url: `/api/hooks/${id}`,
+    hasSecret: Boolean(wf.webhookSecret),
+    secret: wf.webhookSecret,
+    header: "X-Puppetmaster-Signature",
+    scheme: "sha256=HMAC_SHA256(secret, rawBody)",
+  };
+});
+
+/** Rotate (or set) the webhook signing secret (builder+). */
+app.post("/api/workflows/:id/webhook/rotate", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const wf = await getWorkflow(db, id);
+  if (!wf) return reply.code(404).send({ error: "workflow not found" });
+  const secret = newWebhookSecret();
+  await setWebhookSecret(db, id, secret);
+  return { secret };
 });
 
 app.post("/api/workflows/:id/run", async (req, reply) => {
@@ -375,6 +425,15 @@ app.post("/api/workflows/:id/run", async (req, reply) => {
 // --- Webhook trigger ---------------------------------------------------------
 app.post("/api/hooks/:workflowId", async (req, reply) => {
   const { workflowId } = req.params as { workflowId: string };
+  // Enforce the HMAC signature when the workflow has a signing secret.
+  const wf = await getWorkflow(db, workflowId);
+  if (wf?.webhookSecret) {
+    const sig = req.headers[WEBHOOK_SIGNATURE_HEADER] as string | undefined;
+    const raw = (req as { rawBody?: string }).rawBody ?? "";
+    if (!verifyWebhookSignature(wf.webhookSecret, raw, sig)) {
+      return reply.code(401).send({ error: "invalid or missing webhook signature" });
+    }
+  }
   try {
     const mission = await startWorkflow(db, {
       workflowId,

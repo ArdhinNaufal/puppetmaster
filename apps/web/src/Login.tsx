@@ -8,6 +8,7 @@ import { authApi } from "./api.js";
  */
 export function Login(props: { onAuthed: () => void }) {
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
+  const [oidcEnabled, setOidcEnabled] = useState(false);
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
@@ -17,7 +18,10 @@ export function Login(props: { onAuthed: () => void }) {
   useEffect(() => {
     authApi
       .status()
-      .then((s) => setNeedsSetup(s.needsSetup))
+      .then((s) => {
+        setNeedsSetup(s.needsSetup);
+        setOidcEnabled(s.oidcEnabled);
+      })
       .catch(() => setNeedsSetup(false));
   }, []);
 
@@ -82,6 +86,14 @@ export function Login(props: { onAuthed: () => void }) {
             <button className="chip accent login-submit" disabled={busy} type="submit">
               {busy ? "…" : needsSetup ? "INITIALIZE WORKSPACE" : "AUTHENTICATE"}
             </button>
+            {oidcEnabled && (
+              <>
+                <div className="login-or">— OR —</div>
+                <a className="chip login-submit login-sso" href="/api/auth/oidc/login">
+                  SIGN IN WITH SSO
+                </a>
+              </>
+            )}
           </form>
         </Panel>
       </div>

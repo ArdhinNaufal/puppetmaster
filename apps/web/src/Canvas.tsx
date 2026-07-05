@@ -72,6 +72,7 @@ export function Canvas(props: {
   const [runInput, setRunInput] = useState('{ "n": 10 }');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [webhook, setWebhook] = useState<{ url: string; secret: string | null } | null>(null);
 
   // Load the selected workflow's graph.
   useEffect(() => {
@@ -210,8 +211,42 @@ export function Canvas(props: {
         <button className="chip accent" onClick={run} disabled={busy}>
           {busy ? "…" : "▶ RUN"}
         </button>
+        {nodes.some((n) => (n.data as { kind?: NodeKind })?.kind === "trigger" && (n.data as { config?: { mode?: string } })?.config?.mode === "webhook") && props.workflowId && (
+          <button
+            className="chip"
+            onClick={async () => {
+              const w = await api.getWebhook(props.workflowId!);
+              setWebhook({ url: w.url, secret: w.secret });
+            }}
+          >
+            ⚿ WEBHOOK
+          </button>
+        )}
         {msg && <span className="tb-msg">{msg}</span>}
       </div>
+      {webhook && (
+        <div className="webhook-reveal">
+          <span className="tag-lo">SIGNED WEBHOOK</span>
+          <code>POST {webhook.url}</code>
+          <span className="tag-lo">SECRET</span>
+          <code className="wh-secret">{webhook.secret ?? "(none)"}</code>
+          <span className="wh-hint">
+            X-Puppetmaster-Signature: sha256=HMAC_SHA256(secret, body)
+          </span>
+          <button
+            className="chip tiny"
+            onClick={async () => {
+              if (props.workflowId) {
+                const r = await api.rotateWebhook(props.workflowId);
+                setWebhook((w) => (w ? { ...w, secret: r.secret } : w));
+              }
+            }}
+          >
+            ROTATE
+          </button>
+          <button className="chip tiny" onClick={() => setWebhook(null)}>CLOSE</button>
+        </div>
+      )}
 
       <div className="canvas-body">
         <ReactFlow

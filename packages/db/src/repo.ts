@@ -33,11 +33,16 @@ export async function updateWorkspace(
 
 export async function createWorkflow(
   db: Db,
-  input: { workspaceId: string; name: string; graph: WorkflowGraph },
+  input: { workspaceId: string; name: string; graph: WorkflowGraph; webhookSecret?: string | null },
 ) {
   const [wf] = await db
     .insert(workflows)
-    .values({ workspaceId: input.workspaceId, name: input.name, currentVersion: 1 })
+    .values({
+      workspaceId: input.workspaceId,
+      name: input.name,
+      currentVersion: 1,
+      webhookSecret: input.webhookSecret ?? null,
+    })
     .returning();
   const [version] = await db
     .insert(workflowVersions)
@@ -52,6 +57,15 @@ export async function listWorkflows(db: Db, workspaceId: string) {
     .from(workflows)
     .where(eq(workflows.workspaceId, workspaceId))
     .orderBy(desc(workflows.createdAt));
+}
+
+export async function getWorkflow(db: Db, id: string) {
+  const [wf] = await db.select().from(workflows).where(eq(workflows.id, id)).limit(1);
+  return wf ?? null;
+}
+
+export async function setWebhookSecret(db: Db, id: string, secret: string | null) {
+  await db.update(workflows).set({ webhookSecret: secret }).where(eq(workflows.id, id));
 }
 
 export async function getWorkflowWithGraph(db: Db, id: string) {

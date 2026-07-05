@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-05 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M5 core + audit log complete
+**Date:** 2026-07-05 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M5 + audit log + OIDC/webhook-signing/demo-seed complete
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -56,11 +56,36 @@ decisions; this file only captures state and next steps.
 
 1. Owner review of M1–M5 on `claude/kickoff-prompt-continuation-cy021r` (manual review
    pending).
-2. **M5 remaining**: Tauri desktop client (Phase 2 packaging — needs the desktop
-   toolchain, not present in this env; the server core it wraps is ready).
-3. Security hardening candidates (later): per-webhook signing secrets (`/api/hooks/:id` is
-   deliberately public), OIDC (ARCHITECTURE.md §6 "later"). The append-only audit log is
-   now done (below).
+2. **Remaining**: Tauri desktop client (Phase 2 packaging — needs the desktop
+   toolchain, not present in this env; the server core it wraps is ready). This is now the
+   only roadmap item left.
+
+### Hardening batch — OIDC, webhook signing, demo seed (verified)
+
+- **OIDC login** (ARCHITECTURE.md §6): `oidc.ts` implements the authorization-code flow
+  with `jose` — discovery (`.well-known/openid-configuration`), token exchange, and
+  id_token **signature verification via the provider JWKS** (issuer + audience checked).
+  Routes in `auth.ts`: `GET /api/auth/oidc/login` (state cookie → redirect to the IdP) and
+  `/callback` (state check, code exchange, user provisioning, session). Enabled only when
+  `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/`OIDC_REDIRECT_URI` are set;
+  `GET /api/auth/status` advertises `oidcEnabled` and the Login screen shows an SSO button.
+  First SSO user of an empty instance is provisioned owner; others get `OIDC_DEFAULT_ROLE`
+  (member). Verified end-to-end against a mock IdP (RS256/JWKS round trip, state mismatch
+  rejected, owner provisioning, session minted).
+- **Signed webhooks**: `workflows.webhook_secret` column; a webhook-trigger workflow gets an
+  HMAC secret on create/save. `/api/hooks/:id` enforces `X-Puppetmaster-Signature:
+  sha256=HMAC_SHA256(secret, rawBody)` (constant-time; raw body captured by a content-type
+  parser). Reveal (`GET /api/workflows/:id/webhook`, builder+) and rotate
+  (`POST …/webhook/rotate`) endpoints; Canvas shows a ⚿ WEBHOOK reveal box with the URL,
+  secret, signing scheme, and rotate. Verified: unsigned/bad-sig → 401, valid → 202,
+  member → 403 on reveal.
+- **Demo seed** (`seed-demo.ts`, `pnpm --filter @puppetmaster/server seed:demo`): drives the
+  **real kernel** (mock model, inline dispatch) to populate a lived-in workspace — "ACME OPS"
+  branding, 4 users across all roles (password `demodemo123`), 3 agents + 3 workflows from
+  templates, 12 missions across succeeded/awaiting_approval, 2 pending approvals, embedded
+  memories, and the full audit trail. `PGLITE_DATA_DIR` (new, in `createDb`) lets the seeder
+  and server share one on-disk PGlite store. Verified: seed → start server on the same store
+  → owner logs in, all views populated.
 
 ### Audit log — Policy & Approval Engine §3.6 (verified in the browser)
 

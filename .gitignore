@@ -8,3 +8,4 @@ build/
 coverage/
 .DS_Store
 dump.rdb
+.pmdata/
