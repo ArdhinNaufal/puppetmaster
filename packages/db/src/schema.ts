@@ -209,12 +209,33 @@ export const templates = pgTable("templates", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Append-only audit trail (ARCHITECTURE.md §3.6): every LLM call, tool call,
+ *  and approval decision, plus auth/member actions. Never updated or deleted. */
+export const auditLog = pgTable("audit_log", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  /** "user" | "agent" | "system" — who/what took the action. */
+  actorKind: text("actor_kind").notNull().default("system"),
+  /** user id, agent id, or a label like "system"; nullable for anonymous. */
+  actorId: text("actor_id"),
+  actorLabel: text("actor_label"),
+  missionId: uuid("mission_id"),
+  /** dotted verb, e.g. "llm.call", "tool.call", "approval.decision", "member.role". */
+  action: text("action").notNull(),
+  target: text("target"),
+  detail: jsonb("detail"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const schema = {
   users,
   sessions,
   memberships,
   uiPreferences,
   templates,
+  auditLog,
   workspaces,
   workflows,
   workflowVersions,

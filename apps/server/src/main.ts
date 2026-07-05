@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { WorkflowGraph } from "@puppetmaster/shared";
 import {
+  appendAudit,
   createAgent,
   createDb,
   createTemplate,
@@ -19,6 +20,7 @@ import {
   getWorkspace,
   listAgents,
   listApprovals,
+  listAudit,
   listMemories,
   listMissions,
   listTemplates,
@@ -59,6 +61,7 @@ import {
 import { utilsServerPath } from "@puppetmaster/mcp-connectors";
 import { registerAuth } from "./auth.js";
 import { BUILTIN_TEMPLATES } from "./seeds.js";
+import { createAuditSink, startAuditProjector } from "./audit.js";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -89,8 +92,13 @@ const embedder = createEmbedder({
   baseUrl: process.env.EMBEDDING_BASE_URL ?? process.env.OPENAI_BASE_URL,
   apiKey: process.env.EMBEDDING_API_KEY ?? process.env.OPENAI_API_KEY,
 });
-const executor = new WorkflowExecutor({ db, bus, tools });
-const agentRuntime = new AgentRuntime({ db, bus, router, tools, embedder });
+// Append-only audit log (ARCHITECTURE.md §3.6): the kernel writes LLM/tool
+// calls through this sink; a bus projector adds mission lifecycle + approval
+// requests; endpoints add approval decisions and auth/member actions.
+const auditSink = createAuditSink(db);
+const executor = new WorkflowExecutor({ db, bus, tools, audit: auditSink });
+const agentRuntime = new AgentRuntime({ db, bus, router, tools, embedder, audit: auditSink });
+const auditUnsub = startAuditProjector(bus, db);
 
 // Seed the first-party template catalog (PRD §6 marketplace), idempotently.
 const seededTemplates = await seedBuiltinTemplates(db, BUILTIN_TEMPLATES);
@@ -286,6 +294,13 @@ app.delete("/api/templates/:id", async (req, reply) => {
   if (tpl.builtin) return reply.code(400).send({ error: "cannot delete a built-in template" });
   await deleteTemplate(db, id);
   return reply.code(204).send();
+});
+
+// --- Audit log (ARCHITECTURE.md §3.6) -----------------------------------------
+// Append-only; admin+ only (RBAC rule in auth.ts). No write/delete surface.
+app.get("/api/audit", async (req) => {
+  const { action, limit } = req.query as { action?: string; limit?: string };
+  return listAudit(db, workspaceId, { action, limit: limit ? Number(limit) : undefined });
 });
 
 // --- Adaptive suggestions (M5, PRD §5) ----------------------------------------
@@ -498,6 +513,16 @@ app.post("/api/approvals/:id", async (req, reply) => {
   if (!approval) return reply.code(404).send({ error: "approval not found" });
   const approved = body.approved !== false;
   await resolveApproval(db, id, approved);
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    missionId: approval.missionId,
+    action: "approval.decision",
+    target: approval.nodeId,
+    detail: { approved, tier: approval.tier },
+  });
   await bus.publish({
     type: "approval.resolved",
     missionId: approval.missionId,
@@ -525,6 +550,7 @@ app.get("/api/events", { websocket: true }, (socket) => {
 // --- Lifecycle ---------------------------------------------------------------
 async function shutdown() {
   app.log.info("shutting down");
+  auditUnsub();
   await runner.close();
   for (const conn of mcpConnections) await conn.close().catch(() => {});
   await bus.close?.();

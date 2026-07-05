@@ -17,6 +17,7 @@ import {
 } from "@puppetmaster/db";
 import type { MissionStatus } from "@puppetmaster/shared";
 import type { EventBus } from "./bridge.js";
+import type { AuditSink } from "./audit-sink.js";
 import { toVectorLiteral, type EmbeddingProvider } from "./embeddings.js";
 import { ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
@@ -70,6 +71,7 @@ export interface AgentRuntimeDeps {
   /** When set, memories are embedded on save and recalled by pgvector cosine
    *  similarity (RAG); otherwise recall falls back to keyword search. */
   embedder?: EmbeddingProvider | null;
+  audit?: AuditSink;
 }
 
 /**
@@ -86,6 +88,7 @@ export class AgentRuntime {
   private readonly router: ModelRouter;
   private readonly tools: ToolRegistry;
   private readonly embedder: EmbeddingProvider | null;
+  private readonly audit: AuditSink | null;
 
   constructor(deps: AgentRuntimeDeps) {
     this.db = deps.db;
@@ -93,6 +96,17 @@ export class AgentRuntime {
     this.router = deps.router;
     this.tools = deps.tools ?? new BuiltinToolRegistry();
     this.embedder = deps.embedder ?? null;
+    this.audit = deps.audit ?? null;
+  }
+
+  /** Best-effort audit; never let a logging failure break the tick. */
+  private async recordAudit(entry: Parameters<AuditSink>[0]): Promise<void> {
+    if (!this.audit) return;
+    try {
+      await this.audit(entry);
+    } catch {
+      /* audit is advisory */
+    }
   }
 
   /** Long-term recall: pgvector cosine similarity when an embedder is
@@ -119,6 +133,15 @@ export class AgentRuntime {
     }
     const agent = await getAgent(this.db, mission.subjectId);
     if (!agent) throw new Error(`agent ${mission.subjectId} not found`);
+
+    // Actor identity stamped on this tick's audit entries (ARCHITECTURE.md §3.6).
+    const auditActor = {
+      workspaceId: mission.workspaceId,
+      actorKind: "agent" as const,
+      actorId: agent.id,
+      actorLabel: agent.name,
+      missionId,
+    };
 
     const cursor = (mission.cursor ?? {}) as { pending?: PendingToolCall; iterations?: number };
     const resuming = mission.status === "awaiting_approval" && cursor.pending;
@@ -168,6 +191,12 @@ export class AgentRuntime {
         isError = true;
       }
       await this.recordToolStep(missionId, pending.name, approved && !isError, pending.args, result);
+      await this.recordAudit({
+        ...auditActor,
+        action: "tool.call",
+        target: pending.name.replace("__", "."),
+        detail: { ok: approved && !isError, gated: true, approved, args: pending.args },
+      });
       await appendAgentMessage(this.db, {
         agentId: agent.id,
         missionId,
@@ -237,6 +266,12 @@ export class AgentRuntime {
         status: "succeeded",
         output: { text: response.text, toolCalls: response.toolCalls, usage: response.usage },
         finishedAt: now(),
+      });
+      await this.recordAudit({
+        ...auditActor,
+        action: "llm.call",
+        target: agent.model,
+        detail: { iteration: iterations, usage: response.usage, toolCalls: response.toolCalls.length },
       });
 
       // Persist the assistant turn (text and/or tool calls).
@@ -322,6 +357,12 @@ export class AgentRuntime {
           isError = true;
         }
         await this.recordToolStep(missionId, call.name, !isError, call.args, result);
+        await this.recordAudit({
+          ...auditActor,
+          action: "tool.call",
+          target: call.name.replace("__", "."),
+          detail: { ok: !isError, args: call.args },
+        });
         toolResults.push({ toolCallId: call.id, result, isError });
       }
 

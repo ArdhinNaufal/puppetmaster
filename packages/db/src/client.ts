@@ -183,6 +183,19 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS agent_messages_agent_idx ON agent_messages(agent_id)`,
   `CREATE INDEX IF NOT EXISTS agent_memories_agent_idx ON agent_memories(agent_id)`,
   `CREATE INDEX IF NOT EXISTS templates_kind_idx ON templates(kind)`,
+  `CREATE TABLE IF NOT EXISTS audit_log (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     actor_kind text NOT NULL DEFAULT 'system',
+     actor_id text,
+     actor_label text,
+     mission_id uuid,
+     action text NOT NULL,
+     target text,
+     detail jsonb,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS audit_log_workspace_idx ON audit_log(workspace_id, created_at)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

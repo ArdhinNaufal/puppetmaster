@@ -228,6 +228,23 @@ export const suggestionApi = {
   get: () => fetch("/api/suggestions").then(json<Suggestion[]>),
 };
 
+export interface AuditEntry {
+  id: string;
+  actorKind: "user" | "agent" | "system";
+  actorId: string | null;
+  actorLabel: string | null;
+  missionId: string | null;
+  action: string;
+  target: string | null;
+  detail: unknown;
+  createdAt: string;
+}
+
+export const auditApi = {
+  list: (action?: string) =>
+    fetch(`/api/audit${action ? `?action=${encodeURIComponent(action)}` : ""}`).then(json<AuditEntry[]>),
+};
+
 /* ------------------------------------------------------------ Auth / members */
 
 export type Role = "owner" | "admin" | "builder" | "member";

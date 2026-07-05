@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import { Role, ROLE_RANK } from "@puppetmaster/shared";
 import {
+  appendAudit,
   countUsers,
   createSession,
   createUser,
@@ -66,9 +67,10 @@ interface PolicyRule {
 }
 
 const POLICY: PolicyRule[] = [
-  // Admin surface: workspace/branding + member management.
+  // Admin surface: workspace/branding + member management + audit log.
   { methods: ["PUT"], path: /^\/api\/workspace$/, role: "admin" },
   { methods: ["GET", "POST", "PUT", "DELETE"], path: /^\/api\/members(\/|$)/, role: "admin" },
+  { methods: ["GET"], path: /^\/api\/audit$/, role: "admin" },
   // Builder surface: authoring and operating workflows/agents, resolving approvals.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/workflows(\/|$)/, role: "builder" },
   { methods: ["POST"], path: /^\/api\/approvals(\/|$)/, role: "builder" },
@@ -168,6 +170,10 @@ export async function registerAuth(
     });
     await upsertMembership(db, { userId: user.id, workspaceId, role: "owner" });
     await setSessionCookie(reply, user.id);
+    await appendAudit(db, {
+      workspaceId, actorKind: "user", actorId: user.id, actorLabel: user.email,
+      action: "workspace.setup", target: user.email, detail: { role: "owner" },
+    });
     return reply.code(201).send({ user: { id: user.id, email: user.email, name: user.name }, role: "owner" });
   });
 
@@ -179,6 +185,9 @@ export async function registerAuth(
     const membership = await getMembership(db, user.id, workspaceId);
     if (!membership) return reply.code(403).send({ error: "not a member of this workspace" });
     await setSessionCookie(reply, user.id);
+    await appendAudit(db, {
+      workspaceId, actorKind: "user", actorId: user.id, actorLabel: user.email, action: "auth.login",
+    });
     return { user: { id: user.id, email: user.email, name: user.name }, role: membership.role };
   });
 
@@ -216,6 +225,10 @@ export async function registerAuth(
       passwordHash: await hashPassword(body.password),
     });
     await upsertMembership(db, { userId: user.id, workspaceId, role });
+    await appendAudit(db, {
+      workspaceId, actorKind: "user", actorId: req.authUser!.id, actorLabel: req.authUser!.email,
+      action: "member.create", target: user.email, detail: { role },
+    });
     return reply.code(201).send({ userId: user.id, email: user.email, name: user.name, role });
   });
 
@@ -229,6 +242,10 @@ export async function registerAuth(
     if (target.role === "owner") return reply.code(400).send({ error: "the owner role cannot be changed" });
     if (userId === req.authUser!.id) return reply.code(400).send({ error: "cannot change your own role" });
     await upsertMembership(db, { userId, workspaceId, role: role.data });
+    await appendAudit(db, {
+      workspaceId, actorKind: "user", actorId: req.authUser!.id, actorLabel: req.authUser!.email,
+      action: "member.role", target: userId, detail: { role: role.data },
+    });
     return { userId, role: role.data };
   });
 
@@ -241,6 +258,10 @@ export async function registerAuth(
     await removeMembership(db, userId, workspaceId);
     // Single-workspace deployment: removing the membership retires the account too.
     if (await getUser(db, userId)) await deleteUser(db, userId);
+    await appendAudit(db, {
+      workspaceId, actorKind: "user", actorId: req.authUser!.id, actorLabel: req.authUser!.email,
+      action: "member.remove", target: userId,
+    });
     return reply.code(204).send();
   });
 

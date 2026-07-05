@@ -144,6 +144,9 @@ Sessions are HttpOnly-cookie based and live 30 days. Additional users are create
    ranked by pgvector cosine similarity (scores shown).
 6. **Adaptive suggestions:** the **SUGGESTED** sidebar panel lists your most-run agents and
    workflows, most-used first.
+7. **Audit log:** as an admin/owner, open **ADMIN** → **AUDIT LOG** — every LLM call, tool
+   call, and approval decision (plus auth/membership changes) appears in an append-only trail,
+   filterable by action.
 
 ## Notes
 

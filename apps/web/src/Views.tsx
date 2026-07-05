@@ -3,11 +3,13 @@ import { Chip, Panel, Stat, StatusDot, StatusText, TierBadge } from "@puppetmast
 import {
   agentApi,
   api,
+  auditApi,
   memberApi,
   templateApi,
   workspaceApi,
   type Agent,
   type AgentMemory,
+  type AuditEntry,
   type MemberRow,
   type MemoryHit,
   type Mission,
@@ -431,11 +433,15 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
   const [members, setMembers] = useState<MemberRow[]>([]);
   const [memberErr, setMemberErr] = useState<string | null>(null);
   const [draft, setDraft] = useState({ email: "", name: "", password: "", role: "member" as Role });
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [auditFilter, setAuditFilter] = useState("");
 
   const refreshMembers = () => memberApi.list().then(setMembers).catch(() => {});
+  const refreshAudit = (action?: string) => auditApi.list(action || undefined).then(setAudit).catch(() => {});
   useEffect(() => {
     workspaceApi.get().then(setWs).catch(() => {});
     refreshMembers();
+    refreshAudit();
   }, []);
 
   const addMember = async () => {
@@ -572,6 +578,51 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
             approves, <b>admin</b> manages members and branding, <b>owner</b> is fixed at setup.
           </p>
         </div>
+      </Panel>
+
+      <Panel
+        title="AUDIT LOG"
+        className="grow"
+        scroll
+        actions={
+          <span className="head-actions">
+            <select className="audit-filter" value={auditFilter} onChange={(e) => { setAuditFilter(e.target.value); refreshAudit(e.target.value); }}>
+              <option value="">all actions</option>
+              <option value="llm.call">llm.call</option>
+              <option value="tool.call">tool.call</option>
+              <option value="approval.requested">approval.requested</option>
+              <option value="approval.decision">approval.decision</option>
+              <option value="mission.finished">mission.finished</option>
+              <option value="member.create">member.create</option>
+              <option value="member.role">member.role</option>
+              <option value="auth.login">auth.login</option>
+            </select>
+            <Chip tiny onClick={() => refreshAudit(auditFilter)}>REFRESH</Chip>
+          </span>
+        }
+      >
+        <table className="fui-table audit-table">
+          <thead>
+            <tr><th>TIME</th><th>ACTOR</th><th>ACTION</th><th>TARGET</th></tr>
+          </thead>
+          <tbody>
+            {audit.map((a) => (
+              <tr key={a.id}>
+                <td className="dim mono">{new Date(a.createdAt).toLocaleTimeString()}</td>
+                <td><span className={`audit-actor ak-${a.actorKind}`}>{a.actorKind}</span> {a.actorLabel}</td>
+                <td className="mono">{a.action}</td>
+                <td className="dim">{a.target ?? ""}</td>
+              </tr>
+            ))}
+            {audit.length === 0 && (
+              <tr><td colSpan={4} className="dim pad">No audit entries yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+        <p className="dim pad">
+          Append-only trail (ARCHITECTURE §3.6): every LLM call, tool call, and approval decision,
+          plus auth and membership changes.
+        </p>
       </Panel>
     </div>
   );

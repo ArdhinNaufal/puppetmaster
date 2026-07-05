@@ -22,6 +22,7 @@ import {
   type Db,
 } from "@puppetmaster/db";
 import type { EventBus } from "./bridge.js";
+import type { AuditSink } from "./audit-sink.js";
 import { runCodeNode } from "./sandbox.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
 
@@ -85,6 +86,7 @@ export interface ExecutorDeps {
   db: Db;
   bus: EventBus;
   tools?: ToolRegistry;
+  audit?: AuditSink;
 }
 
 /**
@@ -97,12 +99,24 @@ export class WorkflowExecutor {
   private readonly db: Db;
   private readonly bus: EventBus;
   private readonly tools: ToolRegistry;
+  private readonly audit: AuditSink | null;
   private agentInvoker: AgentInvoker | null = null;
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
     this.bus = deps.bus;
     this.tools = deps.tools ?? new BuiltinToolRegistry();
+    this.audit = deps.audit ?? null;
+  }
+
+  /** Best-effort audit; never let a logging failure break execution. */
+  private async recordAudit(entry: Parameters<AuditSink>[0]): Promise<void> {
+    if (!this.audit) return;
+    try {
+      await this.audit(entry);
+    } catch {
+      /* audit is advisory */
+    }
   }
 
   /** Wire the workflow → agent bridge (docs/ARCHITECTURE.md §3.3). */
@@ -238,6 +252,18 @@ export class WorkflowExecutor {
       outputs[node.id] = output ?? null;
       completed.add(node.id);
       await this.recordStep(missionId, node, "succeeded", attempt, nodeInput ?? null, output ?? null, null, stepIdByNode);
+      if (node.kind === "action") {
+        const c = node.config as { server?: string; tool?: string };
+        await this.recordAudit({
+          workspaceId: mission.workspaceId,
+          actorKind: "system",
+          actorLabel: "workflow",
+          missionId,
+          action: "tool.call",
+          target: c.server && c.tool ? `${c.server}.${c.tool}` : node.id,
+          detail: { node: node.id, status: "succeeded" },
+        });
+      }
       await persistCursor();
     }
 

@@ -533,3 +533,17 @@ button { font-family: inherit; cursor: pointer; }
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- Audit log (ARCHITECTURE §3.6) -------------------------------------- */
+.audit-table td { vertical-align: top; }
+.audit-actor {
+  display: inline-block;
+  font-size: 0.54rem;
+  letter-spacing: 0.1em;
+  padding: 0.05rem 0.3rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--stroke);
+  color: var(--text-lo);
+}
+.audit-actor.ak-user { color: var(--accent); border-color: var(--accent); }
+.audit-actor.ak-agent { color: var(--warn); border-color: var(--warn); }

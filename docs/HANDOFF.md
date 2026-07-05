@@ -1,6 +1,6 @@
 # Puppetmaster — Session Handoff
 
-**Date:** 2026-07-05 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M5 core complete (templates + RAG + adaptive UI)
+**Date:** 2026-07-05 · **Branch:** `claude/kickoff-prompt-continuation-cy021r` · **Milestone:** M5 core + audit log complete
 
 This document lets a fresh Claude Code session (on any account) continue exactly where the
 previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTURE.md`,
@@ -59,7 +59,30 @@ decisions; this file only captures state and next steps.
 2. **M5 remaining**: Tauri desktop client (Phase 2 packaging — needs the desktop
    toolchain, not present in this env; the server core it wraps is ready).
 3. Security hardening candidates (later): per-webhook signing secrets (`/api/hooks/:id` is
-   deliberately public), OIDC (ARCHITECTURE.md §6 "later"), append-only audit log surface.
+   deliberately public), OIDC (ARCHITECTURE.md §6 "later"). The append-only audit log is
+   now done (below).
+
+### Audit log — Policy & Approval Engine §3.6 (verified in the browser)
+
+- **DB**: `audit_log` table (`workspaceId`, `actorKind` user|agent|system, `actorId`,
+  `actorLabel`, `missionId`, `action`, `target`, `detail` jsonb) + `audit-repo.ts`
+  (`appendAudit` / `listAudit`). Append-only by contract — no update/delete surface.
+- **Kernel**: an `AuditSink` (`audit-sink.ts`) is injected into the `WorkflowExecutor` and
+  `AgentRuntime`. The runtime records every `llm.call` (per model step, with usage) and
+  `tool.call` (including gated ones, with approved/ok flags); the executor records action
+  nodes as `tool.call`. All best-effort — a logging failure never breaks execution.
+- **Server**: `audit.ts` binds the sink to the table and runs a bus **projector** that adds
+  `mission.started` / `mission.finished` / `approval.requested` (actor resolved from the
+  mission, cached). `approval.decision` is written at the resolve endpoint with the deciding
+  **user's** identity; `auth.login`, `workspace.setup`, `member.create` / `.role` / `.remove`
+  are written in `auth.ts` with the acting user. `GET /api/audit` (admin+; RBAC rule added,
+  optional `action`/`limit` filters).
+- **Web**: an AUDIT LOG panel in the Admin view — time / actor (color-coded user·agent·system
+  badge) / action / target, with an action filter and refresh.
+- **Verified** (API + Playwright, real Redis + PGlite): a run producing llm.call ×4,
+  tool.call ×2, approval.requested + approval.decision (by the deciding user), member.create,
+  workspace.setup, mission start/finish — all with correct actors; member gets 403 on
+  `/api/audit`; the Admin filter isolates a single action.
 
 ### M5 — ecosystem: templates, RAG, adaptive UI (verified in the browser)
 
