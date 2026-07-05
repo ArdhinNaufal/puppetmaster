@@ -11,8 +11,11 @@ import {
   type WorkflowNode,
 } from "@puppetmaster/shared";
 import {
+  beginNodeExecution,
+  commitNodeExecution,
   createApproval,
   findApprovalForNode,
+  findCommittedExecution,
   getMission,
   getMissionSteps,
   getWorkflowVersionById,
@@ -172,6 +175,14 @@ export class WorkflowExecutor {
     for (const node of order) {
       if (completed.has(node.id) || skipped.has(node.id)) continue;
 
+      // Cooperative cancellation (Stage 2): honour a cancel request between
+      // nodes — the granularity at which the cursor is durable.
+      const fresh = await getMission(this.db, missionId);
+      if (fresh?.cancelRequested) {
+        await persistCursor();
+        return this.finishMission(missionId, "cancelled", null, "cancelled by operator");
+      }
+
       // Activation: triggers are entry points; other nodes need a satisfied edge.
       const inEdges = incoming.get(node.id) ?? [];
       let active = node.kind === "trigger" || inEdges.length === 0;
@@ -238,7 +249,7 @@ export class WorkflowExecutor {
         await this.recordStep(missionId, node, "running", attempt, nodeInput ?? null, null, null, stepIdByNode);
         try {
           output = await withTimeout(
-            this.executeNode(node, nodeInput, outputs, missionId, triggerMode),
+            this.executeNode(node, nodeInput, outputs, missionId, triggerMode, attempt),
             node.timeoutMs ?? 30_000,
             `node ${node.id}`,
           );
@@ -288,6 +299,7 @@ export class WorkflowExecutor {
     outputs: Record<string, unknown>,
     missionId: string,
     triggerMode: string | null,
+    attempt: number,
   ): Promise<unknown> {
     switch (node.kind) {
       case "trigger":
@@ -295,7 +307,16 @@ export class WorkflowExecutor {
       case "action": {
         const cfg = ActionConfig.parse(node.config);
         const args = resolveArgs(cfg.args, input);
-        return this.tools.callTool(cfg.server, cfg.tool, args, { input });
+        // Idempotency (Stage 2, G4): a retried mission reuses the committed
+        // output of a side-effectful call instead of re-executing it. The
+        // ledger row is written *before* the call so a crash mid-call is
+        // distinguishable (uncommitted) from completed work (committed).
+        const committed = await findCommittedExecution(this.db, missionId, node.id);
+        if (committed) return committed.output;
+        const exec = await beginNodeExecution(this.db, { missionId, nodeId: node.id, attempt });
+        const result = await this.tools.callTool(cfg.server, cfg.tool, args, { input });
+        await commitNodeExecution(this.db, exec.id, result);
+        return result;
       }
       case "logic": {
         const cfg = LogicConfig.parse(node.config);

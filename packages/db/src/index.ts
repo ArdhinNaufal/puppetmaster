@@ -6,3 +6,4 @@ export * from "./auth-repo.js";
 export * from "./template-repo.js";
 export * from "./audit-repo.js";
 export * from "./security-repo.js";
+export * from "./durability-repo.js";

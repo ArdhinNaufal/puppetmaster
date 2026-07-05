@@ -18,11 +18,13 @@ import {
   getMissionSteps,
   getTemplate,
   getWorkflow,
+  getWorkflowVersionById,
   getWorkflowWithGraph,
   getWorkspace,
   listAgents,
   listApprovals,
   listAudit,
+  listDeadLetterMissions,
   listMemories,
   listMissions,
   listPoliciesForAgent,
@@ -30,6 +32,8 @@ import {
   listWorkflows,
   migrate,
   missionUsage,
+  requestMissionCancel,
+  resetMissionForRetry,
   resolveApproval,
   saveWorkflowVersion,
   searchMemories,
@@ -37,6 +41,7 @@ import {
   seedBuiltinTemplates,
   setWebhookSecret,
   updateAgent,
+  updateMission,
   updateWorkspace,
   type DbHandle,
 } from "@puppetmaster/db";
@@ -54,6 +59,7 @@ import {
   QueueRunner,
   RedisEventBus,
   registerBridgeTools,
+  replayMission,
   resolveCredentialEnv,
   startAgentTick,
   startWorkflow,
@@ -597,12 +603,99 @@ app.get("/api/agents/:id/memory-search", async (req) => {
 // --- Missions & traces -------------------------------------------------------
 app.get("/api/missions", async () => listMissions(db, workspaceId));
 
+/** Dead-letter queue: missions retried at least once and still failed. */
+app.get("/api/missions/dead-letter", async () =>
+  listDeadLetterMissions(db, workspaceId, 1));
+
 app.get("/api/missions/:id", async (req, reply) => {
   const { id } = req.params as { id: string };
   const mission = await getMission(db, id);
   if (!mission) return reply.code(404).send({ error: "mission not found" });
   const steps = await getMissionSteps(db, id);
   return { mission, steps };
+});
+
+/** Cooperative cancel (Stage 2): queued/paused missions cancel immediately;
+ *  running missions get a flag checked between nodes/iterations. */
+app.post("/api/missions/:id/cancel", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const mission = await getMission(db, id);
+  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (["succeeded", "failed", "cancelled"].includes(mission.status)) {
+    return reply.code(409).send({ error: `mission is already ${mission.status}` });
+  }
+  await requestMissionCancel(db, id);
+  const immediate = mission.status === "queued" || mission.status === "awaiting_approval";
+  if (immediate) {
+    await updateMission(db, id, {
+      status: "cancelled",
+      error: "cancelled by operator",
+      finishedAt: new Date(),
+    });
+    await bus.publish({ type: "mission.finished", missionId: id, status: "cancelled", at: new Date().toISOString() });
+  }
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    missionId: id,
+    action: "mission.cancel",
+    detail: { immediate },
+  });
+  return reply.code(202).send({ ok: true, cancelled: immediate, cancelling: !immediate });
+});
+
+/** Retry-from-step (Stage 2): re-enqueue a failed/cancelled mission; the
+ *  cursor + idempotency ledger make it resume where it stopped without
+ *  repeating committed side effects. */
+app.post("/api/missions/:id/retry", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const mission = await getMission(db, id);
+  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (!["failed", "cancelled"].includes(mission.status)) {
+    return reply.code(409).send({ error: `only failed/cancelled missions can be retried (status: ${mission.status})` });
+  }
+  await resetMissionForRetry(db, id);
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    missionId: id,
+    action: "mission.retry",
+    detail: { retryCount: mission.retryCount + 1 },
+  });
+  await runner.enqueue(id);
+  return reply.code(202).send({ ok: true, missionId: id });
+});
+
+/** Deterministic replay (Stage 2): re-walk the DAG over recorded outputs,
+ *  no side effects — flags divergence between expected and recorded steps. */
+app.get("/api/missions/:id/replay", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const mission = await getMission(db, id);
+  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  const steps = await getMissionSteps(db, id);
+  if (mission.kind !== "workflow" || !mission.workflowVersionId) {
+    // Agent ticks are linear: the ordered step log is already the lineage.
+    return { mission, kind: mission.kind, lineage: steps };
+  }
+  const version = await getWorkflowVersionById(db, mission.workflowVersionId);
+  if (!version) return reply.code(404).send({ error: "workflow version not found" });
+  const lineage = replayMission(
+    version.graph,
+    steps.map((s) => ({
+      nodeId: s.nodeId,
+      status: s.status,
+      input: s.input,
+      output: s.output,
+      error: s.error,
+      attempt: s.attempt,
+    })),
+    mission.input,
+  );
+  return { mission, kind: "workflow", lineage };
 });
 
 // --- Approvals ---------------------------------------------------------------

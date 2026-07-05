@@ -229,6 +229,19 @@ const DDL: string[] = [
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
   `CREATE INDEX IF NOT EXISTS approval_policies_workspace_idx ON approval_policies(workspace_id)`,
+  `ALTER TABLE missions ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false`,
+  `ALTER TABLE missions ADD COLUMN IF NOT EXISTS retry_count integer NOT NULL DEFAULT 0`,
+  `CREATE TABLE IF NOT EXISTS node_executions (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     mission_id uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+     node_id text NOT NULL,
+     attempt integer NOT NULL DEFAULT 0,
+     key text NOT NULL UNIQUE,
+     output jsonb,
+     committed boolean NOT NULL DEFAULT false,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS node_executions_mission_idx ON node_executions(mission_id, node_id)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

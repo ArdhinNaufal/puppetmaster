@@ -81,6 +81,8 @@ const POLICY: PolicyRule[] = [
   // The webhook secret is sensitive: revealing it is builder+, not an open GET.
   { methods: ["GET"], path: /^\/api\/workflows\/[^/]+\/webhook$/, role: "builder" },
   { methods: ["POST"], path: /^\/api\/approvals(\/|$)/, role: "builder" },
+  // Mission control (Stage 2): cancel/retry are operator actions.
+  { methods: ["POST"], path: /^\/api\/missions(\/|$)/, role: "builder" },
   // Templates: browsing is open (member); instantiate/publish/delete are builder+.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/templates(\/|$)/, role: "builder" },
   // Agent CRUD is builder-tier, but chatting with an agent is core member UX.

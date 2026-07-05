@@ -118,6 +118,12 @@ export const api = {
   listMissions: () => fetch("/api/missions").then(json<Mission[]>),
   getMission: (id: string) =>
     fetch(`/api/missions/${id}`).then(json<{ mission: Mission; steps: MissionStep[] }>),
+  cancelMission: (id: string) =>
+    fetch(`/api/missions/${id}/cancel`, { method: "POST" }).then(
+      json<{ ok: boolean; cancelled: boolean; cancelling: boolean }>,
+    ),
+  retryMission: (id: string) =>
+    fetch(`/api/missions/${id}/retry`, { method: "POST" }).then(json<{ ok: boolean }>),
   listApprovals: (status = "pending") =>
     fetch(`/api/approvals?status=${status}`).then(json<Approval[]>),
   resolveApproval: (id: string, approved: boolean) =>

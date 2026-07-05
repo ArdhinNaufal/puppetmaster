@@ -1,6 +1,9 @@
 import {
   appendAgentMessage,
+  beginNodeExecution,
+  commitNodeExecution,
   createApproval,
+  findCommittedExecutionByKey,
   getAgent,
   getAgentMessages,
   getApproval,
@@ -195,11 +198,26 @@ export class AgentRuntime {
       let result: unknown;
       let isError = false;
       if (approved) {
-        try {
-          result = await this.executeTool(agent.id, missionId, pending.name, pending.args);
-        } catch (err) {
-          result = { error: err instanceof Error ? err.message : String(err) };
-          isError = true;
+        // Idempotency (Stage 2): if a previous resume executed this approved
+        // call but died before persisting the result, don't repeat the side
+        // effect — reuse the committed output.
+        const execKey = `${missionId}:approval:${pending.approvalId}`;
+        const committed = await findCommittedExecutionByKey(this.db, execKey);
+        if (committed) {
+          result = committed.output;
+        } else {
+          const exec = await beginNodeExecution(this.db, {
+            missionId,
+            nodeId: pending.name,
+            key: execKey,
+          });
+          try {
+            result = await this.executeTool(agent.id, missionId, pending.name, pending.args);
+            await commitNodeExecution(this.db, exec.id, result);
+          } catch (err) {
+            result = { error: err instanceof Error ? err.message : String(err) };
+            isError = true;
+          }
         }
       } else {
         result = { error: "approval rejected by operator" };
@@ -232,6 +250,13 @@ export class AgentRuntime {
 
     while (iterations < MAX_ITERATIONS) {
       iterations++;
+
+      // Cooperative cancellation (Stage 2): honour a cancel request between
+      // iterations of the tick loop.
+      const freshMission = await getMission(this.db, missionId);
+      if (freshMission?.cancelRequested) {
+        return this.finish(missionId, "cancelled", null, "cancelled by operator");
+      }
 
       const history = await getAgentMessages(this.db, agent.id);
       const messages = toChatMessages(history);

@@ -507,6 +507,26 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 </button>
               )}
               {!mission && <p className="muted pad">Run a workflow to see its live trace.</p>}
+              {mission && canBuild && (
+                <div className="pad" style={{ display: "flex", gap: 8 }}>
+                  {["queued", "running", "awaiting_approval"].includes(mission.status) && (
+                    <button
+                      className="chip tiny"
+                      onClick={() => api.cancelMission(mission.id).then(() => refreshTrace(mission.id)).catch(() => {})}
+                    >
+                      ✕ CANCEL
+                    </button>
+                  )}
+                  {["failed", "cancelled"].includes(mission.status) && (
+                    <button
+                      className="chip tiny"
+                      onClick={() => api.retryMission(mission.id).then(() => refreshTrace(mission.id)).catch(() => {})}
+                    >
+                      ↻ RETRY
+                    </button>
+                  )}
+                </div>
+              )}
               {mission && (
                 <>
                   {(() => {

@@ -123,6 +123,10 @@ export const missions = pgTable("missions", {
   error: text("error"),
   /** Resume cursor: map of completed nodeId -> output, so approval gates resume. */
   cursor: jsonb("cursor"),
+  /** Cooperative cancellation (Stage 2): checked between nodes/iterations. */
+  cancelRequested: boolean("cancel_requested").notNull().default(false),
+  /** Times this mission has been re-enqueued after failing (dead-letter signal). */
+  retryCount: integer("retry_count").notNull().default(0),
   startedAt: timestamp("started_at", { withTimezone: true }),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -232,6 +236,25 @@ export const auditLog = pgTable("audit_log", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Idempotency ledger for side-effectful node executions (Stage 2, G4).
+ *  A row is written *before* the tool call and committed with the output
+ *  after it; a retried mission reuses any committed output for a node
+ *  instead of re-executing the side effect (at-most-once for committed
+ *  work, at-least-once for work that died mid-call). */
+export const nodeExecutions = pgTable("node_executions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id")
+    .notNull()
+    .references(() => missions.id, { onDelete: "cascade" }),
+  nodeId: text("node_id").notNull(),
+  attempt: integer("attempt").notNull().default(0),
+  /** `missionId:nodeId:attempt` (or an explicit key, e.g. per approval). */
+  key: text("key").notNull().unique(),
+  output: jsonb("output"),
+  committed: boolean("committed").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 /** Encrypted-at-rest secrets (ARCHITECTURE §4, Stage 1). `encrypted` is an
  *  AES-256-GCM envelope (`v1:iv:tag:ciphertext`, hex) sealed with
  *  PUPPETMASTER_MASTER_KEY; plaintext is never stored and never returned by
@@ -305,4 +328,5 @@ export const schema = {
   credentials,
   mcpToolPins,
   approvalPolicies,
+  nodeExecutions,
 };

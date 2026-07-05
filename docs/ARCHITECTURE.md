@@ -51,6 +51,15 @@
 ### 3.2 Workflow Engine
 - Workflows are DAGs stored as JSON; nodes: trigger, action (MCP tool call), logic (branch/loop/wait), code (sandboxed JS via isolated worker), **agent node**, human-approval node.
 - Deterministic executor on BullMQ with retries, timeouts, and per-node IO snapshots for the trace view.
+- **Durable execution (Stage 2)**: side-effectful calls are journaled in `node_executions` —
+  a ledger row is written *before* the call and committed with the output after, so a retried
+  mission reuses committed outputs instead of repeating side effects (at-most-once for committed
+  work). Missions support cooperative **cancellation** (`POST /api/missions/:id/cancel`; flag
+  checked between nodes/agent iterations), **retry-from-cursor** (`POST /api/missions/:id/retry`,
+  builder+; preserves the step log and ledger), a **dead-letter list**
+  (`GET /api/missions/dead-letter`: retried ≥1× and still failed), and **deterministic replay**
+  (`GET /api/missions/:id/replay`: re-walks the DAG over recorded outputs with no side effects,
+  flagging divergence between expected and recorded activation).
 
 ### 3.3 The Bridge (differentiator)
 - Internal event bus (Redis streams) with typed events: `mission.*`, `agent.*`, `workflow.*`, `approval.*`.
