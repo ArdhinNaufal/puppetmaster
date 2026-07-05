@@ -125,6 +125,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [missionsRefresh, setMissionsRefresh] = useState(0);
+  const [streamText, setStreamText] = useState("");
+  const [diagnosis, setDiagnosis] = useState<{ summary: string; diagnosis: string } | null>(null);
   const [info, setInfo] = useState<{ dbDriver: string; queue: string } | null>(null);
 
   // Arrangeable panels persisted per user (ui_preferences).
@@ -212,6 +214,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         }
         if (event.type === "agent.message" && event.agentId === selectedAgentRef.current) {
           setChatRefresh((n) => n + 1);
+          if (event.role === "assistant") setStreamText("");
+        }
+        if (event.type === "agent.message.delta" && event.agentId === selectedAgentRef.current) {
+          setStreamText((t) => t + event.delta);
         }
       },
       [refreshApprovals, refreshTrace, refreshSuggestions],
@@ -233,6 +239,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const track = (id: string) => {
     setTracked(id);
     setNodeStatus({});
+    setDiagnosis(null);
     refreshTrace(id);
   };
 
@@ -443,7 +450,9 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </aside>
 
         <main className="panel canvas-panel">
-          {view === "command" && <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} />}
+          {view === "command" && (
+            <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} streaming={streamText} />
+          )}
           {view === "canvas" && canBuild && (
             <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
           )}
@@ -527,6 +536,14 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                       ↻ RETRY
                     </button>
                   )}
+                  {mission.status === "failed" && (
+                    <button
+                      className="chip tiny"
+                      onClick={() => api.explainMission(mission.id).then(setDiagnosis).catch(() => {})}
+                    >
+                      ? EXPLAIN
+                    </button>
+                  )}
                 </div>
               )}
               {mission && (
@@ -568,6 +585,12 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                     <div className="mission-output err">
                       <span className="tag-lo">ERROR</span>
                       <pre>{mission.error}</pre>
+                    </div>
+                  )}
+                  {diagnosis && (
+                    <div className="mission-output">
+                      <span className="tag-lo">DIAGNOSIS</span>
+                      <pre>{diagnosis.summary}{diagnosis.diagnosis ? `\n\n${diagnosis.diagnosis}` : ""}</pre>
                     </div>
                   )}
                 </>

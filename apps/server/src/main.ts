@@ -67,6 +67,8 @@ import {
   connectMcpServer,
   createAgentInvoker,
   createEmbedder,
+  draftWorkflowGraph,
+  explainFailure,
   InlineRunner,
   InMemoryEventBus,
   ModelRouter,
@@ -74,6 +76,7 @@ import {
   parseMcpServersEnv,
   kbIngest,
   kbSearch,
+  lintWorkflowGraph,
   QueueRunner,
   RedisEventBus,
   registerBridgeTools,
@@ -519,6 +522,22 @@ app.post("/api/workflows/:id/webhook/rotate", async (req, reply) => {
   return { secret };
 });
 
+/** NL→draft (Stage 6): model-drafted WorkflowGraph, returned as an editable
+ *  draft — never saved. Lint issues ride along so the editor can surface them. */
+app.post("/api/workflows/draft", async (req, reply) => {
+  const body = (req.body ?? {}) as { description?: string; model?: string };
+  if (!body.description?.trim()) return reply.code(400).send({ error: "description is required" });
+  const model = body.model?.trim() || process.env.COPILOT_MODEL || "mock";
+  const { graph, source } = await draftWorkflowGraph(router, model, body.description.trim());
+  return { graph, source, model, issues: lintWorkflowGraph(graph, (s, t) => tools.info(s, t)) };
+});
+
+/** Graph linter (Stage 6): static checks against the live tool catalog. */
+app.post("/api/workflows/lint", async (req) => {
+  const body = (req.body ?? {}) as { graph?: unknown };
+  return lintWorkflowGraph(body.graph ?? { nodes: [], edges: [] }, (s, t) => tools.info(s, t));
+});
+
 app.post("/api/workflows/:id/run", async (req, reply) => {
   const { id } = req.params as { id: string };
   const body = (req.body ?? {}) as { input?: unknown };
@@ -883,6 +902,20 @@ app.post("/api/missions/:id/retry", async (req, reply) => {
   });
   await runner.enqueue(id);
   return reply.code(202).send({ ok: true, missionId: id });
+});
+
+/** Failure explainer (Stage 6): deterministic locator line + model-written
+ *  diagnosis of the recorded step trace. */
+app.post("/api/missions/:id/explain", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const mission = await getMission(db, id);
+  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (mission.status !== "failed") {
+    return reply.code(409).send({ error: `mission is ${mission.status}, not failed` });
+  }
+  const steps = await getMissionSteps(db, id);
+  const model = process.env.COPILOT_MODEL || "mock";
+  return explainFailure(router, model, mission, steps);
 });
 
 /** Deterministic replay (Stage 2): re-walk the DAG over recorded outputs,

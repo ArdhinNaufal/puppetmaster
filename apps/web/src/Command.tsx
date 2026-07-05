@@ -10,6 +10,8 @@ export function Command(props: {
   agent: Agent | null;
   refreshKey: number;
   onRan: (missionId: string) => void;
+  /** Live streaming text (agent.message.delta) not yet persisted. */
+  streaming?: string;
 }) {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -25,7 +27,7 @@ export function Command(props: {
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [messages]);
+  }, [messages, props.streaming]);
 
   const send = async () => {
     if (!props.agent || !draft.trim() || busy) return;
@@ -57,6 +59,12 @@ export function Command(props: {
         {messages.map((m) => (
           <MessageRow key={m.id} msg={m} />
         ))}
+        {props.streaming && (
+          <div className="msg assistant">
+            <span className="msg-role">AGENT</span>
+            <div className="msg-body"><p>{props.streaming}<span className="dim">▌</span></p></div>
+          </div>
+        )}
       </div>
       <div className="cmd-input-row">
         <input

@@ -463,13 +463,28 @@ export class AgentRuntime {
 
       let response;
       try {
-        response = await this.router.chat({
-          model: agent.model,
-          system,
-          messages,
-          tools: toolDefs,
-          maxTokens: 4096,
-        });
+        // Stream deltas onto the bus (Stage 6): the UI renders them as a live
+        // bubble that is replaced by the persisted message when the turn ends.
+        response = await this.router.chatStream(
+          {
+            model: agent.model,
+            system,
+            messages,
+            tools: toolDefs,
+            maxTokens: 4096,
+          },
+          (delta) => {
+            void Promise.resolve(
+              this.bus.publish({
+                type: "agent.message.delta",
+                agentId: agent.id,
+                missionId,
+                delta,
+                at: now().toISOString(),
+              }),
+            ).catch(() => {});
+          },
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await updateStep(this.db, modelStep.id, { status: "failed", error: msg, finishedAt: now() });

@@ -13,7 +13,7 @@ import {
   type Node,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type NodeKind, type StepStatus, type WorkflowGraph } from "./api.js";
+import { api, type LintIssue, type NodeKind, type StepStatus, type WorkflowGraph } from "./api.js";
 import { FlowNode, NODE_META, type FlowNodeData } from "./FlowNode.js";
 
 const nodeTypes = { fui: FlowNode };
@@ -73,6 +73,9 @@ export function Canvas(props: {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [webhook, setWebhook] = useState<{ url: string; secret: string | null } | null>(null);
+  const [describe, setDescribe] = useState("");
+  const [drafting, setDrafting] = useState(false);
+  const [lintIssues, setLintIssues] = useState<LintIssue[] | null>(null);
 
   // Load the selected workflow's graph.
   useEffect(() => {
@@ -120,6 +123,34 @@ export function Canvas(props: {
         data: { kind, label: NODE_META[kind].tag[0] + NODE_META[kind].tag.slice(1).toLowerCase(), config: { ...DEFAULT_CONFIG[kind] } },
       },
     ]);
+  };
+
+  // NL→draft (Stage 6): the model drafts a graph rendered as *editable* state
+  // — nothing is saved until the builder hits SAVE (human-in-command).
+  const draft = async () => {
+    if (!describe.trim() || drafting) return;
+    setDrafting(true);
+    setMsg(null);
+    try {
+      const res = await api.draftWorkflow(describe.trim());
+      const flow = graphToFlow(res.graph);
+      setNodes(flow.nodes);
+      setEdges(flow.edges);
+      setLintIssues(res.issues);
+      setMsg(`draft loaded (${res.source}) — review, then SAVE to keep it`);
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : "draft failed");
+    } finally {
+      setDrafting(false);
+    }
+  };
+
+  const lint = async () => {
+    try {
+      setLintIssues(await api.lintWorkflow(flowToGraph(nodes, edges)));
+    } catch {
+      setLintIssues(null);
+    }
   };
 
   const save = useCallback(async () => {
@@ -224,6 +255,38 @@ export function Canvas(props: {
         )}
         {msg && <span className="tb-msg">{msg}</span>}
       </div>
+      <div className="canvas-toolbar">
+        <span className="tb-label">COPILOT</span>
+        <input
+          className="run-input"
+          style={{ flex: 1, minWidth: 220 }}
+          placeholder="Describe a workflow… e.g. 'daily: fetch api, summarize with agent, email me'"
+          value={describe}
+          onChange={(e) => setDescribe(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && draft()}
+        />
+        <button className="chip accent" onClick={draft} disabled={drafting || !describe.trim()}>
+          {drafting ? "…" : "✎ DRAFT"}
+        </button>
+        <button className="chip" onClick={lint}>⚖ LINT</button>
+        {lintIssues !== null && (
+          <span className="tb-msg">
+            {lintIssues.length === 0
+              ? "lint: clean"
+              : `${lintIssues.filter((i) => i.severity === "error").length} errors · ${lintIssues.filter((i) => i.severity === "warning").length} warnings`}
+          </span>
+        )}
+      </div>
+      {lintIssues !== null && lintIssues.length > 0 && (
+        <div className="webhook-reveal">
+          {lintIssues.map((i, n) => (
+            <span key={n} className={i.severity === "error" ? "wh-secret" : "wh-hint"}>
+              {i.severity.toUpperCase()} [{i.code}] {i.message}
+            </span>
+          ))}
+          <button className="chip tiny" onClick={() => setLintIssues(null)}>CLOSE</button>
+        </div>
+      )}
       {webhook && (
         <div className="webhook-reveal">
           <span className="tag-lo">SIGNED WEBHOOK</span>

@@ -142,6 +142,22 @@
   per-agent monthly token limits, admin CRUD at `/api/budgets`) gate new agent ticks behind an
   approval when exhausted — the operator can approve a one-off override or reject the tick.
 
+### 3.10 Workflow copilot (Stage 6)
+- **NL→draft**: `POST /api/workflows/draft` turns a description into a WorkflowGraph — model-
+  drafted (`COPILOT_MODEL`), with a deterministic keyword heuristic under the keyless mock
+  provider. The draft is returned to the Canvas as *editable state*, never auto-saved
+  (human-in-command per §1.2); lint issues ride along.
+- **Graph linter** (`POST /api/workflows/lint`, surfaced in the editor): missing trigger,
+  dangling edges/self-loops, cycles, duplicate ids, unreachable nodes, write/destructive
+  actions with no approval upstream, network calls with retries=0, unknown tools, unconfigured
+  agent nodes, empty code nodes.
+- **Failure explainer**: `POST /api/missions/:id/explain` returns a deterministic locator line
+  ("failed at node X on attempt N: err") plus a model-written root-cause diagnosis of the
+  recorded trace — rendered as a DIAGNOSIS card in the trace panel.
+- **Streaming**: assistant replies stream as `agent.message.delta` bus events (true token
+  streaming on Anthropic, chunked delivery elsewhere); the Command view renders a live bubble
+  replaced by the persisted message.
+
 ## 4. Data model (core tables)
 
 `users`, `workspaces`, `memberships(role)`, `agents`, `agent_memories`, `workflows`,

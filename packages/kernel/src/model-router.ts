@@ -43,18 +43,31 @@ export interface ChatResponse {
   usage: ChatUsage;
 }
 
+export type StreamDelta = (textDelta: string) => void;
+
 export interface ModelProvider {
   chat(req: ChatRequest): Promise<ChatResponse>;
+  /** Optional true token streaming; providers without it fall back to chat(). */
+  chatStream?(req: ChatRequest, onDelta: StreamDelta): Promise<ChatResponse>;
 }
 
 /** Anthropic provider on the official SDK. */
 export class AnthropicProvider implements ModelProvider {
   constructor(private readonly apiKey?: string) {}
 
-  async chat(req: ChatRequest): Promise<ChatResponse> {
+  /** True streaming via the SDK's message stream (Stage 6). */
+  async chatStream(req: ChatRequest, onDelta: StreamDelta): Promise<ChatResponse> {
     const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const client = this.apiKey ? new Anthropic({ apiKey: this.apiKey }) : new Anthropic();
+    const stream = client.messages.stream(await this.buildParams(req));
+    stream.on("text", (delta) => onDelta(delta));
+    const response = await stream.finalMessage();
+    return this.toChatResponse(response);
+  }
 
+  private async buildParams(
+    req: ChatRequest,
+  ): Promise<import("@anthropic-ai/sdk").Anthropic.MessageCreateParams> {
     const messages: import("@anthropic-ai/sdk").Anthropic.MessageParam[] = [];
     for (const m of req.messages) {
       if (m.role === "user") {
@@ -79,7 +92,7 @@ export class AnthropicProvider implements ModelProvider {
       }
     }
 
-    const response = await client.messages.create({
+    return {
       model: req.model,
       max_tokens: req.maxTokens ?? 4096,
       system: req.system,
@@ -89,8 +102,17 @@ export class AnthropicProvider implements ModelProvider {
         description: t.description,
         input_schema: t.inputSchema as import("@anthropic-ai/sdk").Anthropic.Tool.InputSchema,
       })),
-    });
+    };
+  }
 
+  async chat(req: ChatRequest): Promise<ChatResponse> {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    const client = this.apiKey ? new Anthropic({ apiKey: this.apiKey }) : new Anthropic();
+    const response = await client.messages.create({ ...(await this.buildParams(req)), stream: false });
+    return this.toChatResponse(response);
+  }
+
+  private toChatResponse(response: import("@anthropic-ai/sdk").Anthropic.Message): ChatResponse {
     const text = response.content
       .filter((b): b is import("@anthropic-ai/sdk").Anthropic.TextBlock => b.type === "text")
       .map((b) => b.text)
@@ -311,6 +333,25 @@ export class ModelRouter {
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
     const res = await this.providerFor(req.model).chat(req);
+    this.totalUsage.inputTokens += res.usage.inputTokens;
+    this.totalUsage.outputTokens += res.usage.outputTokens;
+    return res;
+  }
+
+  /**
+   * Streaming chat (Stage 6): true token deltas where the provider supports
+   * it (Anthropic); otherwise the reply is delivered in small chunks so the
+   * UX contract (progressive `agent.message.delta` events) holds everywhere.
+   */
+  async chatStream(req: ChatRequest, onDelta: StreamDelta): Promise<ChatResponse> {
+    const provider = this.providerFor(req.model);
+    let res: ChatResponse;
+    if (provider.chatStream) {
+      res = await provider.chatStream(req, onDelta);
+    } else {
+      res = await provider.chat(req);
+      for (let i = 0; i < res.text.length; i += 24) onDelta(res.text.slice(i, i + 24));
+    }
     this.totalUsage.inputTokens += res.usage.inputTokens;
     this.totalUsage.outputTokens += res.usage.outputTokens;
     return res;

@@ -71,6 +71,13 @@ export interface Approval {
   createdAt: string;
 }
 
+export interface LintIssue {
+  severity: "error" | "warning";
+  code: string;
+  message: string;
+  nodeId?: string;
+}
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -124,6 +131,16 @@ export const api = {
     ),
   retryMission: (id: string) =>
     fetch(`/api/missions/${id}/retry`, { method: "POST" }).then(json<{ ok: boolean }>),
+  explainMission: (id: string) =>
+    fetch(`/api/missions/${id}/explain`, { method: "POST" }).then(
+      json<{ summary: string; diagnosis: string; failedNodeId: string | null }>,
+    ),
+  draftWorkflow: (description: string) =>
+    post("/api/workflows/draft", { description }).then(
+      json<{ graph: WorkflowGraph; source: string; model: string; issues: LintIssue[] }>,
+    ),
+  lintWorkflow: (graph: WorkflowGraph) =>
+    post("/api/workflows/lint", { graph }).then(json<LintIssue[]>),
   listApprovals: (status = "pending") =>
     fetch(`/api/approvals?status=${status}`).then(json<Approval[]>),
   resolveApproval: (id: string, approved: boolean) =>
@@ -409,4 +426,5 @@ export type BusEvent =
   | { type: "mission.finished"; missionId: string; status: string; at: string }
   | { type: "mission.step"; missionId: string; nodeId: string; kind: NodeKind; status: StepStatus; at: string }
   | { type: "approval.requested"; missionId: string; nodeId: string; approvalId: string; prompt: string; at: string }
-  | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string };
+  | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string }
+  | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string };

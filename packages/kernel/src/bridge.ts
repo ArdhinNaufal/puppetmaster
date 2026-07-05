@@ -34,7 +34,10 @@ export type BusEvent =
       prompt: string;
       at: string;
     }
-  | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string };
+  | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string }
+  /** Streaming assistant text (Stage 6): progressive chunks of the reply
+   *  being generated; the persisted agent.message follows when the turn ends. */
+  | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string };
 
 export interface EventBus {
   publish(event: BusEvent): Promise<void>;
