@@ -5,12 +5,9 @@
 Puppetmaster's interface takes its cues from **fictional/future user interfaces (FUI)** rather
 than conventional SaaS chrome. Primary references chosen by the product owner:
 
-- **SPECTRE (007) MI6 UI by Rushes** — https://www.hudsandguis.com/home/2015/12/7/spectre-007
+- **SPECTRE (007) MI6 UI by Rushes** — (https://www.hudsandguis.com/home/2015/12/7/spectre-007, https://vincentstudios.co.uk/portfolio/007-spectre/)
   Dark, technically authentic command-center panels; data-dense readouts; restrained color;
   a heightened sense of realism grounded in real technical detail.
-- **"Patient" by Jan Gryc (2020)** — https://www.hudsandguis.com/home/2020/patient
-  Clean clinical panels floating in calm 3D space; thin linework; precise typography;
-  soft depth and glow used sparingly.
 
 ## Principles
 
