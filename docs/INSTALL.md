@@ -81,6 +81,7 @@ them in your shell or prefix the run command:
 | `OIDC_DEFAULT_ROLE` | `member` | role granted to newly provisioned SSO users (the first user of an empty instance becomes owner) |
 | `PUPPETMASTER_MASTER_KEY` | *(unset → vault off)* | passphrase sealing the credentials vault (AES-256-GCM); required to store secrets and resolve `{{credential:NAME}}` refs in `MCP_SERVERS` env |
 | `HTTP_ALLOWED_HOSTS` | *(unset → unrestricted)* | comma-separated egress allowlist for the `http.get` tool, e.g. `api.github.com,acme.io` (subdomains match) |
+| `MEMORY_CAP` | `200` | per-agent long-term memory cap; overflow evicts the lowest importance×recency-decay unpinned memories |
 
 Without any provider keys, agents on the `mock` model still work — a scripted provider used
 for demos and tests.

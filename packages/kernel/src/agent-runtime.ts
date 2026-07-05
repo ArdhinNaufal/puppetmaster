@@ -2,18 +2,23 @@ import {
   appendAgentMessage,
   beginNodeExecution,
   commitNodeExecution,
+  countMemories,
   createApproval,
+  evictMemoryOverflow,
   findCommittedExecutionByKey,
   getAgent,
   getAgentMessages,
   getApproval,
+  getMemory,
   getMission,
   insertStep,
   saveMemory,
   searchMemories,
   searchMemoriesByVector,
   setMemoryEmbedding,
+  touchMemories,
   updateAgent,
+  updateMemory,
   updateMission,
   updateStep,
   type Db,
@@ -23,9 +28,15 @@ import type { EventBus } from "./bridge.js";
 import type { AuditSink } from "./audit-sink.js";
 import { toVectorLiteral, type EmbeddingProvider } from "./embeddings.js";
 import { ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
+import { rrfFuse } from "./kb.js";
 import { findMatchingPolicy, type ApprovalPolicyLike } from "./policy.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
 import { UNTRUSTED_PROMPT_NOTE, wrapUntrusted } from "./untrusted.js";
+
+/** Memory v2 admission control (Stage 4): near-duplicate merge threshold and
+ *  the per-agent cap that decay-based eviction enforces. */
+const MEMORY_DEDUP_TAU = 0.92;
+const MEMORY_CAP = Math.max(10, Number(process.env.MEMORY_CAP ?? 200));
 
 const MAX_ITERATIONS = 8;
 const now = () => new Date();
@@ -127,20 +138,114 @@ export class AgentRuntime {
     }
   }
 
-  /** Long-term recall: pgvector cosine similarity when an embedder is
-   *  configured (and any memory is embedded), else keyword search. */
+  /** Hybrid long-term recall (Stage 4, reusing Stage 3's fusion): pgvector
+   *  cosine + keyword lists fused by reciprocal rank. Recalled memories are
+   *  touched so decay-based eviction keeps useful ones alive. */
   private async recall(agentId: string, query: string, limit = 5): Promise<string[]> {
+    const lists: { id: string; content: string }[][] = [];
     if (this.embedder && query.trim()) {
       try {
         const [qv] = await this.embedder.embed([query]);
-        const hits = await searchMemoriesByVector(this.db, agentId, toVectorLiteral(qv!), limit);
-        if (hits.length > 0) return hits.map((h) => h.content);
+        lists.push(await searchMemoriesByVector(this.db, agentId, toVectorLiteral(qv!), 10));
       } catch {
-        /* pgvector unavailable — fall through to keyword */
+        /* pgvector unavailable — keyword leg still applies */
       }
     }
-    const rows = await searchMemories(this.db, agentId, query, limit);
-    return rows.map((r) => r.content);
+    const kw = await searchMemories(this.db, agentId, query, 10);
+    lists.push(kw.map((r) => ({ id: r.id, content: r.content })));
+    const top = rrfFuse(lists, (m) => m.id)
+      .slice(0, limit)
+      .map(({ item }) => item);
+    touchMemories(this.db, top.map((m) => m.id)).catch(() => {});
+    return top.map((m) => m.content);
+  }
+
+  /**
+   * Admission-controlled memory write (Stage 4): a near-duplicate of an
+   * existing same-kind memory (cosine > τ) is merged — importance bumped,
+   * recency touched — instead of inserted; otherwise insert + embed, then
+   * evict decay-scored overflow above the per-agent cap (pins survive).
+   */
+  private async admitMemory(
+    agentId: string,
+    content: string,
+    opts: { kind?: string; missionId?: string | null; importance?: number } = {},
+  ): Promise<{ id: string; merged: boolean }> {
+    const kind = opts.kind ?? "fact";
+    let vector: string | null = null;
+    if (this.embedder && content.trim()) {
+      try {
+        const [emb] = await this.embedder.embed([content]);
+        vector = toVectorLiteral(emb!);
+        const [nearest] = await searchMemoriesByVector(this.db, agentId, vector, 1, kind);
+        if (nearest && nearest.score > MEMORY_DEDUP_TAU) {
+          const existing = await getMemory(this.db, nearest.id);
+          await updateMemory(this.db, nearest.id, {
+            importance: Math.min(1, Math.max(existing?.importance ?? 0.5, opts.importance ?? 0.5) + 0.05),
+            lastAccessedAt: new Date(),
+          });
+          return { id: nearest.id, merged: true };
+        }
+      } catch {
+        vector = null; /* embedding unavailable — plain insert */
+      }
+    }
+    const row = await saveMemory(this.db, agentId, content, {
+      kind,
+      missionId: opts.missionId ?? null,
+      importance: opts.importance,
+    });
+    if (vector) await setMemoryEmbedding(this.db, row.id, vector);
+    if ((await countMemories(this.db, agentId)) > MEMORY_CAP) {
+      await evictMemoryOverflow(this.db, agentId, MEMORY_CAP).catch(() => {});
+    }
+    return { id: row.id, merged: false };
+  }
+
+  /** Episodic + procedural memories for a finished tick (Stage 4): a
+   *  model-written one-line summary linked to the mission, and — when tools
+   *  ran — a LEGOMem-style "steps that worked" procedure. Best-effort. */
+  private async writeMissionMemories(
+    agent: { id: string; name: string; model: string },
+    missionId: string,
+    task: string,
+    toolsUsed: string[],
+    finalReply: string,
+  ): Promise<void> {
+    if (!task.trim()) return;
+    try {
+      const summary = await this.router.chat({
+        model: agent.model,
+        system:
+          "Summarize the completed task in one factual sentence (what was asked, what was done). Reply with the sentence only.",
+        messages: [
+          {
+            role: "user",
+            text: `Task: ${task.slice(0, 300)}\nTools used: ${toolsUsed.join(", ") || "none"}\nFinal reply: ${finalReply.slice(0, 300)}`,
+          },
+        ],
+        maxTokens: 200,
+      });
+      if (summary.text.trim()) {
+        await this.admitMemory(agent.id, `[episode] ${summary.text.trim()}`, {
+          kind: "episodic",
+          missionId,
+          importance: 0.6,
+        });
+      }
+    } catch {
+      /* episodic memory is advisory */
+    }
+    if (toolsUsed.length > 0) {
+      const procedure = `[procedure] task: "${task.slice(0, 160)}" | steps: ${toolsUsed
+        .map((t) => t.replace("__", "."))
+        .join(" → ")} | outcome: success`;
+      await this.admitMemory(agent.id, procedure, {
+        kind: "procedural",
+        missionId,
+        importance: 0.7,
+      }).catch(() => {});
+    }
   }
 
   async runMission(missionId: string): Promise<MissionStatus> {
@@ -163,6 +268,11 @@ export class AgentRuntime {
 
     const cursor = (mission.cursor ?? {}) as { pending?: PendingToolCall; iterations?: number };
     const resuming = mission.status === "awaiting_approval" && cursor.pending;
+
+    // Stage 4: the task text + successful tool sequence feed the episodic and
+    // procedural memories written when the tick succeeds.
+    const taskMessage = ((mission.input ?? {}) as { message?: string }).message ?? "";
+    const toolsUsed: string[] = [];
 
     if (!resuming) {
       await updateMission(this.db, missionId, { status: "running", startedAt: now() });
@@ -223,6 +333,7 @@ export class AgentRuntime {
         result = { error: "approval rejected by operator" };
         isError = true;
       }
+      if (approved && !isError) toolsUsed.push(pending.name);
       await this.recordToolStep(missionId, pending.name, approved && !isError, pending.args, result);
       await this.recordAudit({
         ...auditActor,
@@ -341,6 +452,7 @@ export class AgentRuntime {
           text: response.text,
           at: now().toISOString(),
         });
+        await this.writeMissionMemories(agent, missionId, taskMessage, toolsUsed, response.text);
         return this.finish(missionId, "succeeded", response.text, null);
       }
 
@@ -426,6 +538,9 @@ export class AgentRuntime {
           result = { error: err instanceof Error ? err.message : String(err) };
           isError = true;
         }
+        if (!isError && !call.name.startsWith("memory__") && !call.name.startsWith("scratchpad__")) {
+          toolsUsed.push(call.name);
+        }
         await this.recordToolStep(missionId, call.name, !isError, call.args, result);
         await this.recordAudit({
           ...auditActor,
@@ -466,16 +581,8 @@ export class AgentRuntime {
   ): Promise<unknown> {
     if (toolName === "memory__save") {
       const content = String(args.content ?? "");
-      const row = await saveMemory(this.db, agentId, content);
-      if (this.embedder && content.trim()) {
-        try {
-          const [emb] = await this.embedder.embed([content]);
-          await setMemoryEmbedding(this.db, row.id, toVectorLiteral(emb!));
-        } catch {
-          /* keyword recall still works without the vector */
-        }
-      }
-      return { saved: true, id: row.id };
+      const { id, merged } = await this.admitMemory(agentId, content, { missionId });
+      return { saved: true, id, merged };
     }
     if (toolName === "memory__search") {
       return this.recall(agentId, String(args.query ?? ""));

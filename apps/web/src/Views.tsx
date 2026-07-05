@@ -230,7 +230,48 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
                     {memories.length === 0 && <p className="dim">Nothing remembered yet.</p>}
                     <ul className="mem-list">
                       {memories.map((m) => (
-                        <li key={m.id}>▸ {m.content}</li>
+                        <li key={m.id}>
+                          <span className="tag-lo">{(m.kind ?? "fact").toUpperCase()}</span>{" "}
+                          {m.pinned && <span title="pinned">📌</span>} {m.content}
+                          {!props.readOnly && agent && (
+                            <span style={{ marginLeft: 6, whiteSpace: "nowrap" }}>
+                              <button
+                                className="chip tiny"
+                                title={m.pinned ? "Unpin (eligible for decay eviction)" : "Pin (never evicted)"}
+                                onClick={() =>
+                                  agentApi
+                                    .updateMemory(agent.id, m.id, { pinned: !m.pinned })
+                                    .then(() => agentApi.memories(agent.id).then(setMemories))
+                                }
+                              >
+                                {m.pinned ? "UNPIN" : "PIN"}
+                              </button>{" "}
+                              <button
+                                className="chip tiny"
+                                onClick={() => {
+                                  const next = prompt("Edit memory", m.content);
+                                  if (next !== null && next.trim() && next !== m.content) {
+                                    agentApi
+                                      .updateMemory(agent.id, m.id, { content: next.trim() })
+                                      .then(() => agentApi.memories(agent.id).then(setMemories));
+                                  }
+                                }}
+                              >
+                                EDIT
+                              </button>{" "}
+                              <button
+                                className="chip tiny"
+                                onClick={() =>
+                                  agentApi
+                                    .deleteMemory(agent.id, m.id)
+                                    .then(() => agentApi.memories(agent.id).then(setMemories))
+                                }
+                              >
+                                ✕
+                              </button>
+                            </span>
+                          )}
+                        </li>
                       ))}
                     </ul>
                   </>

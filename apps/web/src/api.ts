@@ -159,6 +159,10 @@ export interface AgentMessage {
 export interface AgentMemory {
   id: string;
   content: string;
+  kind: string;
+  pinned: boolean;
+  importance: number;
+  missionId: string | null;
   createdAt: string;
 }
 
@@ -197,6 +201,14 @@ export const agentApi = {
   memories: (id: string) => fetch(`/api/agents/${id}/memories`).then(json<AgentMemory[]>),
   searchMemories: (id: string, q: string) =>
     fetch(`/api/agents/${id}/memory-search?q=${encodeURIComponent(q)}`).then(json<MemoryHit[]>),
+  updateMemory: (id: string, memId: string, patch: { content?: string; pinned?: boolean }) =>
+    fetch(`/api/agents/${id}/memories/${memId}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json<AgentMemory>),
+  deleteMemory: (id: string, memId: string) =>
+    fetch(`/api/agents/${id}/memories/${memId}`, { method: "DELETE" }),
 };
 
 /* ------------------------------------------------------ Templates & signals */

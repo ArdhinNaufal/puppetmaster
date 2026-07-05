@@ -77,9 +77,78 @@ export async function getAgentMessages(db: Db, agentId: string, limit = 40) {
   return rows.reverse();
 }
 
-export async function saveMemory(db: Db, agentId: string, content: string) {
-  const [row] = await db.insert(agentMemories).values({ agentId, content }).returning();
+export async function saveMemory(
+  db: Db,
+  agentId: string,
+  content: string,
+  opts: { kind?: string; missionId?: string | null; importance?: number; pinned?: boolean } = {},
+) {
+  const [row] = await db
+    .insert(agentMemories)
+    .values({
+      agentId,
+      content,
+      kind: opts.kind ?? "fact",
+      missionId: opts.missionId ?? null,
+      importance: opts.importance ?? 0.5,
+      pinned: opts.pinned ?? false,
+    })
+    .returning();
   return row!;
+}
+
+export async function getMemory(db: Db, memoryId: string) {
+  const [row] = await db.select().from(agentMemories).where(eq(agentMemories.id, memoryId)).limit(1);
+  return row ?? null;
+}
+
+export async function updateMemory(
+  db: Db,
+  memoryId: string,
+  patch: Partial<typeof agentMemories.$inferInsert>,
+) {
+  await db.update(agentMemories).set(patch).where(eq(agentMemories.id, memoryId));
+}
+
+export async function deleteMemory(db: Db, memoryId: string) {
+  await db.delete(agentMemories).where(eq(agentMemories.id, memoryId));
+}
+
+export async function countMemories(db: Db, agentId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)` })
+    .from(agentMemories)
+    .where(eq(agentMemories.agentId, agentId));
+  return Number(row?.n ?? 0);
+}
+
+/** Recency signal for decay-based eviction: recalled memories stay alive. */
+export async function touchMemories(db: Db, ids: string[]) {
+  if (ids.length === 0) return;
+  const now = new Date();
+  for (const id of ids) {
+    await db.update(agentMemories).set({ lastAccessedAt: now }).where(eq(agentMemories.id, id));
+  }
+}
+
+/**
+ * Enforce the per-agent memory cap (Stage 4 admission control): evict the
+ * lowest-scoring unpinned memories, where score = importance × exponential
+ * recency decay (30-day half-life-ish, per MemoryBank/Ebbinghaus).
+ */
+export async function evictMemoryOverflow(db: Db, agentId: string, cap: number): Promise<number> {
+  const total = await countMemories(db, agentId);
+  const overflow = total - cap;
+  if (overflow <= 0) return 0;
+  await db.execute(
+    sql`DELETE FROM agent_memories WHERE id IN (
+          SELECT id FROM agent_memories
+          WHERE agent_id = ${agentId} AND NOT pinned
+          ORDER BY importance * exp(-extract(epoch FROM (now() - coalesce(last_accessed_at, created_at))) / 2592000.0) ASC
+          LIMIT ${overflow}
+        )`,
+  );
+  return overflow;
 }
 
 /** Persist a memory's embedding into the pgvector column (raw SQL: the column is
@@ -110,11 +179,13 @@ export async function searchMemoriesByVector(
   agentId: string,
   vectorLiteral: string,
   limit = 5,
+  kind?: string,
 ): Promise<{ id: string; content: string; score: number }[]> {
   const res = await db.execute(
     sql`SELECT id, content, 1 - (embedding <=> ${vectorLiteral}::vector) AS score
         FROM agent_memories
         WHERE agent_id = ${agentId} AND embedding IS NOT NULL
+        ${kind ? sql`AND kind = ${kind}` : sql``}
         ORDER BY embedding <=> ${vectorLiteral}::vector
         LIMIT ${limit}`,
   );

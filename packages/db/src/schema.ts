@@ -3,6 +3,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  real,
   text,
   timestamp,
   unique,
@@ -189,13 +190,23 @@ export const agentMessages = pgTable("agent_messages", {
 });
 
 /** Long-term memory; `embedding` is filled when an embedding provider is
- *  configured (pgvector), otherwise recall falls back to keyword search. */
+ *  configured (pgvector), otherwise recall falls back to keyword search.
+ *  Memory v2 (Stage 4): tiered kinds — `fact` (agent-saved), `episodic`
+ *  (auto mission summaries, linked via missionId), `procedural` (tool
+ *  sequences that worked, LEGOMem-style) — with admission control
+ *  (dedup-merge at save), importance scoring, decay-based eviction under a
+ *  per-agent cap, and pinning (pinned memories are never evicted). */
 export const agentMemories = pgTable("agent_memories", {
   id: uuid("id").primaryKey().defaultRandom(),
   agentId: uuid("agent_id")
     .notNull()
     .references(() => agents.id, { onDelete: "cascade" }),
   content: text("content").notNull(),
+  kind: text("kind").notNull().default("fact"),
+  missionId: uuid("mission_id"),
+  importance: real("importance").notNull().default(0.5),
+  pinned: boolean("pinned").notNull().default(false),
+  lastAccessedAt: timestamp("last_accessed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

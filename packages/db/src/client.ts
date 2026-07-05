@@ -263,6 +263,11 @@ const DDL: string[] = [
   `ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding vector(1024)`,
   `CREATE INDEX IF NOT EXISTS document_chunks_document_idx ON document_chunks(document_id)`,
   `CREATE INDEX IF NOT EXISTS documents_workspace_idx ON documents(workspace_id)`,
+  `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'fact'`,
+  `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS mission_id uuid`,
+  `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS importance real NOT NULL DEFAULT 0.5`,
+  `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false`,
+  `ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS last_accessed_at timestamptz`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

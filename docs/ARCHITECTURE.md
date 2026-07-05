@@ -47,6 +47,16 @@
 - Execution as **ticks**: an agentic loop (LLM ↔ tools) run to completion or to an approval gate, resumable.
 - Activation: cron schedule, event subscription (webhook, workflow completion, another agent), or direct chat.
 - Memory: short-term (conversation window), long-term (pgvector semantic memory), and structured scratchpad per agent.
+- **Memory v2 (Stage 4, §1.1)**: tiered long-term memory — `fact` (agent-saved), `episodic`
+  (model-written one-line summary of every successful tick, linked to its mission), and
+  `procedural` (LEGOMem-style "task → tool steps that worked"). Writes pass **admission
+  control**: a near-duplicate of a same-kind memory (cosine > 0.92) merges into it (importance
+  bump + recency touch) instead of inserting; per-agent cap (`MEMORY_CAP`, default 200) enforced
+  by evicting the lowest `importance × exp(-age/30d)` unpinned rows. Recall is **hybrid**
+  (pgvector + keyword, reciprocal-rank fused via the Stage 3 machinery) and touches returned
+  rows so useful memories survive decay. Governance per SSGM: pin/unpin, edit, delete in the
+  agent inspector (`PUT/DELETE /api/agents/:id/memories/:memId`, builder+); pinned memories are
+  never evicted.
 
 ### 3.2 Workflow Engine
 - Workflows are DAGs stored as JSON; nodes: trigger, action (MCP tool call), logic (branch/loop/wait), code (sandboxed JS via isolated worker), **agent node**, human-approval node.

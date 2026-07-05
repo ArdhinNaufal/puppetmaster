@@ -10,6 +10,7 @@ import {
   createWorkflow,
   deleteAgent,
   deleteDocument,
+  deleteMemory,
   deleteTemplate,
   ensureDefaultWorkspace,
   getAgent,
@@ -17,6 +18,7 @@ import {
   getApproval,
   getDocument,
   getDocumentChunks,
+  getMemory,
   getMission,
   getMissionSteps,
   getTemplate,
@@ -45,6 +47,7 @@ import {
   seedBuiltinTemplates,
   setWebhookSecret,
   updateAgent,
+  updateMemory,
   updateMission,
   updateWorkspace,
   type DbHandle,
@@ -591,6 +594,30 @@ app.get("/api/agents/:id/messages", async (req) => {
 app.get("/api/agents/:id/memories", async (req) => {
   const { id } = req.params as { id: string };
   return listMemories(db, id);
+});
+
+/** Memory governance (Stage 4, SSGM): edit content or pin/unpin. */
+app.put("/api/agents/:id/memories/:memId", async (req, reply) => {
+  const { id, memId } = req.params as { id: string; memId: string };
+  const memory = await getMemory(db, memId);
+  if (!memory || memory.agentId !== id) return reply.code(404).send({ error: "memory not found" });
+  const body = (req.body ?? {}) as { content?: string; pinned?: boolean; importance?: number };
+  const patch: Record<string, unknown> = {};
+  if (typeof body.content === "string" && body.content.trim()) patch.content = body.content.trim();
+  if (typeof body.pinned === "boolean") patch.pinned = body.pinned;
+  if (typeof body.importance === "number" && body.importance >= 0 && body.importance <= 1) {
+    patch.importance = body.importance;
+  }
+  if (Object.keys(patch).length > 0) await updateMemory(db, memId, patch);
+  return getMemory(db, memId);
+});
+
+app.delete("/api/agents/:id/memories/:memId", async (req, reply) => {
+  const { id, memId } = req.params as { id: string; memId: string };
+  const memory = await getMemory(db, memId);
+  if (!memory || memory.agentId !== id) return reply.code(404).send({ error: "memory not found" });
+  await deleteMemory(db, memId);
+  return reply.code(204).send();
 });
 
 /** Ranked recall for the inspector: pgvector semantic search when an embedder is
