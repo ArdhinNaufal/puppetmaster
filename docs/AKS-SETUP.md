@@ -8,6 +8,13 @@ Sizing assumptions (see prior sizing discussion): 2 app replicas, ~0.25-1 vCPU /
 0.5-2 GiB per server pod, single region, low network throughput, no GPU,
 burstable/spot nodes acceptable for the app tier.
 
+This guide is written CLI-first. If you'd rather click through
+**portal.azure.com**, jump to [Portal walkthrough](#portal-walkthrough)
+below — it covers the same 9 steps using the Portal UI plus the built-in
+Cloud Shell (there's no GUI for applying multi-resource YAML with secrets/HPA,
+so that part still uses a shell — just one running inside the Portal, no
+local install required).
+
 ## Prerequisites
 
 - Azure CLI (`az`) logged in: `az login`
@@ -202,6 +209,138 @@ kubectl get all -n puppetmaster
 kubectl logs -l app=server -n puppetmaster --tail=50
 curl http://localhost:4000/   # if port-forwarded, or your domain if ingress is set up
 ```
+
+## Portal walkthrough
+
+Everything below is the same 9 steps, done by clicking through
+**portal.azure.com**. Steps 1-3 (resource group, ACR, AKS cluster) are pure
+GUI. Steps 4-9 use **Azure Cloud Shell** — click the `>_` icon in the top nav
+bar of the Portal. It's a free, browser-based shell with `az`, `kubectl`, `git`,
+and `helm` pre-installed, so you never need to install anything locally. (It
+does *not* have a Docker daemon, so image builds use `az acr build` instead of
+`docker build` — see step 5.)
+
+### 1. Create a resource group
+
+Portal search bar → **"Resource groups"** → **+ Create** → fill in
+Subscription, Resource group name (`puppetmaster-rg`), Region → **Review + create** → **Create**.
+
+### 2. Create an Azure Container Registry (ACR)
+
+Portal search bar → **"Container registries"** → **+ Create** → pick the
+resource group from step 1, Registry name (globally unique, e.g.
+`puppetmasteracr`), Location, SKU **Basic** → **Review + create** → **Create**.
+
+### 3. Create the AKS cluster
+
+Portal search bar → **"Kubernetes services"** → **+ Create** → **Create a Kubernetes cluster**:
+
+- **Basics tab**: Resource group from step 1; Cluster name `puppetmaster-aks`;
+  Region; Availability zones (leave default/None for single-region HA, or pick
+  1,2,3 if you want multi-zone); under "Primary node pool" set node size to
+  `Standard_B2s` and node count to 2.
+- **Node pools tab**: the system pool from Basics is listed. Click **+ Add
+  node pool** to add a second pool for the app tier (`apppool`), size
+  `Standard_B2s`, enable autoscaling (min 1, max 4). If you want spot pricing
+  for cost savings, set **Scale method** → **Spot** here (available as a
+  dropdown when adding the pool).
+- **Networking tab**: defaults are fine for this workload (Azure CNI or
+  Kubenet both work; no special network policy needed at this scale).
+- **Integrations tab**: under **Container registry**, select the ACR you
+  created in step 2 — this does the equivalent of `--attach-acr` for you, so
+  the cluster can pull images without extra credentials.
+- **Review + create** → **Create**. Provisioning takes ~5-10 minutes.
+
+### 4. Connect to the cluster
+
+Open the new AKS resource → **Overview** → click **Connect**. It shows the
+exact `az aks get-credentials` command for your cluster. Click the `>_` Cloud
+Shell icon (top nav bar), paste that command in, then run:
+
+```bash
+kubectl get nodes
+```
+
+### 5. Get the repo and build/push the image (no local Docker needed)
+
+In the same Cloud Shell:
+
+```bash
+git clone https://github.com/ArdhinNaufal/puppetmaster.git
+cd puppetmaster
+
+ACR_NAME=puppetmasteracr   # the name you chose in step 2
+az acr build --registry $ACR_NAME --image puppetmaster-server:latest \
+  --file docker/server.Dockerfile .
+```
+
+`az acr build` uploads the build context and builds the image inside ACR
+itself (via ACR Tasks) — this is the Portal-friendly equivalent of
+`docker build && docker push` and needs no Docker daemon in the shell.
+
+Update the image reference:
+
+```bash
+ACR_LOGIN_SERVER=$(az acr show --name $ACR_NAME --query loginServer -o tsv)
+sed -i "s|<ACR_LOGIN_SERVER>/puppetmaster-server:<TAG>|$ACR_LOGIN_SERVER/puppetmaster-server:latest|" k8s/server.yaml
+```
+
+### 6. Create the namespace and secrets
+
+Still in Cloud Shell:
+
+```bash
+kubectl apply -f k8s/namespace.yaml
+
+kubectl create secret generic puppetmaster-secrets -n puppetmaster \
+  --from-literal=POSTGRES_PASSWORD='<choose-a-strong-password>' \
+  --from-literal=DATABASE_URL='postgres://puppetmaster:<same-password>@postgres:5432/puppetmaster' \
+  --from-literal=REDIS_URL='redis://redis:6379'
+```
+
+### 7. Deploy Postgres, Redis, and the server
+
+```bash
+kubectl apply -f k8s/postgres.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl wait --for=condition=ready pod -l app=postgres -n puppetmaster --timeout=120s
+kubectl wait --for=condition=ready pod -l app=redis -n puppetmaster --timeout=60s
+kubectl apply -f k8s/server.yaml
+```
+
+You can watch these appear in the Portal too: open the AKS resource → left nav
+**Kubernetes resources** → **Workloads**, and **Namespaces**/**Services and
+ingresses** below it. That view is read/inspect-oriented (it does let you edit
+a single object's YAML in place), but for applying a whole manifest set with
+secrets, PVCs, and an HPA together, `kubectl apply -f` in Cloud Shell is the
+reliable path — there isn't a Portal button for "apply this folder of YAML."
+
+### 8. Expose the service (ingress)
+
+`helm` is pre-installed in Cloud Shell, so the same commands from the CLI
+guide work as-is:
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace
+```
+
+Then edit `k8s/ingress.yaml`'s `host:` to your domain and `kubectl apply -f
+k8s/ingress.yaml`. Find the ingress controller's public IP either via
+`kubectl get svc ingress-nginx-controller -n ingress-nginx`, or in the Portal
+under the `ingress-nginx` namespace's **Services and ingresses** page.
+
+### 9. Verify
+
+```bash
+kubectl get all -n puppetmaster
+```
+
+Or check visually in the Portal: AKS resource → **Kubernetes resources** →
+**Workloads** should show `server` (2/2 or more pods Running), `postgres`
+(1/1), and `redis` (1/1).
 
 ## Notes on scaling beyond this baseline
 
