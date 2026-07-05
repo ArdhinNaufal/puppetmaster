@@ -56,9 +56,12 @@ decisions; this file only captures state and next steps.
 
 1. Owner review of M1–M5 on `claude/kickoff-prompt-continuation-cy021r` (manual review
    pending).
-2. **Remaining**: Tauri desktop client (Phase 2 packaging — needs the desktop
-   toolchain, not present in this env; the server core it wraps is ready). This is now the
-   only roadmap item left.
+2. **Research-driven roadmap**: `docs/RESEARCH-ROADMAP.md` (new) — literature + industry
+   survey, gap analysis (G1–G12), and an 8-stage plan (security hardening → durable
+   execution → knowledge/RAG → memory v2 → evals/observability → workflow copilot →
+   MCP 2026 → router polish). Each stage executes only on the owner's explicit go-ahead.
+3. **Remaining from the original roadmap**: Tauri desktop client (Phase 2 packaging —
+   needs the desktop toolchain, not present in this env; the server core it wraps is ready).
 
 ### Hardening batch — OIDC, webhook signing, demo seed (verified)
 
