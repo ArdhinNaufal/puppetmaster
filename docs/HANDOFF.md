@@ -7,6 +7,21 @@ previous session left off. Read it together with `docs/PRD.md`, `docs/ARCHITECTU
 and `docs/DESIGN-LANGUAGE.md` — those are the source of truth for product and technical
 decisions; this file only captures state and next steps.
 
+## 0. Session-resume ritual (start here — supersedes the state snapshots below)
+
+As of 2026-07-06 this repo uses persistent task artifacts instead of a hand-maintained
+state snapshot (docs/AI-SDLC-INTEGRATION-PLAN.md, WP0). Begin every fresh session with:
+
+> Read docs/AI-SDLC-INTEGRATION-PLAN.md §7, todos/active/, todos/backlog/, learnings.md,
+> and docs/adr/. Tell me the current state of the project and what the next undone task
+> is. Do NOT start work yet — confirm your understanding with me first.
+
+If that prompt cannot reconstruct where the last session stopped, the artifacts are too
+thin — fix them at the end of each session rather than growing this file. Decisions live
+in `docs/adr/` (ADR-000 for the convention); gotchas live in `learnings.md`; task state
+lives in `todos/`. The sections below remain accurate as of their date but are historical
+context, no longer the live handoff mechanism.
+
 ## 1. Current state
 
 - **M0 skeleton** (spec + monorepo) shipped on branch `claude/ai-agent-automation-platform-e7nwzf`

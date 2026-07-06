@@ -15,6 +15,12 @@
     "node": ">=22"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "msgpackr-extract"]
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "msgpackr-extract"
+    ]
+  },
+  "devDependencies": {
+    "dependency-cruiser": "^18.0.0"
   }
 }
