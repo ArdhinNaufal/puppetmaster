@@ -1,9 +1,13 @@
 # Puppetmaster — AI SDLC Workflow Integration Plan
 
-**Version:** 1.1 · **Date:** 2026-07-06 · **Status: APPROVED — execution not yet started.**
-The owner's rulings on all six open decisions are recorded in §8 (2026-07-06). WP0 and WP1
-are unblocked and begin on the owner's start signal; each subsequent work package runs only
-on explicit go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
+**Version:** 1.1 · **Date:** 2026-07-06 · **Status: IN EXECUTION.** Owner rulings on all
+six open decisions are recorded in §8; the owner's start signal was given 2026-07-06.
+**WP0 is complete** (dogfood assets live: `todos/`, `learnings.md`, `docs/adr/`,
+`.claude/commands/`, `scripts/verify-arch.sh` with acceptance verified). **WP1 is complete
+except one item:** the ADR-002 container spike half is blocked on a docker-capable host
+(the headless-CLI half PASSED — `docs/adr/spike-002-record.md`). ADRs 000–007 are written.
+Each subsequent work package (WP2+) runs only on explicit go-ahead, in order, following
+the same convention as `docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
 **`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
@@ -55,8 +59,9 @@ Puppetmaster itself.** The full analysis is §2; the short version:
    order: compose first, promote to first-class machinery only where composition
    demonstrably fails. The phasing in §6 obeys this.
 
-**Explicitly not executed yet.** This document is the deliverable. No schema, code, or
-config changes accompany it.
+**Execution log:** plan authored and approved 2026-07-06 as a plan-only deliverable;
+execution began the same day on the owner's signal (WP0 + WP1 — see §7 checkboxes and the
+status header). Product code (WP2+) remains untouched pending go-ahead.
 
 ---
 
@@ -559,21 +564,25 @@ zero unmapped rows; UAT report updated.
 *(Tracking convention as NEXUS §10 — update checkboxes as work lands. Nothing below is
 started.)*
 
-**WP0 — Dogfood (operation track)**
-- [ ] `todos/` tree + `learnings.md` seeded from HANDOFF + this plan
-- [ ] `docs/adr/` + ADR-000 + two retroactive ADRs (marked retroactive)
-- [ ] `.claude/commands/{spec,plan,next,loop,review,refactor}.md` translated for this repo
-- [ ] `scripts/verify-arch.sh` (dependency-cruiser + ratchet baseline)
-- [ ] HANDOFF.md points at the session-resume ritual
-- [ ] (earned, deferred) `test-gate` hook — install only after the failure bites
+**WP0 — Dogfood (operation track)** — ✅ complete 2026-07-06
+- [x] `todos/` tree + `learnings.md` seeded from HANDOFF + this plan
+- [x] `docs/adr/` + ADR-000 + two retroactive ADRs (ADR-006, ADR-007 — marked retroactive)
+- [x] `.claude/commands/{spec,plan,next,loop,review,refactor}.md` translated for this repo
+- [x] `scripts/verify-arch.sh` (dependency-cruiser + ratchet baseline = 0; acceptance
+      verified: deliberate kernel→apps import fails, clean tree passes)
+- [x] HANDOFF.md §0 points at the session-resume ritual
+- [ ] (earned, deferred by design) `test-gate` hook — install only after the failure bites
 
-**WP1 — Decisions**
-- [ ] ADR-001 feature name (ruled: Workshop/project/workbench) + v1 scope boundary
-- [ ] ADR-002 hybrid executor (ruled) + feasibility spike (CLI-in-workbench, budgets, trace)
-- [ ] ADR-003 project state representation
-- [ ] ADR-004 artifact storage
-- [ ] ADR-005 workbench isolation + egress/credential policy
-- [ ] Role × mode matrix formalized (v1 tracks ruled: B/C only)
+**WP1 — Decisions** — ✅ complete 2026-07-06 except the container spike half
+- [x] ADR-001 feature name (ruled: Workshop/project/workbench) + v1 scope boundary
+- [x] ADR-002 hybrid executor (ruled); spike headless-CLI half PASSED
+      (`docs/adr/spike-002-record.md`: stream output, turn budget, clean exit, scope kept)
+- [ ] ADR-002 spike container half — blocked: no Docker daemon in the dev environment;
+      rerun `scripts/spike-adr002.sh --container` on a docker-capable host (WP3 precondition)
+- [x] ADR-003 project state representation (first-class `projects` entity)
+- [x] ADR-004 artifact storage (typed table, KB mirror on acceptance)
+- [x] ADR-005 workbench isolation (sibling container per project, default-closed egress)
+- [x] Role × mode matrix formalized in ADR-001 (v1 tracks ruled: B/C only)
 
 **WP2 — Domain model**
 - [ ] Shared zod schemas (Project, ProjectArtifact, VerifyCheck, Evidence, `verify` kind)
