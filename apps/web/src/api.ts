@@ -311,6 +311,11 @@ export interface PanelLayout {
   collapsed?: Record<string, boolean>;
 }
 
+/** NEXUS pane arrangement (docs/NEXUS.md §4.4). */
+export interface NexusLayout {
+  panes?: { task: string; x: number; y: number; ctx?: Record<string, unknown>; z?: number }[];
+}
+
 const post = (url: string, body: unknown) =>
   fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
@@ -338,13 +343,18 @@ export const memberApi = {
 };
 
 export const prefsApi = {
-  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout } }>),
-  save: (layout: { panels?: PanelLayout }) =>
-    fetch("/api/me/preferences", {
+  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout } }>),
+  /** Merges the given keys over the saved layout (server stores the whole object). */
+  save: async (layout: { panels?: PanelLayout; nexus?: NexusLayout }) => {
+    const current = await fetch("/api/me/preferences")
+      .then(json<{ layout: Record<string, unknown> }>)
+      .catch(() => ({ layout: {} as Record<string, unknown> }));
+    return fetch("/api/me/preferences", {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ layout }),
-    }).then(json<{ layout: { panels?: PanelLayout } }>),
+      body: JSON.stringify({ layout: { ...current.layout, ...layout } }),
+    }).then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout } }>);
+  },
 };
 
 // --- Knowledge base (Stage 3) ---------------------------------------------------

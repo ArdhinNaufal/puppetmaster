@@ -19,6 +19,8 @@ import {
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
 import { Login } from "./Login.js";
+import { Nexus } from "./nexus/Nexus.js";
+import { ROLE_RANK, TASKS } from "./nexus/registry.js";
 import { Palette, type PaletteAction } from "./Palette.js";
 import { SignalRadar, SignalTicker, toSignal, type SignalEntry } from "./Signal.js";
 import { TraceDossier, type StepTiming } from "./Trace.js";
@@ -26,21 +28,21 @@ import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, Template
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 
-const VIEWS = ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
+const VIEWS = ["nexus", "command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
 type View = (typeof VIEWS)[number];
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
 
 /** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
 const ROLE_VIEWS: Record<Role, View[]> = {
-  member: ["command", "templates", "knowledge", "missions", "agents", "tools"],
-  builder: ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools"],
+  member: ["nexus", "command", "templates", "knowledge", "missions", "agents", "tools"],
+  builder: ["nexus", "command", "canvas", "templates", "knowledge", "missions", "agents", "tools"],
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
 /** …and where each role lands after sign-in (role dashboards). */
 const ROLE_HOME: Record<Role, View> = {
-  member: "command",
+  member: "nexus",
   builder: "canvas",
   admin: "missions",
   owner: "missions",
@@ -137,6 +139,12 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [rxTotal, setRxTotal] = useState(0);
   const sessionStart = useRef(Date.now());
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [nexusSpawn, setNexusSpawn] = useState<{ task: string; ctx?: Record<string, unknown>; n: number } | null>(null);
+  const spawnSeq = useRef(0);
+  const reducedMotion = useMemo(
+    () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true,
+    [],
+  );
 
   // Observed per-step timing (from mission.step bus events) — feeds the dossier gantt.
   const timingRef = useRef<Record<string, Record<string, StepTiming>>>({});
@@ -368,6 +376,20 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         { id: "sys:new-wf", group: "SYSTEM", label: "DRAFT NEW WORKFLOW", keywords: "create add", run: newWorkflow },
       );
     }
+    // NEXUS tasks: every registry task is one palette order away (docs/NEXUS.md §3).
+    for (const t of TASKS.filter((t) => !t.hidden && RANK[me.role] >= ROLE_RANK[t.minRole])) {
+      acts.push({
+        id: `task:${t.id}`,
+        group: "TASKS",
+        label: `TASK // ${t.title}`,
+        hint: t.jumpOnly ? "PAGE" : "NEXUS",
+        keywords: "nexus open task",
+        run: () => {
+          setView("nexus");
+          setNexusSpawn({ task: t.id, n: ++spawnSeq.current });
+        },
+      });
+    }
     acts.push({ id: "sys:signout", group: "SYSTEM", label: "SIGN OUT", keywords: "logout exit", run: onSignOut });
     return acts;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -573,6 +595,28 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             </span>
           </div>
           <div className="stage-body">
+            {view === "nexus" && (
+              <Nexus
+                nx={{
+                  role: me.role,
+                  canBuild,
+                  isAdmin: RANK[me.role] >= RANK.admin,
+                  agents,
+                  workflows,
+                  approvals,
+                  signals,
+                  connected,
+                  rxTotal,
+                  navigate: (v) => setView(v as View),
+                  track,
+                  decide,
+                  refreshAgents,
+                  refreshWorkflows,
+                }}
+                spawn={nexusSpawn}
+                reducedMotion={reducedMotion}
+              />
+            )}
             {view === "command" && (
               <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} streaming={streamText} />
             )}

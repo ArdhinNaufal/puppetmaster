@@ -923,6 +923,139 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
   padding: 0.25rem 0.5rem;
 }
 
+/* ---- NEXUS: the single-page operations theater (docs/NEXUS.md) ------------ */
+.nx-wrap { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.nx-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.nx-construct { position: absolute; inset: 0; }
+.nx-construct canvas { display: block; outline-offset: -2px; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* task panes: vague transparent containers floating over the Construct */
+.nx-pane {
+  position: absolute;
+  border: 1px solid var(--stroke-hi);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100% - 24px);
+}
+.nx-pane .fui-bracket { border-color: var(--stroke-hi); }
+.nx-pane.focused { border-color: var(--accent-dim); }
+.nx-pane.focused .fui-bracket { border-color: var(--accent); }
+.nx-pane-rail {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.55rem;
+  border-bottom: 1px solid var(--stroke);
+  background: color-mix(in srgb, var(--panel-hi) 80%, transparent);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.nx-pane-rail:active { cursor: grabbing; }
+.nx-pane-rail:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+.nx-pane-grip { color: var(--stroke-hi); font-size: 0.7rem; }
+.nx-pane-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 0.66rem;
+  letter-spacing: 0.2em;
+  color: var(--text-lo);
+}
+.nx-pane.focused .nx-pane-title { color: var(--text-hi); }
+.nx-pane-glyph { color: var(--accent); margin-right: 0.5em; }
+.nx-pane-btns { display: flex; gap: 0.2rem; }
+.nx-pane-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0.6rem; }
+
+/* pane task bodies */
+.nx-task-stack { display: flex; flex-direction: column; gap: 0.5rem; }
+.nx-task-row { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+.grow-input { flex: 1; min-width: 0; }
+.nx-scroll { max-height: 300px; overflow-y: auto; }
+.nx-task-channel { display: flex; flex-direction: column; gap: 0.5rem; height: 430px; }
+.nx-channel-well {
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  overflow: hidden;
+}
+.nx-dossier-well {
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  max-height: 380px;
+  overflow-y: auto;
+}
+.nx-sig-list { list-style: none; display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.62rem; letter-spacing: 0.08em; }
+.nx-snapshot { font-size: 0.68rem; }
+.nx-snap-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.3rem 0.1rem;
+  border-bottom: 1px solid #0d151b;
+  letter-spacing: 0.12em;
+  color: var(--text-lo);
+}
+.nx-snap-row b { color: var(--text-hi); font-weight: 500; font-variant-numeric: tabular-nums; }
+.nx-snap-row b.ok { color: var(--ok); }
+.nx-snap-row b.err { color: var(--danger); }
+.nx-snap-row b.warn { color: var(--warn); }
+
+/* task tray: the guaranteed path to every task */
+.nx-tray {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.4rem 0.7rem;
+  border-top: 1px solid var(--stroke);
+  background: var(--panel-hi);
+  overflow-x: auto;
+  flex: none;
+}
+.nx-tray-label { font-size: 0.54rem; letter-spacing: 0.26em; color: var(--accent); flex: none; margin-right: 0.3rem; }
+.nx-tray-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: transparent;
+  border: 1px solid var(--stroke);
+  color: var(--text-lo);
+  border-radius: var(--radius);
+  padding: 0.24rem 0.5rem;
+  font-family: var(--font-data);
+  font-size: 0.56rem;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
+  flex: none;
+}
+.nx-tray-chip:hover { border-color: var(--accent-dim); color: var(--text-hi); }
+.nx-tray-chip.open { color: var(--accent); border-color: var(--accent-dim); box-shadow: inset 0 -1px 0 var(--accent); }
+.nx-tray-chip.locked { opacity: 0.4; cursor: default; }
+.nx-tray-glyph { color: var(--accent); }
+.nx-tray-chip.locked .nx-tray-glyph { color: var(--text-lo); }
+.nx-tray-ext { color: var(--stroke-hi); font-size: 0.5rem; }
+
 /* ---- Login / boot sequence ------------------------------------------------ */
 .login-screen {
   height: 100vh;
@@ -1012,6 +1145,14 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
   /* palette entrance */
   .palette { animation: palette-in 0.16s ease-out; }
   @keyframes palette-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+
+  /* NEXUS pane materializes with a flash-settle */
+  .nx-pane { animation: nx-pane-in 0.22s ease-out; }
+  @keyframes nx-pane-in {
+    0% { opacity: 0; transform: translateY(6px) scale(0.985); }
+    60% { opacity: 1; }
+    100% { transform: none; }
+  }
 
   /* boot sequence: staged, one-shot, ~1.3s total */
   .boot .login-brand { animation: boot-fade 0.5s ease-out both 0.15s; }
