@@ -192,6 +192,16 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
                 <input key={agent.id + "s"} defaultValue={agent.schedule ?? ""} placeholder="e.g. 0 9 * * 1-5"
                   onBlur={(e) => (e.target.value || null) !== agent.schedule && patch({ schedule: e.target.value || null })} />
               </label>
+              <label className="ins-field">
+                <span>Context compaction</span>
+                <select
+                  value={agent.contextCompaction ? "on" : "off"}
+                  onChange={(e) => patch({ contextCompaction: e.target.value === "on" })}
+                >
+                  <option value="off">off (raw tool results)</option>
+                  <option value="on">on (compact large results)</option>
+                </select>
+              </label>
             </div>
             <label className="ins-field">
               <span>Tool grants (comma-separated; empty = full catalog)</span>
@@ -985,6 +995,7 @@ export function EvalsView(props: { agents: Agent[] }) {
         <Panel><Stat label="LAST SUITE" value={runs[0] ? `${runs[0].passed}/${runs[0].total}` : "—"} tone="accent" /></Panel>
         <Panel><Stat label="TOKENS THIS MONTH" value={usage?.monthTokens ?? 0} /></Panel>
         <Panel><Stat label="BUDGETS" value={budgets.length} /></Panel>
+        <Panel><Stat label="TOKENS AVOIDED (9C)" value={usage?.compaction?.tokensAvoided ?? 0} /></Panel>
       </div>
 
       <div className="tool-grid">

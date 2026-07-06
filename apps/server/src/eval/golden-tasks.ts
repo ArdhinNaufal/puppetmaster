@@ -1,4 +1,4 @@
-import { searchMemories, type Db } from "@puppetmaster/db";
+import { getMissionSteps, searchMemories, type Db } from "@puppetmaster/db";
 
 /**
  * Golden tasks (Stage 5, G7 — τ-bench style). Each task runs against a fresh
@@ -15,11 +15,16 @@ export interface GoldenTask {
   kind: "agent" | "workflow";
   /** For agent tasks: the chat message (mock-provider scripted). */
   message?: string;
+  /** Extra agent settings (Stage 9C pins context compaction behaviour). */
+  agent?: { contextCompaction?: boolean };
   /** For workflow tasks: graph + run input. */
   graph?: unknown;
   input?: unknown;
   expectOutput?: (output: unknown) => boolean;
-  expectState?: (db: Db, ctx: { workspaceId: string; subjectId: string }) => Promise<boolean>;
+  expectState?: (
+    db: Db,
+    ctx: { workspaceId: string; subjectId: string; missionId: string },
+  ) => Promise<boolean>;
   trajectory?: { mustCall?: string[]; mayCallOnly?: string[] };
 }
 
@@ -40,6 +45,26 @@ export const GOLDEN_TASKS: GoldenTask[] = [
     expectState: async (db, ctx) =>
       (await searchMemories(db, ctx.subjectId, "golden retention", 5)).length > 0,
     trajectory: { mustCall: ["memory.save"], mayCallOnly: ["memory.save"] },
+  },
+  {
+    id: "agent-compaction-provenance",
+    description:
+      "Compaction-enabled agent sees the compacted tool result while the step keeps the raw output",
+    kind: "agent",
+    agent: { contextCompaction: true },
+    // 60 identical lines (~1.6k chars): above the compaction threshold, so the
+    // context copy collapses to one line with a ×60 marker, which the mock
+    // provider then quotes back in its summary.
+    message: `use util.echo ${JSON.stringify({ value: "repeated log line for compaction\n".repeat(60) })}`,
+    expectOutput: (o) => typeof o === "string" && o.includes("[×60]"),
+    // Provenance: the mission step must hold the RAW result — full length, no
+    // compaction markers.
+    expectState: async (db, ctx) => {
+      const steps = await getMissionSteps(db, ctx.missionId);
+      const raw = steps.find((s) => s.kind === "action" && s.nodeId === "util__echo")?.output;
+      return typeof raw === "string" && raw.length > 1500 && !raw.includes("[×");
+    },
+    trajectory: { mustCall: ["util.echo"], mayCallOnly: ["util.echo"] },
   },
   {
     id: "workflow-code-double",

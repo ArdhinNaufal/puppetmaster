@@ -74,6 +74,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
         name: `eval-${task.id}`,
         persona: "You are an eval agent.",
         model: "mock",
+        contextCompaction: task.agent?.contextCompaction ?? false,
       });
       subjectId = agent.id;
       const mission = await startAgentTick(db, {
@@ -106,7 +107,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
       pass = false;
       notes.push(`output predicate failed: ${JSON.stringify(mission!.output)?.slice(0, 120)}`);
     }
-    if (pass && task.expectState && !(await task.expectState(db, { workspaceId, subjectId }))) {
+    if (pass && task.expectState && !(await task.expectState(db, { workspaceId, subjectId, missionId }))) {
       pass = false;
       notes.push("state predicate failed");
     }

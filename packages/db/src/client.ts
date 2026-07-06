@@ -301,6 +301,7 @@ const DDL: string[] = [
      monthly_token_limit integer NOT NULL,
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `ALTER TABLE agents ADD COLUMN IF NOT EXISTS context_compaction boolean NOT NULL DEFAULT false`,
   `CREATE TABLE IF NOT EXISTS router_profiles (
      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
      workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,

@@ -175,6 +175,9 @@ export const agents = pgTable("agents", {
   schedule: text("schedule"),
   /** Structured scratchpad the agent maintains across ticks (ARCHITECTURE.md §3.1). */
   scratchpad: jsonb("scratchpad").notNull().default({}),
+  /** Stage 9C opt-in: large tool results are compacted before entering this
+   *  agent's context (raw output always stays in the mission step). */
+  contextCompaction: boolean("context_compaction").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

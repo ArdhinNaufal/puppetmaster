@@ -12,6 +12,7 @@ export async function createAgent(
     autonomy?: string;
     toolGrants?: string[];
     schedule?: string | null;
+    contextCompaction?: boolean;
   },
 ) {
   const [row] = await db
@@ -24,6 +25,7 @@ export async function createAgent(
       autonomy: input.autonomy ?? "write_approved",
       toolGrants: input.toolGrants ?? [],
       schedule: input.schedule ?? null,
+      contextCompaction: input.contextCompaction ?? false,
     })
     .returning();
   return row!;

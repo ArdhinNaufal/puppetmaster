@@ -723,6 +723,7 @@ app.post("/api/agents", async (req, reply) => {
     autonomy?: string;
     schedule?: string | null;
     toolGrants?: string[];
+    contextCompaction?: boolean;
   };
   if (!body.name?.trim()) return reply.code(400).send({ error: "name is required" });
   const agent = await createAgent(db, {
@@ -733,6 +734,7 @@ app.post("/api/agents", async (req, reply) => {
     autonomy: body.autonomy,
     schedule: body.schedule ?? null,
     toolGrants: Array.isArray(body.toolGrants) ? body.toolGrants : undefined,
+    contextCompaction: body.contextCompaction === true,
   });
   if (agent.schedule) await scheduleAgentCron(agent.id, agent.schedule);
   return reply.code(201).send(agent);
@@ -751,9 +753,10 @@ app.put("/api/agents/:id", async (req, reply) => {
   if (!agent) return reply.code(404).send({ error: "agent not found" });
   const body = (req.body ?? {}) as Record<string, unknown>;
   const patch: Record<string, unknown> = {};
-  for (const key of ["name", "persona", "model", "autonomy", "schedule", "toolGrants"]) {
+  for (const key of ["name", "persona", "model", "autonomy", "schedule", "toolGrants", "contextCompaction"]) {
     if (key in body) patch[key] = body[key];
   }
+  if ("contextCompaction" in patch) patch.contextCompaction = patch.contextCompaction === true;
   await updateAgent(db, id, patch);
   if ("schedule" in patch) await scheduleAgentCron(id, (patch.schedule as string | null) ?? null);
   return getAgent(db, id);
@@ -1008,6 +1011,11 @@ app.get("/api/usage", async () => {
     routerFailures,
     // Stage 9B: candidate health (cooling/healthy, cooldown expiry, last error).
     routerHealth: router.healthStats(),
+    // Stage 9C: context-compaction savings since boot (~4 chars/token estimate).
+    compaction: (() => {
+      const c = agentRuntime.compactionStats();
+      return { ...c, tokensAvoided: Math.max(0, Math.round((c.rawBytes - c.sentBytes) / 4)) };
+    })(),
     breakdown: rows.map((r) => ({
       ...r,
       inputTokens: Number(r.inputTokens),

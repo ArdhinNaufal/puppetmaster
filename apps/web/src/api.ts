@@ -159,6 +159,8 @@ export interface Agent {
   autonomy: string;
   schedule: string | null;
   scratchpad: Record<string, unknown>;
+  /** Stage 9C: compact large tool results before they enter this agent's context. */
+  contextCompaction: boolean;
   createdAt: string;
 }
 export interface AgentMessage {
@@ -457,6 +459,8 @@ export interface UsageReport {
   breakdown: UsageBreakdownRow[];
   routerFailures: Record<string, number>;
   routerHealth: Record<string, RouterCandidateHealth>;
+  /** Stage 9C context-compaction savings since boot. */
+  compaction: { applications: number; rawBytes: number; sentBytes: number; tokensAvoided: number };
 }
 
 export const opsApi = {

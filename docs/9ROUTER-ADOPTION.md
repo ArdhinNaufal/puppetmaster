@@ -1,8 +1,8 @@
 # 9Router Concept Study — Adoption Analysis for Puppetmaster
 
-**Date:** 2026-07-06 · **Status:** Stages 9A ✅ + 9B ✅ executed & e2e-verified; 9C awaiting
-owner go-ahead (one stage per explicit command, same loop as RESEARCH-ROADMAP.md: build
-green → e2e verify → docs → commit/push → owner review) · **Branch:** `claude/9router-platform-research-2q0bvz`
+**Date:** 2026-07-06 · **Status:** ✅ all three stages (9A router profiles, 9B health-aware
+routing, 9C context compaction) executed & e2e-verified, one commit per stage — the
+adoption plan is complete · **Branch:** `claude/9router-platform-research-2q0bvz`
 
 ---
 
@@ -146,17 +146,33 @@ existing router rather than replacing it.
    fail-closed); golden eval suite stays green (4/4 pass²); ROUTER HEALTH panel renders
    both candidates in the browser.
 
-### Stage 9C — Tool-output compaction (RTK, with provenance) · size M
-1. Deterministic compactors in the kernel (no model calls): whitespace/blank-run collapse,
-   repeated-line dedup with counts, head/tail smart-truncate with an elision marker, JSON
-   pretty→compact — applied to tool results larger than a threshold before they enter agent
-   context (inside the untrusted-data envelope).
-2. **Raw output always persisted in the mission step**; the step records
-   `{rawBytes, sentBytes, compactor}` so savings are auditable and replay/evals use raw.
-3. Opt-in per agent (`context_compaction: on|off`, default off); savings surfaced in the
-   usage view (tokens-avoided estimate).
-4. Eval harness runs a golden task with compaction on to pin behavior (no "corrupt
-   success" via over-truncation — trajectory assertions unchanged).
+### Stage 9C — Tool-output compaction (RTK, with provenance) · size M · ✅ EXECUTED 2026-07-06
+1. Deterministic compactors in the kernel (`compaction.ts`, no model calls): JSON
+   pretty→compact, whitespace/blank-run collapse, consecutive-duplicate-line dedup
+   (`line [×N]`), head/tail smart-truncate with an explicit elision marker — applied to
+   catalog-tool results above `COMPACTION_MIN_CHARS` (default 800; truncate above
+   `COMPACTION_MAX_CHARS`, default 4000) before they enter agent context, inside the
+   untrusted-data envelope. No gain → original sent untouched; errors and runtime
+   memory/scratchpad tools are exempt.
+2. **Raw output always persisted in the mission step, byte-identical.** Deviation from the
+   original wording: `{rawBytes, sentBytes, compactors}` is recorded on the `tool.call`
+   **audit entry** rather than a step column — the append-only trail is the provenance
+   ledger, and step outputs stay exactly the raw result for replay/evals/trace.
+3. Opt-in per agent (`agents.context_compaction`, default off) — API create/update +
+   inspector toggle; savings aggregate at `GET /api/usage` (`compaction` with a
+   ~4-chars/token `tokensAvoided` estimate) and an EVALS stat tile.
+4. Golden task `agent-compaction-provenance` pins the behaviour: the mock provider's
+   summary must contain the dedup marker (proving the model saw the compacted copy) while
+   the step must hold the full unmarked raw output; trajectory assertions unchanged.
+   Suite is now 5/5.
+
+   *Verified e2e (keyless, PGlite + Playwright):* a compaction-on agent echoing 60
+   identical lines (1,980 bytes) had its context copy deduped to 40 bytes (98% saved,
+   `[×60]` marker quoted back by the model) while the mission step kept all 1,980 raw
+   bytes; audit shows `compaction: {rawBytes: 1980, sentBytes: 40, compactors:
+   [dedup-lines]}`; `/api/usage` reports 485 tokens avoided (rendered in the EVALS tile);
+   a default-off agent saw the full raw result and moved no counters; the PUT toggle
+   persists and renders in the inspector; golden suite 5/5 pass².
 
 **Rejected permanently** (revisit only if the owner overrules): subscription-OAuth
 harvesting, multi-account rotation, external OpenAI-compatible ingress proxy, N×N format

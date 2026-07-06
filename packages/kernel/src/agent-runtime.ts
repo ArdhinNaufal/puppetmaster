@@ -26,6 +26,7 @@ import {
 import type { MissionStatus } from "@puppetmaster/shared";
 import type { EventBus } from "./bridge.js";
 import type { AuditSink } from "./audit-sink.js";
+import { compactForContext } from "./compaction.js";
 import { toVectorLiteral, type EmbeddingProvider } from "./embeddings.js";
 import { ModelFloorError, ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
 import { rrfFuse } from "./kb.js";
@@ -37,6 +38,12 @@ import { UNTRUSTED_PROMPT_NOTE, wrapUntrusted } from "./untrusted.js";
  *  the per-agent cap that decay-based eviction enforces. */
 const MEMORY_DEDUP_TAU = 0.92;
 const MEMORY_CAP = Math.max(10, Number(process.env.MEMORY_CAP ?? 200));
+
+/** Stage 9C context-compaction thresholds (chars); env-tunable. */
+const numEnv = (v: string | undefined, dflt: number) =>
+  Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : dflt;
+const COMPACTION_MIN_CHARS = numEnv(process.env.COMPACTION_MIN_CHARS, 800);
+const COMPACTION_MAX_CHARS = numEnv(process.env.COMPACTION_MAX_CHARS, 4000);
 
 const MAX_ITERATIONS = 8;
 const now = () => new Date();
@@ -131,6 +138,44 @@ export class AgentRuntime {
     this.audit = deps.audit ?? null;
     this.policyLookup = deps.policyLookup ?? null;
     this.budgetGate = deps.budgetGate ?? null;
+  }
+
+  private readonly compactionTotals = { applications: 0, rawBytes: 0, sentBytes: 0 };
+
+  /** Aggregate compaction savings since boot (Stage 9C), for GET /api/usage. */
+  compactionStats(): { applications: number; rawBytes: number; sentBytes: number } {
+    return { ...this.compactionTotals };
+  }
+
+  /**
+   * Context compaction (Stage 9C): for opted-in agents, large catalog-tool
+   * results are deterministically compacted before they enter model context.
+   * The RAW result is untouched — it goes to the mission step as-is; only the
+   * copy persisted into the conversation is compacted. Runtime tools
+   * (memory/scratchpad) and error results are exempt.
+   */
+  private maybeCompact(
+    agent: { contextCompaction?: boolean | null },
+    toolName: string,
+    result: unknown,
+    isError: boolean,
+  ): { context: unknown; meta: { rawBytes: number; sentBytes: number; compactors: string[] } | null } {
+    if (!agent.contextCompaction || isError) return { context: result, meta: null };
+    if (toolName.startsWith("memory__") || toolName.startsWith("scratchpad__")) {
+      return { context: result, meta: null };
+    }
+    const c = compactForContext(result, {
+      minChars: COMPACTION_MIN_CHARS,
+      maxChars: COMPACTION_MAX_CHARS,
+    });
+    if (!c) return { context: result, meta: null };
+    this.compactionTotals.applications++;
+    this.compactionTotals.rawBytes += c.rawBytes;
+    this.compactionTotals.sentBytes += c.sentBytes;
+    return {
+      context: c.result,
+      meta: { rawBytes: c.rawBytes, sentBytes: c.sentBytes, compactors: c.compactors },
+    };
   }
 
   /** Best-effort audit; never let a logging failure break the tick. */
@@ -406,12 +451,20 @@ export class AgentRuntime {
         isError = true;
       }
       if (approved && !isError) toolsUsed.push(pending.name);
+      // Raw result goes to the step; only the context copy may be compacted.
+      const cx = this.maybeCompact(agent, pending.name, result, isError);
       await this.recordToolStep(missionId, pending.name, approved && !isError, pending.args, result);
       await this.recordAudit({
         ...auditActor,
         action: "tool.call",
         target: pending.name.replace("__", "."),
-        detail: { ok: approved && !isError, gated: true, approved, args: pending.args },
+        detail: {
+          ok: approved && !isError,
+          gated: true,
+          approved,
+          args: pending.args,
+          ...(cx.meta ? { compaction: cx.meta } : {}),
+        },
       });
       await appendAgentMessage(this.db, {
         agentId: agent.id,
@@ -421,7 +474,7 @@ export class AgentRuntime {
           toolResults: [
             {
               toolCallId: pending.toolCallId,
-              result: wrapToolResultForContext(pending.name, result),
+              result: wrapToolResultForContext(pending.name, cx.context),
               isError,
             },
           ],
@@ -684,16 +737,23 @@ export class AgentRuntime {
         if (!isError && !call.name.startsWith("memory__") && !call.name.startsWith("scratchpad__")) {
           toolsUsed.push(call.name);
         }
+        // Raw result goes to the step; only the context copy may be compacted.
+        const cx = this.maybeCompact(agent, call.name, result, isError);
         await this.recordToolStep(missionId, call.name, !isError, call.args, result);
         await this.recordAudit({
           ...auditActor,
           action: "tool.call",
           target: call.name.replace("__", "."),
-          detail: { ok: !isError, args: call.args, ...(autoPolicy ? { autoApproved: true } : {}) },
+          detail: {
+            ok: !isError,
+            args: call.args,
+            ...(autoPolicy ? { autoApproved: true } : {}),
+            ...(cx.meta ? { compaction: cx.meta } : {}),
+          },
         });
         toolResults.push({
           toolCallId: call.id,
-          result: wrapToolResultForContext(call.name, result),
+          result: wrapToolResultForContext(call.name, cx.context),
           isError,
         });
       }

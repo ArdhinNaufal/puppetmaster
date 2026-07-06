@@ -57,6 +57,17 @@
   rows so useful memories survive decay. Governance per SSGM: pin/unpin, edit, delete in the
   agent inspector (`PUT/DELETE /api/agents/:id/memories/:memId`, builder+); pinned memories are
   never evicted.
+- **Context compaction (Stage 9C, docs/9ROUTER-ADOPTION.md)**: per-agent opt-in
+  (`agents.context_compaction`, default off, toggle in the inspector). Catalog-tool results
+  above `COMPACTION_MIN_CHARS` (default 800) pass deterministic, model-free compactors —
+  pretty-JSON→compact, whitespace collapse, consecutive-duplicate-line dedup (`[×N]`),
+  head/tail truncate above `COMPACTION_MAX_CHARS` (default 4000, explicit elision marker) —
+  before entering model context (inside the untrusted-data envelope). **Provenance**: the
+  mission step always stores the raw result byte-identical; the `tool.call` audit entry
+  records `{rawBytes, sentBytes, compactors}`; runtime memory/scratchpad tools and error
+  results are exempt. Savings aggregate at `GET /api/usage` (`compaction.tokensAvoided`,
+  EVALS stat tile); the golden suite pins the behaviour (`agent-compaction-provenance`:
+  compacted context + raw step, trajectory unchanged).
 
 ### 3.2 Workflow Engine
 - Workflows are DAGs stored as JSON; nodes: trigger, action (MCP tool call), logic (branch/loop/wait), code (sandboxed JS via isolated worker), **agent node**, human-approval node.
