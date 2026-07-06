@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Chip, Panel, Stat, StatusDot, StatusText, TierBadge } from "@puppetmaster/ui";
+import { Chip, Gauge, Panel, Stat, StatusDot, StatusText, TierBadge } from "@puppetmaster/ui";
 import {
   agentApi,
   api,
@@ -34,10 +34,15 @@ import {
 
 /* ---------------------------------------------------------------- Missions */
 
-function fmtDuration(m: Mission): string {
-  if (!m.startedAt) return "—";
+function durationMs(m: Mission): number | null {
+  if (!m.startedAt) return null;
   const end = m.finishedAt ? new Date(m.finishedAt).getTime() : Date.now();
-  const ms = end - new Date(m.startedAt).getTime();
+  return end - new Date(m.startedAt).getTime();
+}
+
+function fmtDuration(m: Mission): string {
+  const ms = durationMs(m);
+  if (ms === null) return "—";
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
@@ -56,38 +61,71 @@ export function MissionsView(props: {
     running: missions.filter((m) => m.status === "running").length,
     gated: missions.filter((m) => m.status === "awaiting_approval").length,
     failed: missions.filter((m) => m.status === "failed").length,
+    succeeded: missions.filter((m) => m.status === "succeeded").length,
   };
+  const settled = counts.succeeded + counts.failed;
+  const successPct = settled > 0 ? Math.round((counts.succeeded / settled) * 100) : null;
+
+  // Tempo: durations of the most recent finished missions, oldest → newest.
+  const finished = missions.filter((m) => m.startedAt && m.finishedAt);
+  const tempo = finished.slice(0, 24).reverse().map((m) => (durationMs(m) ?? 0) / 1000);
+  const maxDur = finished.reduce((mx, m) => Math.max(mx, durationMs(m) ?? 0), 0);
 
   return (
     <div className="view-wrap">
       <div className="stat-row">
         <Panel><Stat label="MISSIONS" value={missions.length} /></Panel>
         <Panel><Stat label="RUNNING" value={counts.running} tone={counts.running ? "accent" : "default"} /></Panel>
-        <Panel><Stat label="AWAITING APPROVAL" value={counts.gated} tone={counts.gated ? "warn" : "default"} /></Panel>
+        <Panel><Stat label="AWAITING AUTH" value={counts.gated} tone={counts.gated ? "warn" : "default"} /></Panel>
         <Panel><Stat label="FAILED" value={counts.failed} tone={counts.failed ? "danger" : "default"} /></Panel>
+        <Panel>
+          <Stat
+            label={tempo.length > 1 ? `SUCCESS · TEMPO (LAST ${tempo.length})` : "SUCCESS RATE"}
+            value={successPct !== null ? `${successPct}%` : "—"}
+            tone={successPct === null ? "default" : successPct >= 90 ? "ok" : successPct >= 60 ? "warn" : "danger"}
+            spark={tempo.length > 1 ? tempo : undefined}
+          />
+        </Panel>
       </div>
-      <Panel title="MISSION LOG" className="grow" scroll>
+      <Panel title="MISSION LOG" index="01" className="grow" scroll>
         <table className="fui-table">
           <thead>
-            <tr><th></th><th>KIND</th><th>MISSION</th><th>STATUS</th><th>DURATION</th><th>NESTED</th></tr>
+            <tr><th></th><th>KIND</th><th>MISSION</th><th>STATUS</th><th>T-START</th><th>DURATION</th><th>NESTED</th></tr>
           </thead>
           <tbody>
-            {missions.map((m) => (
-              <tr
-                key={m.id}
-                className={props.selected === m.id ? "sel" : ""}
-                onClick={() => props.onSelect(m.id)}
-              >
-                <td><StatusDot status={m.status} pulse={m.status === "running"} /></td>
-                <td className="dim">{m.kind.toUpperCase()}</td>
-                <td className="mono">{m.id.slice(0, 8)}</td>
-                <td><StatusText status={m.status} /></td>
-                <td className="dim">{fmtDuration(m)}</td>
-                <td className="dim">{m.parentMissionId ? `↳ ${m.parentMissionId.slice(0, 8)}` : ""}</td>
-              </tr>
-            ))}
+            {missions.map((m) => {
+              const ms = durationMs(m);
+              return (
+                <tr
+                  key={m.id}
+                  className={props.selected === m.id ? "sel" : ""}
+                  onClick={() => props.onSelect(m.id)}
+                >
+                  <td><StatusDot status={m.status} pulse={m.status === "running"} /></td>
+                  <td className="dim">{m.kind.toUpperCase()}</td>
+                  <td className="mono">{m.id.slice(0, 8)}</td>
+                  <td><StatusText status={m.status} /></td>
+                  <td className="dim mono">
+                    {m.startedAt ? new Date(m.startedAt).toISOString().slice(11, 19) : "—"}
+                  </td>
+                  <td>
+                    <span className="dur-cell">
+                      {ms !== null && maxDur > 0 && (
+                        <span
+                          className="dur-bar"
+                          style={{ width: `${Math.max((Math.min(ms, maxDur) / maxDur) * 56, 2)}px` }}
+                          aria-hidden="true"
+                        />
+                      )}
+                      <span className="dim">{fmtDuration(m)}</span>
+                    </span>
+                  </td>
+                  <td className="dim">{m.parentMissionId ? `↳ ${m.parentMissionId.slice(0, 8)}` : ""}</td>
+                </tr>
+              );
+            })}
             {missions.length === 0 && (
-              <tr><td colSpan={6} className="dim pad">No missions yet — run a workflow or chat with an agent.</td></tr>
+              <tr><td colSpan={7} className="dim pad">No missions yet — run a workflow or chat with an agent.</td></tr>
             )}
           </tbody>
         </table>
@@ -143,7 +181,7 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
 
   return (
     <div className="view-wrap cols">
-      <Panel title="AGENT ROSTER" className="w-roster" scroll>
+      <Panel title="AGENT ROSTER" index="01" className="w-roster" scroll>
         <div className="agent-cards">
           {agents.map((a) => (
             <button key={a.id} className={`agent-card ${selected === a.id ? "sel" : ""}`} onClick={() => setSelected(a.id)}>
@@ -156,7 +194,7 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
           {agents.length === 0 && <p className="dim pad">No agents. Create one from the Command view.</p>}
         </div>
       </Panel>
-      <Panel title={agent ? `INSPECTOR · ${agent.name.toUpperCase()}` : "INSPECTOR"} className="grow" scroll
+      <Panel title={agent ? `INSPECTOR · ${agent.name.toUpperCase()}` : "INSPECTOR"} index="02" className="grow" scroll
         actions={agent ? <Chip tiny tone="accent" onClick={() => props.onOpenChat(agent.id)}>OPEN CHANNEL</Chip> : undefined}
       >
         {!agent && <p className="dim pad">Select an agent to inspect its definition, scratchpad, and memory.</p>}
@@ -359,7 +397,7 @@ export function ToolsView(props: { isAdmin?: boolean }) {
       </div>
       {props.isAdmin && (
         <div className="tool-grid">
-          <Panel title="WORKSPACE MCP SERVERS (streamable HTTP / stdio)" scroll>
+          <Panel title="WORKSPACE MCP SERVERS (streamable HTTP / stdio)" index="01" scroll>
             <div className="pad" style={{ display: "flex", gap: 8 }}>
               <input className="text-input" placeholder="name" value={addName}
                 onChange={(e) => setAddName(e.target.value)} style={{ width: 120 }} />
@@ -384,7 +422,7 @@ export function ToolsView(props: { isAdmin?: boolean }) {
               {mcpRows.length === 0 && <li className="dim pad">No workspace MCP servers — add one or search the registry.</li>}
             </ul>
           </Panel>
-          <Panel title="MCP REGISTRY" scroll>
+          <Panel title="MCP REGISTRY" index="02" scroll>
             <div className="pad" style={{ display: "flex", gap: 8 }}>
               <input className="text-input" placeholder="Search the public registry…" value={regQuery}
                 onChange={(e) => setRegQuery(e.target.value)}
@@ -508,7 +546,7 @@ export function TemplatesView(props: {
       </div>
 
       {props.canBuild && (
-        <Panel title="PUBLISH A TEMPLATE" actions={msg ? <span className="dim">{msg}</span> : undefined}>
+        <Panel title="PUBLISH A TEMPLATE" index="01" actions={msg ? <span className="dim">{msg}</span> : undefined}>
           <div className="ins-row pad">
             <label className="ins-field">
               <span>Source workflow or agent</span>
@@ -638,7 +676,7 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
 
   return (
     <div className="view-wrap">
-      <Panel title="WORKSPACE BRANDING" actions={msg ? <span className="dim">{msg}</span> : undefined}>
+      <Panel title="WORKSPACE BRANDING" index="01" actions={msg ? <span className="dim">{msg}</span> : undefined}>
         <div className="inspector-grid pad">
           <div className="ins-row">
             <label className="ins-field">
@@ -669,7 +707,7 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
         </div>
       </Panel>
 
-      <Panel title={`MEMBERS · ${members.length}`} className="grow" scroll
+      <Panel title={`MEMBERS · ${members.length}`} index="02" className="grow" scroll
         actions={memberErr ? <span className="login-error">▲ {memberErr}</span> : undefined}
       >
         <table className="fui-table">
@@ -731,6 +769,7 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
 
       <Panel
         title="AUDIT LOG"
+        index="03"
         className="grow"
         scroll
         actions={
@@ -831,7 +870,7 @@ export function KnowledgeView(props: { canBuild: boolean }) {
       </div>
 
       <div className="tool-grid">
-        <Panel title="SEARCH TEST" scroll>
+        <Panel title="SEARCH TEST" index="01" scroll>
           <div className="pad" style={{ display: "flex", gap: 8 }}>
             <input
               className="text-input"
@@ -857,7 +896,7 @@ export function KnowledgeView(props: { canBuild: boolean }) {
           </ul>
         </Panel>
 
-        <Panel title="DOCUMENTS" scroll>
+        <Panel title="DOCUMENTS" index="02" scroll>
           <ul className="tool-list">
             {docs.map((d) => (
               <li key={d.id} className="tool-row">
@@ -886,7 +925,7 @@ export function KnowledgeView(props: { canBuild: boolean }) {
         </Panel>
 
         {props.canBuild && (
-          <Panel title="UPLOAD" scroll>
+          <Panel title="UPLOAD" index="03" scroll>
             <div className="pad" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <input
                 className="text-input"
@@ -989,17 +1028,47 @@ export function EvalsView(props: { agents: Agent[] }) {
   const agentName = (id: string | null) =>
     id ? (props.agents.find((a) => a.id === id)?.name ?? id.slice(0, 8)) : "workspace";
 
+  // Instruments: real measurements only. Budget burn renders when a
+  // workspace-wide budget exists; pass rate when a suite has run.
+  const wsBudget = budgets.find((b) => b.agentId === null) ?? null;
+  const burn = wsBudget && usage ? usage.monthTokens / wsBudget.monthlyTokenLimit : null;
+
   return (
     <div className="view-wrap">
       <div className="stat-row">
         <Panel><Stat label="LAST SUITE" value={runs[0] ? `${runs[0].passed}/${runs[0].total}` : "—"} tone="accent" /></Panel>
-        <Panel><Stat label="TOKENS THIS MONTH" value={usage?.monthTokens ?? 0} /></Panel>
+        <Panel><Stat label="TOKENS THIS MONTH" value={(usage?.monthTokens ?? 0).toLocaleString()} unit="TOK" /></Panel>
         <Panel><Stat label="BUDGETS" value={budgets.length} /></Panel>
-        <Panel><Stat label="TOKENS AVOIDED (9C)" value={usage?.compaction?.tokensAvoided ?? 0} /></Panel>
+        <Panel><Stat label="TOKENS AVOIDED (9C)" value={(usage?.compaction?.tokensAvoided ?? 0).toLocaleString()} unit="TOK" /></Panel>
       </div>
 
+      {(runs[0] || burn !== null) && (
+        <Panel title="INSTRUMENTS" index="00">
+          <div className="gauge-row pad">
+            {runs[0] && (
+              <Gauge
+                label="SUITE PASS RATE"
+                value={runs[0].passed}
+                max={runs[0].total}
+                display={`${runs[0].passed}/${runs[0].total}`}
+                tone={runs[0].passed === runs[0].total ? "ok" : runs[0].passed === 0 ? "danger" : "warn"}
+              />
+            )}
+            {burn !== null && usage && wsBudget && (
+              <Gauge
+                label="WS BUDGET BURN"
+                value={usage.monthTokens}
+                max={wsBudget.monthlyTokenLimit}
+                display={usage.monthTokens >= 1000 ? `${Math.round(usage.monthTokens / 1000)}k` : String(usage.monthTokens)}
+                tone={burn >= 1 ? "danger" : burn >= 0.8 ? "warn" : "default"}
+              />
+            )}
+          </div>
+        </Panel>
+      )}
+
       <div className="tool-grid">
-        <Panel title="GOLDEN SUITE (pass^3 + trajectory)" scroll
+        <Panel title="GOLDEN SUITE (pass^3 + trajectory)" index="01" scroll
           actions={<Chip tiny tone="accent" onClick={run}>{running ? "RUNNING…" : "RUN SUITE"}</Chip>}>
           <ul className="tool-list">
             {runs.map((r) => (
@@ -1021,7 +1090,7 @@ export function EvalsView(props: { agents: Agent[] }) {
           </ul>
         </Panel>
 
-        <Panel title="COST LEDGER (MONTH TO DATE)" scroll>
+        <Panel title="COST LEDGER (MONTH TO DATE)" index="02" scroll>
           <ul className="tool-list">
             {(usage?.breakdown ?? []).map((row, i) => (
               <li key={i} className="tool-row">
@@ -1036,7 +1105,7 @@ export function EvalsView(props: { agents: Agent[] }) {
           </ul>
         </Panel>
 
-        <Panel title="MONTHLY TOKEN BUDGETS" scroll>
+        <Panel title="MONTHLY TOKEN BUDGETS" index="03" scroll>
           <div className="pad" style={{ display: "flex", gap: 8 }}>
             <select value={budgetAgent} onChange={(e) => setBudgetAgent(e.target.value)}>
               <option value="">whole workspace</option>
@@ -1083,7 +1152,7 @@ export function EvalsView(props: { agents: Agent[] }) {
           </ul>
         </Panel>
 
-        <Panel title="ROUTER PROFILES (Stage 9A)" scroll>
+        <Panel title="ROUTER PROFILES (Stage 9A)" index="04" scroll>
           <div className="pad" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <input
               className="text-input"
@@ -1135,7 +1204,7 @@ export function EvalsView(props: { agents: Agent[] }) {
           </ul>
         </Panel>
 
-        <Panel title="ROUTER HEALTH (Stage 9B)" scroll
+        <Panel title="ROUTER HEALTH (Stage 9B)" index="05" scroll
           actions={<Chip tiny onClick={refresh}>REFRESH</Chip>}>
           <ul className="tool-list">
             {Object.entries(usage?.routerHealth ?? {}).map(([model, h]) => (

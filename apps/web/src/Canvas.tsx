@@ -311,7 +311,7 @@ export function Canvas(props: {
         </div>
       )}
 
-      <div className="canvas-body">
+      <div className={`canvas-body ${Object.values(props.nodeStatus).some((s) => s === "running") ? "canvas-live" : ""}`}>
         <ReactFlow
           nodes={nodes}
           edges={edges}

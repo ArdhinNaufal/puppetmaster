@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Decode } from "@puppetmaster/ui";
 import { agentApi, type Agent, type AgentMessage } from "./api.js";
 
 /**
- * Command view (PRD §6): chat-first interaction with an agent. Messages are
- * persisted server-side; the parent triggers `refreshKey` bumps when live
- * `agent.message` bus events arrive for the selected agent.
+ * Command view (PRD §6): chat-first interaction with an agent, styled as a
+ * secure channel — timestamped transmissions, tool telemetry inline, a live
+ * cursor while the agent streams. Messages are persisted server-side; the
+ * parent bumps `refreshKey` when live `agent.message` bus events arrive.
  */
 export function Command(props: {
   agent: Agent | null;
@@ -49,24 +51,35 @@ export function Command(props: {
   return (
     <div className="cmd-wrap">
       <div className="cmd-head">
-        <span className="cmd-agent">◉ {props.agent.name}</span>
+        <span className="cmd-agent">
+          ◉ <Decode text={props.agent.name.toUpperCase()} />
+        </span>
         <span className="tag-lo">
-          {props.agent.model.toUpperCase()} · {props.agent.autonomy.replace("_", " ").toUpperCase()}
+          {props.agent.model.toUpperCase()} · {props.agent.autonomy.replace(/_/g, " ").toUpperCase()} · {messages.length} TX
         </span>
       </div>
       <div className="cmd-scroll" ref={scrollRef}>
-        {messages.length === 0 && <p className="muted pad">Channel open. Say something.</p>}
+        {messages.length === 0 && <p className="muted pad">Channel open. Transmit when ready.</p>}
         {messages.map((m) => (
           <MessageRow key={m.id} msg={m} />
         ))}
         {props.streaming && (
           <div className="msg assistant">
-            <span className="msg-role">AGENT</span>
-            <div className="msg-body"><p>{props.streaming}<span className="dim">▌</span></p></div>
+            <span className="msg-side">
+              <span className="msg-role">AGENT</span>
+              <span className="msg-time">LIVE</span>
+            </span>
+            <div className="msg-body">
+              <p>
+                {props.streaming}
+                <span className="stream-cursor">▌</span>
+              </p>
+            </div>
           </div>
         )}
       </div>
       <div className="cmd-input-row">
+        <span className="cmd-prompt">▸</span>
         <input
           className="cmd-input"
           placeholder={`Message ${props.agent.name}…`}
@@ -76,13 +89,18 @@ export function Command(props: {
             if (e.key === "Enter") void send();
           }}
         />
-        <button className="chip accent" onClick={send} disabled={busy || !draft.trim()}>
-          {busy ? "…" : "SEND ⏎"}
+        <button className="fui-chip tone-accent" onClick={send} disabled={busy || !draft.trim()}>
+          {busy ? "…" : "TRANSMIT ⏎"}
         </button>
       </div>
     </div>
   );
 }
+
+const fmtClock = (iso: string) => {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? new Date(t).toISOString().slice(11, 19) : "";
+};
 
 function MessageRow({ msg }: { msg: AgentMessage }) {
   if (msg.role === "tool") {
@@ -101,7 +119,10 @@ function MessageRow({ msg }: { msg: AgentMessage }) {
   const calls = msg.content.toolCalls ?? [];
   return (
     <div className={`msg ${msg.role}`}>
-      <span className="msg-role">{msg.role === "user" ? "YOU" : "AGENT"}</span>
+      <span className="msg-side">
+        <span className="msg-role">{msg.role === "user" ? "YOU" : "AGENT"}</span>
+        <span className="msg-time">{fmtClock(msg.createdAt)}</span>
+      </span>
       <div className="msg-body">
         {msg.content.text && <p>{msg.content.text}</p>}
         {calls.map((c) => (

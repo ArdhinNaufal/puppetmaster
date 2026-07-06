@@ -9,6 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "@fontsource/rajdhani": "^5.2.7",
     "@puppetmaster/shared": "workspace:*",
     "@puppetmaster/ui": "workspace:*",
     "@xyflow/react": "^12.4.2",

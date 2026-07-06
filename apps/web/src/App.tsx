@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type JSX } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { Decode, HoldButton } from "@puppetmaster/ui";
 import {
   agentApi,
   api,
@@ -18,10 +19,12 @@ import {
 import { Canvas } from "./Canvas.js";
 import { Command } from "./Command.js";
 import { Login } from "./Login.js";
+import { Palette, type PaletteAction } from "./Palette.js";
+import { SignalRadar, SignalTicker, toSignal, type SignalEntry } from "./Signal.js";
+import { TraceDossier, type StepTiming } from "./Trace.js";
 import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
-import { NODE_META } from "./FlowNode.js";
 
 const VIEWS = ["command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
 type View = (typeof VIEWS)[number];
@@ -45,10 +48,10 @@ const ROLE_HOME: Record<Role, View> = {
 
 /** Arrangeable side panels: default layout per role; users override via ui_preferences. */
 const PANEL_PRESET: Record<Role, { order: string[]; collapsed: Record<string, boolean> }> = {
-  member: { order: ["suggested", "list", "approvals"], collapsed: { approvals: true } },
-  builder: { order: ["list", "suggested", "approvals"], collapsed: {} },
-  admin: { order: ["approvals", "suggested", "list"], collapsed: {} },
-  owner: { order: ["approvals", "suggested", "list"], collapsed: {} },
+  member: { order: ["signal", "suggested", "list", "approvals"], collapsed: { approvals: true } },
+  builder: { order: ["list", "suggested", "approvals", "signal"], collapsed: {} },
+  admin: { order: ["approvals", "signal", "suggested", "list"], collapsed: {} },
+  owner: { order: ["approvals", "signal", "suggested", "list"], collapsed: {} },
 };
 
 function applyBranding(ws: Workspace) {
@@ -73,15 +76,6 @@ const SAMPLE_GRAPH = {
     { from: "b1", to: "e2", condition: "out === false" },
     { from: "a1", to: "e1", condition: null },
   ],
-};
-
-const STATUS_LABEL: Record<StepStatus, string> = {
-  pending: "PENDING",
-  running: "RUNNING",
-  succeeded: "OK",
-  failed: "FAIL",
-  skipped: "SKIP",
-  awaiting_approval: "GATE",
 };
 
 /** Auth gate: resolve the session, then render the shell for the signed-in user. */
@@ -109,6 +103,15 @@ export function App() {
   );
 }
 
+/** True when the key event originates from a typing context. */
+function typing(e: KeyboardEvent): boolean {
+  const t = e.target;
+  return (
+    t instanceof HTMLElement &&
+    (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)
+  );
+}
+
 function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const canBuild = RANK[me.role] >= RANK.builder;
   const [view, setView] = useState<View>(ROLE_HOME[me.role]);
@@ -128,6 +131,15 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [streamText, setStreamText] = useState("");
   const [diagnosis, setDiagnosis] = useState<{ summary: string; diagnosis: string } | null>(null);
   const [info, setInfo] = useState<{ dbDriver: string; queue: string } | null>(null);
+
+  // Signal instruments: every bus event is witnessed (ticker + radar).
+  const [signals, setSignals] = useState<SignalEntry[]>([]);
+  const [rxTotal, setRxTotal] = useState(0);
+  const sessionStart = useRef(Date.now());
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // Observed per-step timing (from mission.step bus events) — feeds the dossier gantt.
+  const timingRef = useRef<Record<string, Record<string, StepTiming>>>({});
 
   // Arrangeable panels persisted per user (ui_preferences).
   const [panelOrder, setPanelOrder] = useState<string[]>(PANEL_PRESET[me.role].order);
@@ -170,7 +182,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       .get()
       .then(({ layout }) => {
         if (layout.panels?.order?.length) {
-          // Keep any newer section (e.g. "suggested") the saved layout predates.
+          // Keep any newer section (e.g. "signal") the saved layout predates.
           const saved = layout.panels.order;
           const merged = [...saved, ...PANEL_PRESET[me.role].order.filter((id) => !saved.includes(id))];
           setPanelOrder(merged);
@@ -195,6 +207,22 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const { connected } = useEventStream(
     useCallback(
       (event) => {
+        setRxTotal((n) => n + 1);
+        // The dossier's gantt uses observed timing; streaming deltas are too
+        // chatty for the ticker and are counted (RX) but not listed.
+        if (event.type === "mission.step") {
+          const m = (timingRef.current[event.missionId] ??= {});
+          const t = (m[event.nodeId] ??= {});
+          const at = Date.parse(event.at) || Date.now();
+          if (event.status === "running") t.start = at;
+          else if (event.status !== "pending") t.end = at;
+        }
+        if (event.type === "mission.started") timingRef.current[event.missionId] = {};
+        if (event.type !== "agent.message.delta") {
+          const entry = toSignal(event);
+          setSignals((s) => [entry, ...s].slice(0, 60));
+        }
+
         const active = trackedRef.current;
         if (event.type === "mission.step" && event.missionId === active) {
           setNodeStatus((s) => ({ ...s, [event.nodeId]: event.status }));
@@ -279,6 +307,71 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   };
 
   const currentAgent = agents.find((a) => a.id === selectedAgent) ?? null;
+  const roleViews = ROLE_VIEWS[me.role];
+
+  // --- Keyboard: ⌘K palette, 1–9 view switch --------------------------------
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+        return;
+      }
+      if (typing(e) || e.metaKey || e.ctrlKey || e.altKey) return;
+      const n = Number(e.key);
+      if (n >= 1 && n <= roleViews.length) {
+        setView(roleViews[n - 1]!);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [roleViews]);
+
+  // --- Command palette actions ----------------------------------------------
+  const paletteActions = useMemo<PaletteAction[]>(() => {
+    const acts: PaletteAction[] = roleViews.map((v, i) => ({
+      id: `view:${v}`,
+      group: "VIEWS",
+      label: `GO TO ${v.toUpperCase()}`,
+      hint: String(i + 1),
+      run: () => setView(v),
+    }));
+    for (const a of agents) {
+      acts.push({
+        id: `agent:${a.id}`,
+        group: "CHANNELS",
+        label: `OPEN CHANNEL · ${a.name.toUpperCase()}`,
+        hint: a.model,
+        keywords: "agent chat talk",
+        run: () => {
+          setSelectedAgent(a.id);
+          setView("command");
+        },
+      });
+    }
+    if (canBuild) {
+      for (const w of workflows) {
+        acts.push({
+          id: `wf:${w.id}`,
+          group: "WORKFLOWS",
+          label: `OPEN CANVAS · ${w.name.toUpperCase()}`,
+          hint: `v${w.currentVersion}`,
+          keywords: "workflow edit graph",
+          run: () => {
+            setSelected(w.id);
+            setView("canvas");
+          },
+        });
+      }
+      acts.push(
+        { id: "sys:new-agent", group: "SYSTEM", label: "COMMISSION NEW AGENT", keywords: "create add", run: newAgent },
+        { id: "sys:new-wf", group: "SYSTEM", label: "DRAFT NEW WORKFLOW", keywords: "create add", run: newWorkflow },
+      );
+    }
+    acts.push({ id: "sys:signout", group: "SYSTEM", label: "SIGN OUT", keywords: "logout exit", run: onSignOut });
+    return acts;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roleViews, agents, workflows, canBuild]);
 
   // --- Panel arrangement helpers -------------------------------------------------
   const movePanel = (id: string, dir: -1 | 1) => {
@@ -304,18 +397,32 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     </span>
   );
 
+  const idx = (id: string) => String(panelOrder.indexOf(id) + 1).padStart(2, "0");
+
   const sections: Record<string, () => JSX.Element | null> = {
+    signal: () => (
+      <section key="signal">
+        <div className="panel-head">
+          <span><span className="ph-idx">{idx("signal")}</span>SIGNAL</span>
+          <span className="head-actions">
+            <span className={`status ${connected ? "ok" : "down"}`}>{connected ? "LIVE" : "DOWN"}</span>
+            {panelControls("signal")}
+          </span>
+        </div>
+        {!collapsed.signal && <SignalRadar entries={signals} connected={connected} total={rxTotal} />}
+      </section>
+    ),
     list: () => {
       if (view === "canvas" && canBuild) {
         return (
           <section key="list">
             <div className="panel-head">
-              <span>WORKFLOWS</span>
+              <span><span className="ph-idx">{idx("list")}</span>WORKFLOWS</span>
               <span className="head-actions">
                 {!collapsed.list && (
                   <>
-                    <button className="chip tiny" onClick={newWorkflow}>＋</button>
-                    <button className="chip tiny" onClick={sampleWorkflow}>SAMPLE</button>
+                    <button className="chip tiny fui-chip" onClick={newWorkflow}>＋</button>
+                    <button className="chip tiny fui-chip" onClick={sampleWorkflow}>SAMPLE</button>
                   </>
                 )}
                 {panelControls("list")}
@@ -341,9 +448,9 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       return (
         <section key="list">
           <div className="panel-head">
-            <span>AGENTS</span>
+            <span><span className="ph-idx">{idx("list")}</span>AGENTS</span>
             <span className="head-actions">
-              {canBuild && !collapsed.list && <button className="chip tiny" onClick={newAgent}>＋</button>}
+              {canBuild && !collapsed.list && <button className="chip tiny fui-chip" onClick={newAgent}>＋</button>}
               {panelControls("list")}
             </span>
           </div>
@@ -369,7 +476,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     suggested: () => (
       <section key="suggested">
         <div className="panel-head">
-          <span>SUGGESTED</span>
+          <span><span className="ph-idx">{idx("suggested")}</span>SUGGESTED</span>
           <span className="head-actions">
             <span className="tag-lo" title="Frequently used, from mission history">ADAPTIVE</span>
             {panelControls("suggested")}
@@ -393,22 +500,25 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     approvals: () => (
       <section key="approvals">
         <div className="panel-head">
-          <span>APPROVALS</span>
+          <span><span className="ph-idx">{idx("approvals")}</span>AUTHORIZATIONS</span>
           <span className="head-actions">
-            <span className="count">{approvals.length}</span>
+            <span className={`count ${approvals.length > 0 ? "hot" : ""}`}>{approvals.length}</span>
             {panelControls("approvals")}
           </span>
         </div>
         {!collapsed.approvals && (
           <ul className="appr-list">
-            {approvals.length === 0 && <li className="muted">Inbox clear.</li>}
+            {approvals.length === 0 && <li className="muted pad">Inbox clear.</li>}
             {approvals.map((a) => (
               <li key={a.id} className="appr">
+                <span className="appr-tag">PENDING · {a.tier.replace(/_/g, " ").toUpperCase()}</span>
                 <div className="appr-prompt">{a.prompt}</div>
                 {canBuild ? (
                   <div className="appr-actions">
-                    <button className="chip accent tiny" onClick={() => decide(a.id, true)}>APPROVE</button>
-                    <button className="chip danger tiny" onClick={() => decide(a.id, false)}>REJECT</button>
+                    <HoldButton tiny onComplete={() => decide(a.id, true)} title="Hold to authorize">
+                      ⏣ HOLD TO AUTHORIZE
+                    </HoldButton>
+                    <button className="fui-chip tone-danger tiny" onClick={() => decide(a.id, false)}>DENY</button>
                   </div>
                 ) : (
                   <div className="appr-actions"><span className="tag-lo">BUILDER+ ONLY</span></div>
@@ -421,26 +531,29 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     ),
   };
 
+  const missionLive = mission !== null && ["queued", "running", "awaiting_approval"].includes(mission.status);
+
   return (
     <div className="app">
       <header className="rail">
-        <span className="brand">{workspace?.branding?.brandName || "PUPPETMASTER"}</span>
-        <nav className="view-switch">
-          {ROLE_VIEWS[me.role].map((v) => (
+        <span className="brand">
+          {workspace?.branding?.brandName || "PUPPETMASTER"}
+          <span className="brand-sub">{workspace?.name ? workspace.name.toUpperCase() : "COMMAND CENTER"}</span>
+        </span>
+        <nav className="view-switch" aria-label="Views">
+          {roleViews.map((v, i) => (
             <button key={v} className={`vs ${view === v ? "on" : ""}`} onClick={() => setView(v)}>
+              <span className="vs-idx">{String(i + 1).padStart(2, "0")}</span>
               {v.toUpperCase()}
             </button>
           ))}
         </nav>
         <span className="rail-meta">
           {info && <span className="tag-lo">DB {info.dbDriver.toUpperCase()} · Q {info.queue.toUpperCase()}</span>}
-          <span className={`status ${connected ? "ok" : "down"}`}>
-            {connected ? "BUS ONLINE" : "BUS OFFLINE"}
-          </span>
           <span className="user-chip" title={me.user.email}>
             {me.user.name.toUpperCase()} · {me.role.toUpperCase()}
           </span>
-          <button className="chip tiny" onClick={onSignOut}>SIGN OUT</button>
+          <button className="fui-chip tiny" onClick={onSignOut}>SIGN OUT</button>
         </span>
       </header>
 
@@ -450,60 +563,73 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </aside>
 
         <main className="panel canvas-panel">
-          {view === "command" && (
-            <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} streaming={streamText} />
-          )}
-          {view === "canvas" && canBuild && (
-            <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
-          )}
-          {view === "templates" && (
-            <TemplatesView
-              canBuild={canBuild}
-              onInstantiated={(kind, id) => {
-                if (kind === "workflow") {
-                  refreshWorkflows();
-                  setSelected(id);
-                  if (canBuild) setView("canvas");
-                } else {
-                  refreshAgents();
+          <div className="stage-head">
+            <span className="stage-title">
+              <span className="stage-idx">{String(roleViews.indexOf(view) + 1).padStart(2, "0")} //</span>
+              <Decode text={view.toUpperCase()} />
+            </span>
+            <span className="stage-hint">
+              <kbd>⌘K</kbd> COMMAND · <kbd>1–{roleViews.length}</kbd> VIEWS
+            </span>
+          </div>
+          <div className="stage-body">
+            {view === "command" && (
+              <Command agent={currentAgent} refreshKey={chatRefresh} onRan={track} streaming={streamText} />
+            )}
+            {view === "canvas" && canBuild && (
+              <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
+            )}
+            {view === "templates" && (
+              <TemplatesView
+                canBuild={canBuild}
+                onInstantiated={(kind, id) => {
+                  if (kind === "workflow") {
+                    refreshWorkflows();
+                    setSelected(id);
+                    if (canBuild) setView("canvas");
+                  } else {
+                    refreshAgents();
+                    setSelectedAgent(id);
+                    setView("command");
+                  }
+                }}
+              />
+            )}
+            {view === "knowledge" && <KnowledgeView canBuild={canBuild} />}
+            {view === "missions" && (
+              <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />
+            )}
+            {view === "agents" && (
+              <AgentsView
+                readOnly={!canBuild}
+                onOpenChat={(id) => {
                   setSelectedAgent(id);
                   setView("command");
-                }
-              }}
-            />
-          )}
-          {view === "knowledge" && <KnowledgeView canBuild={canBuild} />}
-          {view === "missions" && (
-            <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />
-          )}
-          {view === "agents" && (
-            <AgentsView
-              readOnly={!canBuild}
-              onOpenChat={(id) => {
-                setSelectedAgent(id);
-                setView("command");
-              }}
-            />
-          )}
-          {view === "tools" && <ToolsView isAdmin={RANK[me.role] >= RANK.admin} />}
-          {view === "evals" && RANK[me.role] >= RANK.admin && <EvalsView agents={agents} />}
-          {view === "admin" && RANK[me.role] >= RANK.admin && (
-            <AdminView
-              meId={me.user.id}
-              onBrandingChange={(ws) => {
-                setWorkspace(ws);
-                applyBranding(ws);
-              }}
-            />
-          )}
+                }}
+              />
+            )}
+            {view === "tools" && <ToolsView isAdmin={RANK[me.role] >= RANK.admin} />}
+            {view === "evals" && RANK[me.role] >= RANK.admin && <EvalsView agents={agents} />}
+            {view === "admin" && RANK[me.role] >= RANK.admin && (
+              <AdminView
+                meId={me.user.id}
+                onBrandingChange={(ws) => {
+                  setWorkspace(ws);
+                  applyBranding(ws);
+                }}
+              />
+            )}
+          </div>
         </main>
 
         <aside className="panel trace">
           <div className="panel-head">
-            <span>{collapsed.trace ? "TRACE" : "MISSION TRACE"}</span>
+            <span><span className="ph-idx">OP</span>{collapsed.trace ? "TRACE" : "OPERATION"}</span>
             <span className="head-actions">
               {mission && !collapsed.trace && (
-                <span className={`mstatus st-${mission.status}`}>{mission.status.toUpperCase()}</span>
+                <span className={`mstatus st-${mission.status}`}>
+                  <Decode text={mission.status.replace(/_/g, " ").toUpperCase()} />
+                </span>
               )}
               <button className="ph-btn" title={collapsed.trace ? "Expand" : "Collapse"} onClick={() => togglePanel("trace")}>
                 {collapsed.trace ? "＋" : "－"}
@@ -513,16 +639,16 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           {!collapsed.trace && (
             <>
               {mission?.parentMissionId && (
-                <button className="chip tiny parent-chip" onClick={() => track(mission.parentMissionId!)}>
+                <button className="fui-chip tiny parent-chip" onClick={() => track(mission.parentMissionId!)}>
                   ↑ NESTED · VIEW PARENT MISSION
                 </button>
               )}
-              {!mission && <p className="muted pad">Run a workflow to see its live trace.</p>}
+              {!mission && <p className="muted pad">Run a workflow or task an agent to open its dossier.</p>}
               {mission && canBuild && (
-                <div className="pad" style={{ display: "flex", gap: 8 }}>
-                  {["queued", "running", "awaiting_approval"].includes(mission.status) && (
+                <div className="trace-actions">
+                  {missionLive && (
                     <button
-                      className="chip tiny"
+                      className="fui-chip tiny"
                       onClick={() => api.cancelMission(mission.id).then(() => refreshTrace(mission.id)).catch(() => {})}
                     >
                       ✕ CANCEL
@@ -530,7 +656,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                   )}
                   {["failed", "cancelled"].includes(mission.status) && (
                     <button
-                      className="chip tiny"
+                      className="fui-chip tiny"
                       onClick={() => api.retryMission(mission.id).then(() => refreshTrace(mission.id)).catch(() => {})}
                     >
                       ↻ RETRY
@@ -538,7 +664,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                   )}
                   {mission.status === "failed" && (
                     <button
-                      className="chip tiny"
+                      className="fui-chip tiny"
                       onClick={() => api.explainMission(mission.id).then(setDiagnosis).catch(() => {})}
                     >
                       ? EXPLAIN
@@ -547,58 +673,21 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 </div>
               )}
               {mission && (
-                <>
-                  {(() => {
-                    const t = steps.reduce(
-                      (acc, s) => {
-                        const u = (s.output as { usage?: { inputTokens?: number; outputTokens?: number } } | null)?.usage;
-                        if (u) {
-                          acc.in += u.inputTokens ?? 0;
-                          acc.out += u.outputTokens ?? 0;
-                        }
-                        return acc;
-                      },
-                      { in: 0, out: 0 },
-                    );
-                    return t.in + t.out > 0 ? (
-                      <div className="trace-cost tag-lo">COST · {t.in} TOK IN · {t.out} TOK OUT</div>
-                    ) : null;
-                  })()}
-                  <ul className="step-list">
-                    {steps.map((s) => (
-                      <li key={s.id} className={`step st-${s.status}`}>
-                        <span className="step-dot" />
-                        <span className="step-node">
-                          {NODE_META[s.kind]?.glyph} {s.nodeId}
-                        </span>
-                        <span className="step-status">{STATUS_LABEL[s.status]}</span>
-                      </li>
-                    ))}
-                  </ul>
-                  {mission.output !== null && mission.output !== undefined && (
-                    <div className="mission-output">
-                      <span className="tag-lo">OUTPUT</span>
-                      <pre>{JSON.stringify(mission.output, null, 2)}</pre>
-                    </div>
-                  )}
-                  {mission.error && (
-                    <div className="mission-output err">
-                      <span className="tag-lo">ERROR</span>
-                      <pre>{mission.error}</pre>
-                    </div>
-                  )}
-                  {diagnosis && (
-                    <div className="mission-output">
-                      <span className="tag-lo">DIAGNOSIS</span>
-                      <pre>{diagnosis.summary}{diagnosis.diagnosis ? `\n\n${diagnosis.diagnosis}` : ""}</pre>
-                    </div>
-                  )}
-                </>
+                <TraceDossier
+                  mission={mission}
+                  steps={steps}
+                  timing={timingRef.current[mission.id] ?? {}}
+                  diagnosis={diagnosis}
+                />
               )}
             </>
           )}
         </aside>
       </div>
+
+      <SignalTicker entries={signals} total={rxTotal} connected={connected} sessionStart={sessionStart.current} />
+      <Palette open={paletteOpen} actions={paletteActions} onClose={() => setPaletteOpen(false)} />
     </div>
   );
 }
+
