@@ -8,10 +8,13 @@ import type { BusEvent } from "./api.js";
  * event type, subject id, wall-clock time.
  */
 
+/** Operator-facing events (vitals + audit summaries feed the WATCH, not the ticker). */
+export type OperationalEvent = Exclude<BusEvent, { type: "ops.vitals" } | { type: "audit.appended" }>;
+
 export interface SignalEntry {
   seq: number;
   at: number;
-  type: BusEvent["type"];
+  type: OperationalEvent["type"];
   label: string;
   tone: "default" | "accent" | "warn" | "danger" | "ok";
   /** Stable subject (mission/agent id) — anchors the radar bearing. */
@@ -20,8 +23,8 @@ export interface SignalEntry {
 
 let seq = 0;
 
-/** Map a bus event to a ticker/radar entry. */
-export function toSignal(e: BusEvent): SignalEntry {
+/** Map an operational bus event to a ticker/radar entry. */
+export function toSignal(e: OperationalEvent): SignalEntry {
   const at = Date.parse(e.at) || Date.now();
   const short = (id: string) => id.slice(0, 8);
   switch (e.type) {

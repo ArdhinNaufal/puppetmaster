@@ -205,7 +205,7 @@ const embedder = createEmbedder({
 // calls through this sink; a bus projector adds mission lifecycle + approval
 // requests; endpoints add approval decisions and auth/member actions.
 // Stage 5: llm.call entries also feed the usage ledger (cost/budgets).
-const baseAuditSink = createAuditSink(db);
+const baseAuditSink = createAuditSink(db, bus);
 const auditSink: typeof baseAuditSink = async (entry) => {
   await baseAuditSink(entry);
   if (entry.action === "llm.call" && entry.detail && typeof entry.detail === "object") {
@@ -1368,7 +1368,9 @@ app.post("/api/approvals/:id", async (req, reply) => {
 });
 
 // --- Live event stream -------------------------------------------------------
+let wsClients = 0;
 app.get("/api/events", { websocket: true }, (socket) => {
+  wsClients++;
   const unsubscribe = bus.subscribe((event) => {
     try {
       socket.send(JSON.stringify(event));
@@ -1376,8 +1378,66 @@ app.get("/api/events", { websocket: true }, (socket) => {
       /* socket closing */
     }
   });
-  socket.on("close", unsubscribe);
+  socket.on("close", () => {
+    wsClients--;
+    unsubscribe();
+  });
 });
+
+// --- Kernel vitals (docs/PROCESS-WATCH.md R-VITALS) ----------------------------
+// Real process measurements sampled every 2.5s: CPU% (cpuUsage delta), RSS/heap,
+// event-loop lag (timer drift), uptime, live sockets, mission status counts.
+// Published on the bus only while operators are connected; a short ring buffer
+// backs the REST endpoint so the watch paints history on entry.
+type Vitals = Extract<import("@puppetmaster/kernel").BusEvent, { type: "ops.vitals" }>;
+const vitalsHistory: Vitals[] = [];
+const VITALS_PERIOD_MS = 2500;
+let lastCpu = process.cpuUsage();
+let lastSampleAt = performance.now();
+const vitalsTimer = setInterval(() => {
+  void (async () => {
+    const now = performance.now();
+    const elapsedMs = now - lastSampleAt;
+    const lag = Math.max(0, elapsedMs - VITALS_PERIOD_MS);
+    const cpu = process.cpuUsage();
+    const cpuPct =
+      elapsedMs > 0 ? ((cpu.user - lastCpu.user + cpu.system - lastCpu.system) / 1000 / elapsedMs) * 100 : 0;
+    lastCpu = cpu;
+    lastSampleAt = now;
+    const mem = process.memoryUsage();
+    let running = 0;
+    let gated = 0;
+    let queued = 0;
+    try {
+      for (const m of await listMissions(db, workspaceId)) {
+        if (m.status === "running") running++;
+        else if (m.status === "awaiting_approval") gated++;
+        else if (m.status === "queued") queued++;
+      }
+    } catch {
+      /* counts are best-effort */
+    }
+    const sample: Vitals = {
+      type: "ops.vitals",
+      at: new Date().toISOString(),
+      cpuPct: Math.round(cpuPct * 10) / 10,
+      rssMb: Math.round(mem.rss / 1048576),
+      heapMb: Math.round(mem.heapUsed / 1048576),
+      loopLagMs: Math.round(lag * 10) / 10,
+      upSec: Math.round(process.uptime()),
+      wsClients,
+      running,
+      gated,
+      queued,
+    };
+    vitalsHistory.push(sample);
+    if (vitalsHistory.length > 120) vitalsHistory.shift();
+    if (wsClients > 0) await bus.publish(sample).catch(() => {});
+  })();
+}, VITALS_PERIOD_MS);
+vitalsTimer.unref?.();
+
+app.get("/api/ops/vitals", async () => ({ samples: vitalsHistory }));
 
 // --- Lifecycle ---------------------------------------------------------------
 async function shutdown() {

@@ -37,7 +37,41 @@ export type BusEvent =
   | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string }
   /** Streaming assistant text (Stage 6): progressive chunks of the reply
    *  being generated; the persisted agent.message follows when the turn ends. */
-  | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string };
+  | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string }
+  /** Kernel resource sample (docs/PROCESS-WATCH.md): published ~2.5s while
+   *  operators are connected. Real process measurements only. */
+  | {
+      type: "ops.vitals";
+      at: string;
+      cpuPct: number;
+      rssMb: number;
+      heapMb: number;
+      loopLagMs: number;
+      upSec: number;
+      wsClients: number;
+      running: number;
+      gated: number;
+      queued: number;
+    }
+  /** Safe summary of an audit append (llm.call / tool.call) for the live
+   *  process log. Carries identifiers and numbers only — never prompt text,
+   *  arguments, or results (full detail stays in the audit table). */
+  | {
+      type: "audit.appended";
+      at: string;
+      action: string;
+      actorKind: "user" | "agent" | "system";
+      actorLabel: string | null;
+      target: string | null;
+      missionId: string | null;
+      /** llm.call extras when present. */
+      model?: string;
+      inputTokens?: number;
+      outputTokens?: number;
+      latencyMs?: number;
+      /** tool.call extra when present. */
+      tier?: string;
+    };
 
 export interface EventBus {
   publish(event: BusEvent): Promise<void>;

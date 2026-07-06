@@ -7,9 +7,43 @@ import {
 } from "@puppetmaster/db";
 import type { AuditEntry, EventBus } from "@puppetmaster/kernel";
 
-/** Bind the kernel's AuditSink to the append-only audit_log table. */
-export function createAuditSink(db: Db): (entry: AuditEntry) => Promise<void> {
-  return (entry) => appendAudit(db, entry).then(() => {});
+/**
+ * Bind the kernel's AuditSink to the append-only audit_log table. When a bus
+ * is given, llm.call/tool.call appends are additionally broadcast as safe
+ * `audit.appended` summaries for the live PROCESS WATCH (docs/PROCESS-WATCH.md)
+ * — identifiers and numbers only, never prompts/args/results.
+ */
+export function createAuditSink(db: Db, bus?: EventBus): (entry: AuditEntry) => Promise<void> {
+  return async (entry) => {
+    await appendAudit(db, entry);
+    if (!bus || (entry.action !== "llm.call" && entry.action !== "tool.call")) return;
+    const detail = (entry.detail ?? {}) as {
+      usage?: { inputTokens?: number; outputTokens?: number };
+      servedBy?: string;
+      gated?: boolean;
+    };
+    try {
+      await bus.publish({
+        type: "audit.appended",
+        at: new Date().toISOString(),
+        action: entry.action,
+        actorKind: entry.actorKind,
+        actorLabel: entry.actorLabel ?? null,
+        target: entry.target ?? null,
+        missionId: entry.missionId ?? null,
+        ...(entry.action === "llm.call"
+          ? {
+              model: detail.servedBy ?? entry.target ?? undefined,
+              inputTokens: detail.usage?.inputTokens,
+              outputTokens: detail.usage?.outputTokens,
+            }
+          : {}),
+        ...(entry.action === "tool.call" && detail.gated ? { tier: "gated" } : {}),
+      });
+    } catch {
+      /* watch broadcast is best-effort */
+    }
+  };
 }
 
 interface MissionActor {

@@ -316,6 +316,11 @@ export interface NexusLayout {
   panes?: { task: string; x: number; y: number; ctx?: Record<string, unknown>; z?: number }[];
 }
 
+/** PROCESS WATCH strip state (docs/PROCESS-WATCH.md). */
+export interface WatchLayout {
+  open?: boolean;
+}
+
 const post = (url: string, body: unknown) =>
   fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
@@ -343,9 +348,9 @@ export const memberApi = {
 };
 
 export const prefsApi = {
-  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout } }>),
+  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout } }>),
   /** Merges the given keys over the saved layout (server stores the whole object). */
-  save: async (layout: { panels?: PanelLayout; nexus?: NexusLayout }) => {
+  save: async (layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout }) => {
     const current = await fetch("/api/me/preferences")
       .then(json<{ layout: Record<string, unknown> }>)
       .catch(() => ({ layout: {} as Record<string, unknown> }));
@@ -353,7 +358,7 @@ export const prefsApi = {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ layout: { ...current.layout, ...layout } }),
-    }).then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout } }>);
+    }).then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout } }>);
   },
 };
 
@@ -522,6 +527,36 @@ export const mcpApi = {
     fetch(`/api/mcp/registry?q=${encodeURIComponent(q)}`).then(json<{ servers: McpRegistryEntry[] }>),
 };
 
+/** Kernel resource sample (docs/PROCESS-WATCH.md R-VITALS). */
+export interface OpsVitals {
+  type: "ops.vitals";
+  at: string;
+  cpuPct: number;
+  rssMb: number;
+  heapMb: number;
+  loopLagMs: number;
+  upSec: number;
+  wsClients: number;
+  running: number;
+  gated: number;
+  queued: number;
+}
+
+/** Safe llm.call/tool.call summary for the live process log. */
+export interface AuditAppended {
+  type: "audit.appended";
+  at: string;
+  action: string;
+  actorKind: "user" | "agent" | "system";
+  actorLabel: string | null;
+  target: string | null;
+  missionId: string | null;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  tier?: string;
+}
+
 export type BusEvent =
   | { type: "mission.started"; missionId: string; agentId?: string; at: string }
   | { type: "agent.message"; agentId: string; missionId: string; role: string; text: string; at: string }
@@ -529,4 +564,10 @@ export type BusEvent =
   | { type: "mission.step"; missionId: string; nodeId: string; kind: NodeKind; status: StepStatus; at: string }
   | { type: "approval.requested"; missionId: string; nodeId: string; approvalId: string; prompt: string; at: string }
   | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string }
-  | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string };
+  | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string }
+  | OpsVitals
+  | AuditAppended;
+
+export const watchApi = {
+  vitals: () => fetch("/api/ops/vitals").then(json<{ samples: OpsVitals[] }>),
+};

@@ -6,6 +6,8 @@ import {
   authApi,
   prefsApi,
   suggestionApi,
+  watchApi,
+  type OpsVitals,
   type Agent,
   type Approval,
   type Me,
@@ -24,6 +26,7 @@ import { ROLE_RANK, TASKS } from "./nexus/registry.js";
 import { Palette, type PaletteAction } from "./Palette.js";
 import { SignalRadar, SignalTicker, toSignal, type SignalEntry } from "./Signal.js";
 import { TraceDossier, type StepTiming } from "./Trace.js";
+import { rowFromAudit, rowFromSignal, Watch, type ProcessRow } from "./Watch.js";
 import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
@@ -137,6 +140,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   // Signal instruments: every bus event is witnessed (ticker + radar).
   const [signals, setSignals] = useState<SignalEntry[]>([]);
   const [rxTotal, setRxTotal] = useState(0);
+  // PROCESS WATCH (docs/PROCESS-WATCH.md): kernel vitals ring + merged process log.
+  const [vitals, setVitals] = useState<OpsVitals[]>([]);
+  const [procRows, setProcRows] = useState<ProcessRow[]>([]);
+  const [watchOpen, setWatchOpen] = useState(false);
   const sessionStart = useRef(Date.now());
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [nexusSpawn, setNexusSpawn] = useState<{ task: string; ctx?: Record<string, unknown>; n: number } | null>(null);
@@ -196,11 +203,17 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           setPanelOrder(merged);
         }
         if (layout.panels?.collapsed) setCollapsed(layout.panels.collapsed);
+        if (layout.watch?.open !== undefined) setWatchOpen(layout.watch.open);
         prefsReady.current = true;
       })
       .catch(() => {
         prefsReady.current = true;
       });
+    // seed the vitals ring so the watch paints history immediately
+    watchApi
+      .vitals()
+      .then(({ samples }) => setVitals((v) => (v.length ? v : samples.slice(-120))))
+      .catch(() => {});
   }, [refreshWorkflows, refreshAgents, refreshApprovals, refreshSuggestions]);
 
   // Debounced save of the panel arrangement, once initial prefs have loaded.
@@ -212,9 +225,24 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     return () => clearTimeout(t);
   }, [panelOrder, collapsed]);
 
+  useEffect(() => {
+    if (!prefsReady.current) return;
+    prefsApi.save({ watch: { open: watchOpen } }).catch(() => {});
+  }, [watchOpen]);
+
   const { connected } = useEventStream(
     useCallback(
       (event) => {
+        // WATCH feeds: vitals heartbeat and audit summaries are process
+        // telemetry, not operator traffic — they bypass ticker/radar/RX.
+        if (event.type === "ops.vitals") {
+          setVitals((v) => [...v.slice(-119), event]);
+          return;
+        }
+        if (event.type === "audit.appended") {
+          setProcRows((r) => [rowFromAudit(event), ...r].slice(0, 200));
+          return;
+        }
         setRxTotal((n) => n + 1);
         // The dossier's gantt uses observed timing; streaming deltas are too
         // chatty for the ticker and are counted (RX) but not listed.
@@ -229,6 +257,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         if (event.type !== "agent.message.delta") {
           const entry = toSignal(event);
           setSignals((s) => [entry, ...s].slice(0, 60));
+          setProcRows((r) => [rowFromSignal(entry), ...r].slice(0, 200));
         }
 
         const active = trackedRef.current;
@@ -729,6 +758,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </aside>
       </div>
 
+      <Watch view={view} vitals={vitals} rows={procRows} open={watchOpen} onToggle={() => setWatchOpen((o) => !o)} />
       <SignalTicker entries={signals} total={rxTotal} connected={connected} sessionStart={sessionStart.current} />
       <Palette open={paletteOpen} actions={paletteActions} onClose={() => setPaletteOpen(false)} />
     </div>
