@@ -27,7 +27,7 @@ import type { MissionStatus } from "@puppetmaster/shared";
 import type { EventBus } from "./bridge.js";
 import type { AuditSink } from "./audit-sink.js";
 import { toVectorLiteral, type EmbeddingProvider } from "./embeddings.js";
-import { ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
+import { ModelFloorError, ModelRouter, type ChatMessage, type ChatToolDef } from "./model-router.js";
 import { rrfFuse } from "./kb.js";
 import { findMatchingPolicy, type ApprovalPolicyLike } from "./policy.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
@@ -274,6 +274,22 @@ export class AgentRuntime {
     const cursor = (mission.cursor ?? {}) as { pending?: PendingToolCall; iterations?: number };
     const resuming = mission.status === "awaiting_approval" && cursor.pending;
 
+    // Router-profile floor gate (Stage 9A): a tick paused because its profile
+    // could only answer below the gated-tools floor resumes here — approved
+    // means this mission may downgrade for the rest of the tick.
+    const floorCursor = cursor as typeof cursor & { floorApprovalId?: string; floorCleared?: boolean };
+    let allowDowngrade = Boolean(floorCursor.floorCleared);
+    if (!resuming && floorCursor.floorApprovalId && !floorCursor.floorCleared) {
+      const approval = await getApproval(this.db, floorCursor.floorApprovalId);
+      if (!approval || approval.status === "pending") return "awaiting_approval";
+      if (approval.status === "rejected") {
+        return this.finish(missionId, "failed", null, "model-class downgrade rejected by operator");
+      }
+      allowDowngrade = true;
+      floorCursor.floorCleared = true;
+      await updateMission(this.db, missionId, { cursor: { ...floorCursor } });
+    }
+
     // Stage 4: the task text + successful tool sequence feed the episodic and
     // procedural memories written when the tick succeeds.
     const taskMessage = ((mission.input ?? {}) as { message?: string }).message ?? "";
@@ -337,9 +353,10 @@ export class AgentRuntime {
         agentId: agent.id,
         at: now().toISOString(),
       });
-      // A direct-chat tick starts with the incoming user message.
+      // A direct-chat tick starts with the incoming user message — unless this
+      // is a floor-gate resume, where the message was appended before the gate.
       const input = mission.input as { message?: string } | null;
-      if (input?.message) {
+      if (input?.message && !floorCursor.floorApprovalId) {
         await appendAgentMessage(this.db, {
           agentId: agent.id,
           missionId,
@@ -451,6 +468,13 @@ export class AgentRuntime {
           })),
       ];
 
+      // Stage 9A: an agent that can reach write/destructive tools never
+      // silently downgrades below its profile's floor — the router throws
+      // ModelFloorError instead, converted below into an approval gate.
+      const hasGatedTools = this.tools
+        .list()
+        .some((t) => granted(t.server, t.tool) && t.tier !== "read_auto");
+
       const modelStep = await insertStep(this.db, {
         missionId,
         nodeId: `llm-${iterations}`,
@@ -472,6 +496,7 @@ export class AgentRuntime {
             messages,
             tools: toolDefs,
             maxTokens: 4096,
+            enforceGatedFloor: hasGatedTools && !allowDowngrade,
           },
           (delta) => {
             void Promise.resolve(
@@ -486,6 +511,46 @@ export class AgentRuntime {
           },
         );
       } catch (err) {
+        if (err instanceof ModelFloorError) {
+          // The profile refused to serve below its floor: pause for a human
+          // downgrade decision instead of silently substituting (9ROUTER §4).
+          const approval = await createApproval(this.db, {
+            missionId,
+            nodeId: "router-floor",
+            prompt:
+              `Router profile "${err.profileName}" for agent "${agent.name}" can only answer ` +
+              `below its "${err.floor}" floor right now (candidates: ${err.blocked.join(", ")}). ` +
+              `Serve this tick on a lower-class model?`,
+            tier: "write_approved",
+          });
+          await updateStep(this.db, modelStep.id, { status: "awaiting_approval", finishedAt: now() });
+          await updateMission(this.db, missionId, {
+            status: "awaiting_approval",
+            cursor: {
+              // Redo this iteration on resume — nothing was served.
+              iterations: iterations - 1,
+              floorApprovalId: approval.id,
+              ...(budgetCursor.budgetApprovalId
+                ? { budgetApprovalId: budgetCursor.budgetApprovalId, budgetCleared: budgetCursor.budgetCleared }
+                : {}),
+            },
+          });
+          await this.recordAudit({
+            ...auditActor,
+            action: "router.floor.gate",
+            target: agent.model,
+            detail: { profile: err.profileName, floor: err.floor, blocked: err.blocked },
+          });
+          await this.bus.publish({
+            type: "approval.requested",
+            missionId,
+            nodeId: "router-floor",
+            approvalId: approval.id,
+            prompt: approval.prompt,
+            at: now().toISOString(),
+          });
+          return "awaiting_approval";
+        }
         const msg = err instanceof Error ? err.message : String(err);
         await updateStep(this.db, modelStep.id, { status: "failed", error: msg, finishedAt: now() });
         return this.finish(missionId, "failed", null, msg);
@@ -507,6 +572,7 @@ export class AgentRuntime {
           ...(response.servedBy && response.servedBy !== agent.model
             ? { servedBy: response.servedBy }
             : {}),
+          ...(response.profile ? { profile: response.profile } : {}),
         },
       });
 

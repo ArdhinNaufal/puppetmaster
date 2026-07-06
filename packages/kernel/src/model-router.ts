@@ -29,6 +29,12 @@ export interface ChatRequest {
   messages: ChatMessage[];
   tools?: ChatToolDef[];
   maxTokens?: number;
+  /** Stage 9A: when true and `model` is a `profile:NAME` with a
+   *  minClassForGatedTools floor, candidates below the floor are excluded —
+   *  a chain that can only answer below the floor throws ModelFloorError
+   *  instead of silently downgrading. Set by the agent runtime for agents
+   *  holding write/destructive tools. */
+  enforceGatedFloor?: boolean;
 }
 
 export interface ChatUsage {
@@ -43,6 +49,55 @@ export interface ChatResponse {
   usage: ChatUsage;
   /** Which candidate of a fallback chain actually served the call (Stage 8). */
   servedBy?: string;
+  /** Router profile that resolved the chain, when `model` was `profile:NAME`. */
+  profile?: string;
+}
+
+// --- Router profiles (Stage 9A, docs/9ROUTER-ADOPTION.md) ---------------------------
+// The 9Router study's cost tiers, renamed for a platform that holds real API
+// keys ("subscription" OAuth harvesting was rejected outright): premium =
+// frontier API, cheap = budget API, local = Ollama/vLLM, free = mock/no-cost.
+
+export type CostClass = "premium" | "cheap" | "local" | "free";
+
+export const COST_CLASSES: CostClass[] = ["premium", "cheap", "local", "free"];
+
+const COST_CLASS_RANK: Record<CostClass, number> = { premium: 4, cheap: 3, local: 2, free: 1 };
+
+export interface RouterProfileCandidate {
+  model: string;
+  costClass: CostClass;
+}
+
+export interface RouterProfile {
+  name: string;
+  candidates: RouterProfileCandidate[];
+  /** Floor for callers with gated (write/destructive) tools; null = no floor. */
+  minClassForGatedTools: CostClass | null;
+}
+
+/** Looks up an enabled profile by name; null = unknown. Injected by the server
+ *  so the kernel stays storage-agnostic. */
+export type ProfileResolver = (name: string) => Promise<RouterProfile | null>;
+
+export const PROFILE_PREFIX = "profile:";
+
+/** Thrown instead of silently serving below a profile's gated-tools floor —
+ *  the agent runtime converts it into an approval gate (human decides the
+ *  downgrade), per the anti-silent-substitution stance in 9ROUTER-ADOPTION §4. */
+export class ModelFloorError extends Error {
+  constructor(
+    public readonly profileName: string,
+    public readonly floor: CostClass,
+    /** Candidates the floor excluded (still available if a human approves). */
+    public readonly blocked: string[],
+    detail: string,
+  ) {
+    super(
+      `profile "${profileName}" cannot serve at or above class "${floor}": ${detail}` +
+        (blocked.length > 0 ? ` (below-floor candidates: ${blocked.join(", ")})` : ""),
+    );
+  }
 }
 
 export type StreamDelta = (textDelta: string) => void;
@@ -312,14 +367,24 @@ export interface RouterConfig {
  * `|` — `"claude-sonnet-5|openai/gpt-5|mock"` tries each in order, recording
  * per-model failure counts (`failureStats()`); the response carries
  * `servedBy` so audits show which candidate answered.
+ *
+ * Router profiles (Stage 9A): `model: "profile:NAME"` resolves through the
+ * injected ProfileResolver to a named workspace chain; a profile floor plus
+ * `enforceGatedFloor` refuses to silently serve gated callers below the
+ * floor (ModelFloorError → approval gate upstream).
  */
 export class ModelRouter {
   private readonly config: RouterConfig;
   private readonly failures = new Map<string, number>();
+  private profileResolver: ProfileResolver | null = null;
   totalUsage: ChatUsage = { inputTokens: 0, outputTokens: 0 };
 
   constructor(config: RouterConfig = {}) {
     this.config = config;
+  }
+
+  setProfileResolver(resolver: ProfileResolver): void {
+    this.profileResolver = resolver;
   }
 
   /** Per-model failure counts across fallback attempts (reliability signal). */
@@ -332,16 +397,52 @@ export class ModelRouter {
     return parts.length > 0 ? parts : [model];
   }
 
-  private async withFallback(
+  /** Resolve the attempt list: a `profile:NAME` model becomes the profile's
+   *  chain (floor applied when the caller enforces it); anything else keeps
+   *  the Stage 8 `|`-chain semantics. */
+  private async resolveAttempts(
     model: string,
+    enforceGatedFloor: boolean,
+  ): Promise<{ attempts: string[]; profile?: RouterProfile }> {
+    if (!model.startsWith(PROFILE_PREFIX)) {
+      return { attempts: this.candidatesOf(model) };
+    }
+    const name = model.slice(PROFILE_PREFIX.length).trim();
+    const profile = this.profileResolver ? await this.profileResolver(name) : null;
+    if (!profile) throw new Error(`unknown router profile: "${name}"`);
+    if (profile.candidates.length === 0) {
+      throw new Error(`router profile "${name}" has no candidates`);
+    }
+    const floor = enforceGatedFloor ? profile.minClassForGatedTools : null;
+    if (!floor) return { attempts: profile.candidates.map((c) => c.model), profile };
+    const eligible = profile.candidates.filter(
+      (c) => (COST_CLASS_RANK[c.costClass] ?? 0) >= COST_CLASS_RANK[floor],
+    );
+    const blocked = profile.candidates
+      .filter((c) => (COST_CLASS_RANK[c.costClass] ?? 0) < COST_CLASS_RANK[floor])
+      .map((c) => c.model);
+    if (eligible.length === 0) {
+      throw new ModelFloorError(name, floor, blocked, "every candidate is below the floor");
+    }
+    // Keep the full profile alongside the floored attempt list so the
+    // exhausted-chain path below can still name the blocked candidates.
+    return { attempts: eligible.map((c) => c.model), profile };
+  }
+
+  private async withFallback(
+    req: { model: string; enforceGatedFloor?: boolean },
     run: (candidate: string) => Promise<ChatResponse>,
   ): Promise<ChatResponse> {
-    const candidates = this.candidatesOf(model);
+    const { attempts, profile } = await this.resolveAttempts(
+      req.model,
+      req.enforceGatedFloor ?? false,
+    );
     let lastErr: unknown = null;
-    for (const candidate of candidates) {
+    for (const candidate of attempts) {
       try {
         const res = await run(candidate);
         res.servedBy = candidate;
+        if (profile) res.profile = profile.name;
         this.totalUsage.inputTokens += res.usage.inputTokens;
         this.totalUsage.outputTokens += res.usage.outputTokens;
         return res;
@@ -350,9 +451,26 @@ export class ModelRouter {
         this.failures.set(candidate, (this.failures.get(candidate) ?? 0) + 1);
       }
     }
+    // A floored profile that exhausted its eligible candidates surfaces as a
+    // floor error when below-floor candidates remain — the caller may gate on
+    // a human downgrade decision instead of failing outright.
+    if (profile && (req.enforceGatedFloor ?? false) && profile.minClassForGatedTools) {
+      const floor = profile.minClassForGatedTools;
+      const blocked = profile.candidates
+        .filter((c) => (COST_CLASS_RANK[c.costClass] ?? 0) < COST_CLASS_RANK[floor])
+        .map((c) => c.model);
+      if (blocked.length > 0) {
+        throw new ModelFloorError(
+          profile.name,
+          floor,
+          blocked,
+          `all at-or-above-floor candidates failed (${attempts.join(", ")})`,
+        );
+      }
+    }
     throw lastErr instanceof Error
       ? lastErr
-      : new Error(`all model candidates failed: ${candidates.join(", ")}`);
+      : new Error(`all model candidates failed: ${attempts.join(", ")}`);
   }
 
   providerFor(model: string): ModelProvider {
@@ -375,7 +493,7 @@ export class ModelRouter {
   }
 
   async chat(req: ChatRequest): Promise<ChatResponse> {
-    return this.withFallback(req.model, (candidate) =>
+    return this.withFallback(req, (candidate) =>
       this.providerFor(candidate).chat({ ...req, model: candidate }),
     );
   }
@@ -386,7 +504,7 @@ export class ModelRouter {
    * UX contract (progressive `agent.message.delta` events) holds everywhere.
    */
   async chatStream(req: ChatRequest, onDelta: StreamDelta): Promise<ChatResponse> {
-    return this.withFallback(req.model, async (candidate) => {
+    return this.withFallback(req, async (candidate) => {
       const provider = this.providerFor(candidate);
       if (provider.chatStream) return provider.chatStream({ ...req, model: candidate }, onDelta);
       const res = await provider.chat({ ...req, model: candidate });

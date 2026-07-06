@@ -350,6 +350,30 @@ export const approvalPolicies = pgTable("approval_policies", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Router profiles (Stage 9A, 9ROUTER-ADOPTION.md): named workspace-level
+ *  fallback chains — `model: "profile:NAME"` resolves to the ordered
+ *  candidates at call time. Each candidate carries a cost class
+ *  (premium|cheap|local|free); `minClassForGatedTools` is the floor below
+ *  which an agent holding write/destructive tools never silently downgrades
+ *  (the tick gates on an approval instead). */
+export const routerProfiles = pgTable(
+  "router_profiles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    /** Ordered [{ model, costClass }] tried first-to-last. */
+    candidates: jsonb("candidates").notNull().default([]),
+    minClassForGatedTools: text("min_class_for_gated_tools"),
+    enabled: boolean("enabled").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqName: unique().on(t.workspaceId, t.name) }),
+);
+
 /** Eval harness results (Stage 5, G7): one row per suite run — per-task
  *  pass^k outcomes and trajectory verdicts, shown in the EVALS view. */
 export const evalRuns = pgTable("eval_runs", {
@@ -445,4 +469,5 @@ export const schema = {
   usageLedger,
   budgets,
   mcpServers,
+  routerProfiles,
 };

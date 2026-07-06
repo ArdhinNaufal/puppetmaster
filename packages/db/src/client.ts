@@ -301,6 +301,17 @@ const DDL: string[] = [
      monthly_token_limit integer NOT NULL,
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `CREATE TABLE IF NOT EXISTS router_profiles (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     name text NOT NULL,
+     description text NOT NULL DEFAULT '',
+     candidates jsonb NOT NULL DEFAULT '[]',
+     min_class_for_gated_tools text,
+     enabled boolean NOT NULL DEFAULT true,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (workspace_id, name)
+   )`,
   `CREATE TABLE IF NOT EXISTS mcp_servers (
      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
      workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,

@@ -8,12 +8,14 @@ import {
   mcpApi,
   memberApi,
   opsApi,
+  routerApi,
   templateApi,
   workspaceApi,
   type Agent,
   type AgentMemory,
   type AuditEntry,
   type Budget,
+  type CostClass,
   type EvalRun,
   type KbDocument,
   type KbSearchHit,
@@ -23,6 +25,7 @@ import {
   type MemoryHit,
   type Mission,
   type Role,
+  type RouterProfile,
   type Template,
   type UsageBreakdownRow,
   type Workflow,
@@ -908,7 +911,8 @@ export function KnowledgeView(props: { canBuild: boolean }) {
 /* ------------------------------------------------------------------- Evals */
 
 /** EVALS view (Stage 5): run the golden suite (pass^k, trajectory checks),
- *  browse past runs, and manage the cost ledger + monthly token budgets. */
+ *  browse past runs, and manage the cost ledger + monthly token budgets.
+ *  Stage 9A adds the router-profiles panel (named fallback chains). */
 export function EvalsView(props: { agents: Agent[] }) {
   const [runs, setRuns] = useState<EvalRun[]>([]);
   const [usage, setUsage] = useState<{ monthTokens: number; breakdown: UsageBreakdownRow[] } | null>(null);
@@ -916,13 +920,51 @@ export function EvalsView(props: { agents: Agent[] }) {
   const [running, setRunning] = useState(false);
   const [limit, setLimit] = useState("");
   const [budgetAgent, setBudgetAgent] = useState("");
+  const [profiles, setProfiles] = useState<RouterProfile[]>([]);
+  const [costClasses, setCostClasses] = useState<CostClass[]>(["premium", "cheap", "local", "free"]);
+  const [profName, setProfName] = useState("");
+  const [profChain, setProfChain] = useState("");
+  const [profFloor, setProfFloor] = useState("");
 
   const refresh = () => {
     opsApi.listEvals().then(setRuns).catch(() => {});
     opsApi.usage().then(setUsage).catch(() => {});
     opsApi.listBudgets().then(setBudgets).catch(() => {});
+    routerApi
+      .list()
+      .then((r) => {
+        setProfiles(r.profiles);
+        setCostClasses(r.costClasses);
+      })
+      .catch(() => {});
   };
   useEffect(refresh, []);
+
+  /** Chain syntax: `model@class | model@class` (class defaults to premium). */
+  const addProfile = () => {
+    const candidates = profChain
+      .split("|")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const [model, cls] = part.split("@").map((s) => s.trim());
+        return { model: model ?? "", costClass: (cls || "premium") as CostClass };
+      });
+    if (!profName.trim() || candidates.length === 0) return;
+    routerApi
+      .create({
+        name: profName.trim(),
+        candidates,
+        minClassForGatedTools: (profFloor || null) as CostClass | null,
+      })
+      .then(() => {
+        setProfName("");
+        setProfChain("");
+        setProfFloor("");
+        refresh();
+      })
+      .catch(() => {});
+  };
 
   const run = async () => {
     setRunning(true);
@@ -1027,6 +1069,58 @@ export function EvalsView(props: { agents: Agent[] }) {
               </li>
             ))}
             {budgets.length === 0 && <li className="dim pad">No budgets — ticks run ungated.</li>}
+          </ul>
+        </Panel>
+
+        <Panel title="ROUTER PROFILES (Stage 9A)" scroll>
+          <div className="pad" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input
+              className="text-input"
+              placeholder="name e.g. quality-first"
+              value={profName}
+              onChange={(e) => setProfName(e.target.value)}
+              style={{ width: 150 }}
+            />
+            <input
+              className="text-input"
+              placeholder="chain: claude-sonnet-5@premium | mock@free"
+              value={profChain}
+              onChange={(e) => setProfChain(e.target.value)}
+              style={{ flex: 1, minWidth: 220 }}
+            />
+            <select value={profFloor} onChange={(e) => setProfFloor(e.target.value)}>
+              <option value="">no floor</option>
+              {costClasses.map((c) => (
+                <option key={c} value={c}>floor: {c}</option>
+              ))}
+            </select>
+            <button className="chip" onClick={addProfile}>ADD PROFILE</button>
+          </div>
+          <ul className="tool-list">
+            {profiles.map((p) => (
+              <li key={p.id} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">profile:{p.name}{!p.enabled && " · DISABLED"}</span>
+                  <span className="tag-lo">
+                    {p.minClassForGatedTools ? `FLOOR ${p.minClassForGatedTools.toUpperCase()}` : "NO FLOOR"}
+                  </span>
+                </div>
+                <p className="tool-desc">
+                  {p.candidates.map((c) => `${c.model} (${c.costClass})`).join(" → ")}
+                  {" · "}
+                  <button className="chip tiny" onClick={() => routerApi.setEnabled(p.id, !p.enabled).then(refresh)}>
+                    {p.enabled ? "DISABLE" : "ENABLE"}
+                  </button>{" "}
+                  <button className="chip tiny" onClick={() => routerApi.remove(p.id).then(refresh)}>REMOVE</button>
+                </p>
+              </li>
+            ))}
+            {profiles.length === 0 && (
+              <li className="dim pad">
+                No profiles — agents use raw model strings. Set an agent's model to
+                {" "}profile:NAME to route through a profile.
+              </li>
+            )}
           </ul>
         </Panel>
       </div>

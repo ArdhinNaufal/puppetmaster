@@ -1,8 +1,8 @@
 # 9Router Concept Study — Adoption Analysis for Puppetmaster
 
-**Date:** 2026-07-06 · **Status:** analysis complete, staged plan awaiting owner go-ahead
-(one stage per explicit command, same loop as RESEARCH-ROADMAP.md: build green → e2e
-verify → docs → commit/push → owner review) · **Branch:** `claude/9router-platform-research-2q0bvz`
+**Date:** 2026-07-06 · **Status:** Stage 9A ✅ executed & e2e-verified; 9B/9C awaiting owner
+go-ahead (one stage per explicit command, same loop as RESEARCH-ROADMAP.md: build green →
+e2e verify → docs → commit/push → owner review) · **Branch:** `claude/9router-platform-research-2q0bvz`
 
 ---
 
@@ -95,15 +95,30 @@ existing router rather than replacing it.
 
 ## 5. Staged plan (execute only on explicit owner command, one stage per command)
 
-### Stage 9A — Router profiles ("combos, done right") · size S
+### Stage 9A — Router profiles ("combos, done right") · size S · ✅ EXECUTED 2026-07-06
 1. `router_profiles` table (workspace-scoped): name, description, ordered candidates
-   `[{model, costClass: subscription|cheap|free|local}]`, `minClassForGatedTools`.
+   `[{model, costClass}]`, `minClassForGatedTools`. Cost classes shipped as
+   **`premium|cheap|local|free`** — "subscription" was renamed `premium` because
+   Puppetmaster holds real API keys, not harvested OAuth sessions (§3 rejection).
 2. Agents/workflows may set `model: "profile:NAME"`; the router resolves the profile to its
    chain at call time (changing a profile re-routes every consumer, no per-agent edits).
-3. Admin CRUD `/api/router/profiles` (+ RBAC rule); PROFILES panel in the Tools/Admin view;
-   `servedBy` + profile id recorded in `llm.call` audit entries.
-4. Enforcement: if an agent holds write/destructive grants and the serving candidate is
-   below `minClassForGatedTools`, the tick pauses for approval instead of silently serving.
+   Unknown/disabled profiles fail loudly; profile candidates cannot nest profiles or chains.
+3. CRUD `/api/router/profiles` — mutations admin (RBAC rule), listing member-open so
+   builders can reference profiles by name; ROUTER PROFILES panel shipped in the EVALS
+   (ops) view. `llm.call` audit records `profile` + `servedBy`, and the usage ledger now
+   accrues cost to the **serving** candidate rather than the requested model string.
+4. Enforcement (implemented pre-call, stronger than the original wording): for agents that
+   can reach write/destructive tools, below-floor candidates are excluded from the attempt
+   list; if only below-floor candidates could answer, the router throws `ModelFloorError`
+   and the tick pauses behind a `router-floor` approval (audited `router.floor.gate`) —
+   approve = downgrade for that mission, reject = tick fails. Nothing is ever served first
+   and questioned later.
+
+   *Verified e2e (keyless, PGlite + inline runner + Playwright):* floored profile with a
+   failing premium candidate gates instead of silently serving mock; approve → tick succeeds
+   on mock with `profile`/`servedBy` audited; reject → tick fails; read-only-granted agent
+   bypasses the floor; member gets 403 on mutation; golden eval suite stays green (4/4
+   pass²); ROUTER PROFILES panel creates/renders profiles in the browser.
 
 ### Stage 9B — Health- & quota-aware routing · size S
 1. In-memory + persisted provider health map: consecutive failures / 429s / quota errors →

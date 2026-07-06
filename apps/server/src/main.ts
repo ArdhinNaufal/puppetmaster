@@ -8,9 +8,15 @@ import {
   createApproval,
   createBudget,
   createMcpServer,
+  createRouterProfile,
   deleteMcpServer,
+  deleteRouterProfile,
   getMcpServer,
+  getRouterProfile,
+  getRouterProfileByName,
   listMcpServers,
+  listRouterProfiles,
+  updateRouterProfile,
   deleteBudget,
   createAgent,
   createDb,
@@ -92,6 +98,8 @@ import {
   startAgentTick,
   startWorkflow,
   WorkflowExecutor,
+  COST_CLASSES,
+  type CostClass,
   type EventBus,
   type McpConnection,
   type McpServerConfig,
@@ -142,6 +150,20 @@ const router = new ModelRouter({
   openaiApiKey: process.env.OPENAI_API_KEY,
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL,
 });
+// Router profiles (Stage 9A): `model: "profile:NAME"` resolves to a named
+// workspace chain at call time — editing the profile re-routes every consumer.
+router.setProfileResolver(async (name) => {
+  const row = await getRouterProfileByName(db, workspaceId, name);
+  if (!row) return null;
+  return {
+    name: row.name,
+    candidates: (Array.isArray(row.candidates) ? row.candidates : []) as {
+      model: string;
+      costClass: CostClass;
+    }[],
+    minClassForGatedTools: (row.minClassForGatedTools as CostClass | null) ?? null,
+  };
+});
 // RAG: embed agent memories into pgvector for semantic recall (PRD §5). Defaults
 // to the keyless mock embedder so the pipeline is live in dev; set
 // EMBEDDING_PROVIDER=openai (+ key) for a real model, or =none for keyword-only.
@@ -159,13 +181,19 @@ const baseAuditSink = createAuditSink(db);
 const auditSink: typeof baseAuditSink = async (entry) => {
   await baseAuditSink(entry);
   if (entry.action === "llm.call" && entry.detail && typeof entry.detail === "object") {
-    const usage = (entry.detail as { usage?: { inputTokens?: number; outputTokens?: number } }).usage;
+    const detail = entry.detail as {
+      usage?: { inputTokens?: number; outputTokens?: number };
+      servedBy?: string;
+    };
+    const usage = detail.usage;
     if (usage) {
       recordUsage(db, {
         workspaceId: entry.workspaceId,
         agentId: entry.actorKind === "agent" ? entry.actorId : null,
         missionId: entry.missionId ?? null,
-        model: entry.target ?? "",
+        // Cost accrues to the model that actually answered (Stage 9A: a
+        // profile/fallback chain may be served by any of its candidates).
+        model: detail.servedBy ?? entry.target ?? "",
         inputTokens: usage.inputTokens ?? 0,
         outputTokens: usage.outputTokens ?? 0,
       }).catch(() => {});
@@ -958,6 +986,104 @@ app.get("/api/usage", async () => {
       agentName: r.agentId ? (names.get(r.agentId) ?? null) : null,
     })),
   };
+});
+
+// --- Router profiles (Stage 9A, docs/9ROUTER-ADOPTION.md) -----------------------
+// Listing is member-open (builders reference profiles as `profile:NAME` in the
+// agent model field); mutations are admin (RBAC rule in auth.ts).
+app.get("/api/router/profiles", async () => ({
+  costClasses: COST_CLASSES,
+  profiles: await listRouterProfiles(db, workspaceId),
+}));
+
+app.post("/api/router/profiles", async (req, reply) => {
+  const body = (req.body ?? {}) as {
+    name?: string;
+    description?: string;
+    candidates?: { model?: string; costClass?: string }[];
+    minClassForGatedTools?: string | null;
+  };
+  if (!body.name?.trim() || !/^[\w-]{1,64}$/.test(body.name.trim())) {
+    return reply.code(400).send({ error: "name is required (1-64 chars of [A-Za-z0-9_-])" });
+  }
+  const candidates: { model: string; costClass: string }[] = [];
+  for (const c of Array.isArray(body.candidates) ? body.candidates : []) {
+    if (!c?.model?.trim()) return reply.code(400).send({ error: "every candidate needs a model" });
+    if (c.model.includes("|") || c.model.trim().startsWith("profile:")) {
+      return reply.code(400).send({ error: "candidates are single models (no chains or nested profiles)" });
+    }
+    const costClass = c.costClass ?? "premium";
+    if (!COST_CLASSES.includes(costClass as CostClass)) {
+      return reply.code(400).send({ error: `costClass must be one of ${COST_CLASSES.join(", ")}` });
+    }
+    candidates.push({ model: c.model.trim(), costClass });
+  }
+  if (candidates.length === 0) return reply.code(400).send({ error: "at least one candidate is required" });
+  const minClass = body.minClassForGatedTools ?? null;
+  if (minClass !== null && !COST_CLASSES.includes(minClass as CostClass)) {
+    return reply.code(400).send({ error: `minClassForGatedTools must be null or one of ${COST_CLASSES.join(", ")}` });
+  }
+  const existing = await getRouterProfileByName(db, workspaceId, body.name.trim());
+  if (existing) return reply.code(409).send({ error: `profile "${body.name.trim()}" already exists` });
+  const row = await createRouterProfile(db, {
+    workspaceId,
+    name: body.name.trim(),
+    description: body.description ?? "",
+    candidates,
+    minClassForGatedTools: minClass,
+  });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "router.profile.create",
+    target: row.name,
+    detail: { profileId: row.id, candidates, minClassForGatedTools: minClass },
+  });
+  return reply.code(201).send(row);
+});
+
+app.put("/api/router/profiles/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const existing = await getRouterProfile(db, id);
+  if (!existing || existing.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "profile not found" });
+  }
+  const body = (req.body ?? {}) as { enabled?: boolean };
+  if (typeof body.enabled !== "boolean") {
+    return reply.code(400).send({ error: "enabled (boolean) is required" });
+  }
+  await updateRouterProfile(db, id, { enabled: body.enabled });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "router.profile.update",
+    target: existing.name,
+    detail: { profileId: id, enabled: body.enabled },
+  });
+  return { ...existing, enabled: body.enabled };
+});
+
+app.delete("/api/router/profiles/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const existing = await getRouterProfile(db, id);
+  if (!existing || existing.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "profile not found" });
+  }
+  await deleteRouterProfile(db, id);
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "router.profile.delete",
+    target: existing.name,
+    detail: { profileId: id },
+  });
+  return reply.code(204).send();
 });
 
 app.get("/api/budgets", async () => listBudgets(db, workspaceId));

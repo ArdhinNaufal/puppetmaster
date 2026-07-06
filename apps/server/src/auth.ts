@@ -91,6 +91,9 @@ const POLICY: PolicyRule[] = [
   { methods: ["GET", "POST"], path: /^\/api\/evals(\/|$)/, role: "admin" },
   { methods: ["GET"], path: /^\/api\/usage$/, role: "admin" },
   { methods: ["GET", "POST", "DELETE"], path: /^\/api\/budgets(\/|$)/, role: "admin" },
+  // Stage 9A: router profiles — listing stays member-open (profiles are
+  // referenced by name when authoring agents); changing routing is admin.
+  { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/router(\/|$)/, role: "admin" },
   // Templates: browsing is open (member); instantiate/publish/delete are builder+.
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/templates(\/|$)/, role: "builder" },
   // Agent CRUD is builder-tier, but chatting with an agent is core member UX.

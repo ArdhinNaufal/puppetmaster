@@ -410,6 +410,40 @@ export interface Budget {
   createdAt: string;
 }
 
+// --- Router profiles (Stage 9A) -----------------------------------------------
+
+export type CostClass = "premium" | "cheap" | "local" | "free";
+
+export interface RouterProfile {
+  id: string;
+  name: string;
+  description: string;
+  candidates: { model: string; costClass: CostClass }[];
+  minClassForGatedTools: CostClass | null;
+  enabled: boolean;
+  createdAt: string;
+}
+
+export const routerApi = {
+  list: () =>
+    fetch("/api/router/profiles").then(
+      json<{ costClasses: CostClass[]; profiles: RouterProfile[] }>,
+    ),
+  create: (input: {
+    name: string;
+    description?: string;
+    candidates: { model: string; costClass: CostClass }[];
+    minClassForGatedTools?: CostClass | null;
+  }) => post("/api/router/profiles", input).then(json<RouterProfile>),
+  setEnabled: (id: string, enabled: boolean) =>
+    fetch(`/api/router/profiles/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }).then(json<RouterProfile>),
+  remove: (id: string) => fetch(`/api/router/profiles/${id}`, { method: "DELETE" }),
+};
+
 export const opsApi = {
   listEvals: () => fetch("/api/evals").then(json<EvalRun[]>),
   runEvals: (k = 3) => post("/api/evals/run", { k }).then(json<EvalRun>),

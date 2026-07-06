@@ -102,6 +102,16 @@
   (`"claude-sonnet-5|openai/gpt-5|mock"`); candidates are tried in order, per-model failure
   counts are exposed at `GET /api/usage` (`routerFailures`), and llm.call audit entries record
   `servedBy` when a fallback answered. Streaming (Stage 6) rides the same chain.
+- **Router profiles (Stage 9A, docs/9ROUTER-ADOPTION.md)**: named workspace-level chains in
+  `router_profiles` — `model: "profile:NAME"` resolves at call time to ordered candidates
+  `[{model, costClass}]` (classes `premium|cheap|local|free`), so editing a profile re-routes
+  every consumer. `minClassForGatedTools` is an anti-silent-substitution floor: for agents
+  that can reach write/destructive tools, below-floor candidates are excluded, and a chain
+  that can only answer below the floor pauses the tick behind a `router-floor` approval
+  (audited as `router.floor.gate`; rejection fails the tick, approval permits the downgrade
+  for that mission). llm.call audit records `profile` + `servedBy`; the usage ledger accrues
+  cost to the serving candidate. REST: `GET /api/router/profiles` (member; builders reference
+  profiles by name), mutations admin; ROUTER PROFILES panel in the EVALS view.
 
 ### 3.6 Policy & Approval Engine
 - Autonomy tiers per agent: **read = auto, write = approval, destructive = always confirm** (defaults; configurable per tool/action).
