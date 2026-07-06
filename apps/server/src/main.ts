@@ -144,11 +144,39 @@ const workspaceId = await ensureDefaultWorkspace(db);
 
 const tools = new BuiltinToolRegistry();
 const bus: EventBus = REDIS_URL ? new RedisEventBus(REDIS_URL) : new InMemoryEventBus();
+const healthEnv = (name: string): number | undefined => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+};
 const router = new ModelRouter({
   anthropicApiKey: process.env.ANTHROPIC_API_KEY,
   openaiBaseUrl: process.env.OPENAI_BASE_URL,
   openaiApiKey: process.env.OPENAI_API_KEY,
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL,
+  // Candidate health/cooldowns (Stage 9B); all optional env overrides.
+  health: {
+    failureThreshold: healthEnv("ROUTER_FAILURE_THRESHOLD"),
+    baseCooldownMs: healthEnv("ROUTER_COOLDOWN_MS"),
+    quotaCooldownMs: healthEnv("ROUTER_QUOTA_COOLDOWN_MS"),
+    maxCooldownMs: healthEnv("ROUTER_COOLDOWN_MAX_MS"),
+  },
+});
+// Cooldown transitions land in the audit trail so route-arounds are visible
+// (`router.cooldown`, system actor) — one entry per transition, not per failure.
+router.setCooldownSink((e) => {
+  appendAudit(db, {
+    workspaceId,
+    actorKind: "system",
+    actorLabel: "model-router",
+    action: "router.cooldown",
+    target: e.model,
+    detail: {
+      reason: e.reason,
+      consecutiveFailures: e.consecutiveFailures,
+      cooldownUntil: e.cooldownUntil,
+      error: e.error,
+    },
+  }).catch(() => {});
 });
 // Router profiles (Stage 9A): `model: "profile:NAME"` resolves to a named
 // workspace chain at call time — editing the profile re-routes every consumer.
@@ -978,6 +1006,8 @@ app.get("/api/usage", async () => {
   return {
     monthTokens: total,
     routerFailures,
+    // Stage 9B: candidate health (cooling/healthy, cooldown expiry, last error).
+    routerHealth: router.healthStats(),
     breakdown: rows.map((r) => ({
       ...r,
       inputTokens: Number(r.inputTokens),

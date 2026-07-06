@@ -1,8 +1,8 @@
 # 9Router Concept Study — Adoption Analysis for Puppetmaster
 
-**Date:** 2026-07-06 · **Status:** Stage 9A ✅ executed & e2e-verified; 9B/9C awaiting owner
-go-ahead (one stage per explicit command, same loop as RESEARCH-ROADMAP.md: build green →
-e2e verify → docs → commit/push → owner review) · **Branch:** `claude/9router-platform-research-2q0bvz`
+**Date:** 2026-07-06 · **Status:** Stages 9A ✅ + 9B ✅ executed & e2e-verified; 9C awaiting
+owner go-ahead (one stage per explicit command, same loop as RESEARCH-ROADMAP.md: build
+green → e2e verify → docs → commit/push → owner review) · **Branch:** `claude/9router-platform-research-2q0bvz`
 
 ---
 
@@ -120,14 +120,31 @@ existing router rather than replacing it.
    bypasses the floor; member gets 403 on mutation; golden eval suite stays green (4/4
    pass²); ROUTER PROFILES panel creates/renders profiles in the browser.
 
-### Stage 9B — Health- & quota-aware routing · size S
-1. In-memory + persisted provider health map: consecutive failures / 429s / quota errors →
-   `cooldownUntil` per candidate (quota errors parse retry-after when present).
-2. Chain resolution skips cooling candidates (half-open: one probe after expiry); an
-   all-cooling chain degrades to plain ordered attempts (never fail-closed).
-3. `GET /api/usage` gains `routerHealth` (state, cooldownUntil, lastError per candidate);
-   usage view renders it next to the existing `routerFailures`.
-4. Audit `router.cooldown` events so route-arounds are visible in the trail.
+### Stage 9B — Health- & quota-aware routing · size S · ✅ EXECUTED 2026-07-06
+1. Per-candidate health map with `cooldownUntil`: a quota/429 error cools immediately
+   (retry-after parsed from the error when present, capped at `ROUTER_COOLDOWN_MAX_MS`);
+   other errors cool after `ROUTER_FAILURE_THRESHOLD` consecutive failures for
+   `ROUTER_COOLDOWN_MS`, doubling per repeat cycle. **In-memory only** (deviation from the
+   original "persisted" wording): cooldowns are seconds-scale, so persisting them would
+   outlive their usefulness across any realistic restart.
+2. Chain resolution **deprioritizes** cooling candidates rather than removing them —
+   healthy first, cooling as last resort — which subsumes both "skip" and "never
+   fail-closed" in one rule. Expiry is the half-open probe: the failure counter survives,
+   so a failed probe re-arms the (doubled) cooldown on the very next miss.
+3. `GET /api/usage` gains `routerHealth`; the EVALS view gained a ROUTER HEALTH panel
+   (state, cooldown expiry, total + consecutive failures, last error) beside the ledger.
+4. Cooling **transitions** (not every failure) are audited as `router.cooldown` with
+   reason `quota|failures`, count, expiry, and the triggering error.
+
+   *Verified e2e (keyless, threshold=2 + 8s cooldown env overrides, a stub 429 endpoint
+   as OPENAI_BASE_URL, dead `ollama/phantom` as the failure path):* 2 consecutive failures
+   cool the candidate (audited); a chat inside the window skips it entirely
+   (`routerFailures` stays flat) and serves on the healthy fallback; the post-expiry probe
+   fails and re-cools at once (audited again, doubled window); one 429 cools immediately
+   with reason `quota` and the 6s retry-after hint honoured; a raw single-candidate chain
+   is still attempted while cooling (mission fails with the provider error — never
+   fail-closed); golden eval suite stays green (4/4 pass²); ROUTER HEALTH panel renders
+   both candidates in the browser.
 
 ### Stage 9C — Tool-output compaction (RTK, with provenance) · size M
 1. Deterministic compactors in the kernel (no model calls): whitespace/blank-run collapse,

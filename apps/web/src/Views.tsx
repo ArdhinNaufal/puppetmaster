@@ -27,7 +27,7 @@ import {
   type Role,
   type RouterProfile,
   type Template,
-  type UsageBreakdownRow,
+  type UsageReport,
   type Workflow,
   type Workspace,
 } from "./api.js";
@@ -915,7 +915,7 @@ export function KnowledgeView(props: { canBuild: boolean }) {
  *  Stage 9A adds the router-profiles panel (named fallback chains). */
 export function EvalsView(props: { agents: Agent[] }) {
   const [runs, setRuns] = useState<EvalRun[]>([]);
-  const [usage, setUsage] = useState<{ monthTokens: number; breakdown: UsageBreakdownRow[] } | null>(null);
+  const [usage, setUsage] = useState<UsageReport | null>(null);
   const [budgets, setBudgets] = useState<Budget[]>([]);
   const [running, setRunning] = useState(false);
   const [limit, setLimit] = useState("");
@@ -1119,6 +1119,35 @@ export function EvalsView(props: { agents: Agent[] }) {
               <li className="dim pad">
                 No profiles — agents use raw model strings. Set an agent's model to
                 {" "}profile:NAME to route through a profile.
+              </li>
+            )}
+          </ul>
+        </Panel>
+
+        <Panel title="ROUTER HEALTH (Stage 9B)" scroll
+          actions={<Chip tiny onClick={refresh}>REFRESH</Chip>}>
+          <ul className="tool-list">
+            {Object.entries(usage?.routerHealth ?? {}).map(([model, h]) => (
+              <li key={model} className="tool-row">
+                <div className="tool-row-head">
+                  <span className="tool-name">{model}</span>
+                  <span className="tag-lo">
+                    {h.state === "cooling"
+                      ? `COOLING · until ${new Date(h.cooldownUntil!).toLocaleTimeString()}`
+                      : "HEALTHY"}
+                  </span>
+                </div>
+                <p className="tool-desc">
+                  {usage?.routerFailures[model] ?? 0} total failures
+                  {h.consecutiveFailures > 0 && ` · ${h.consecutiveFailures} consecutive`}
+                  {h.lastError && ` · last: ${h.lastError.slice(0, 90)}`}
+                </p>
+              </li>
+            ))}
+            {Object.keys(usage?.routerHealth ?? {}).length === 0 && (
+              <li className="dim pad">
+                No failures observed — every candidate is healthy. Cooling candidates are
+                deprioritized (tried last), never removed.
               </li>
             )}
           </ul>

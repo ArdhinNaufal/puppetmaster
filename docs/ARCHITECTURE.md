@@ -112,6 +112,17 @@
   for that mission). llm.call audit records `profile` + `servedBy`; the usage ledger accrues
   cost to the serving candidate. REST: `GET /api/router/profiles` (member; builders reference
   profiles by name), mutations admin; ROUTER PROFILES panel in the EVALS view.
+- **Health-aware routing (Stage 9B)**: an in-memory per-candidate health map — a quota/429
+  error (retry-after honoured, capped) cools a candidate immediately; other errors cool it
+  after `ROUTER_FAILURE_THRESHOLD` consecutive failures (default 3) for
+  `ROUTER_COOLDOWN_MS` (default 30s, doubling per repeat cycle up to
+  `ROUTER_COOLDOWN_MAX_MS`, default 120s). Cooling candidates are **deprioritized, never
+  removed**: healthy candidates are tried first, cooling ones remain as last resort, so a
+  chain never fails closed on stale health state. Cooldown expiry is the half-open probe
+  (the failure counter survives expiry, so one more miss re-arms at once). Transitions are
+  audited as `router.cooldown`; `GET /api/usage` exposes `routerHealth`
+  (state/cooldownUntil/lastError per candidate) rendered in the EVALS view's ROUTER HEALTH
+  panel next to `routerFailures`.
 
 ### 3.6 Policy & Approval Engine
 - Autonomy tiers per agent: **read = auto, write = approval, destructive = always confirm** (defaults; configurable per tool/action).

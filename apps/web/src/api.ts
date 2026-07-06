@@ -444,10 +444,25 @@ export const routerApi = {
   remove: (id: string) => fetch(`/api/router/profiles/${id}`, { method: "DELETE" }),
 };
 
+/** Candidate health from the model router (Stage 9B). */
+export interface RouterCandidateHealth {
+  state: "healthy" | "cooling";
+  consecutiveFailures: number;
+  cooldownUntil: string | null;
+  lastError: string | null;
+}
+
+export interface UsageReport {
+  monthTokens: number;
+  breakdown: UsageBreakdownRow[];
+  routerFailures: Record<string, number>;
+  routerHealth: Record<string, RouterCandidateHealth>;
+}
+
 export const opsApi = {
   listEvals: () => fetch("/api/evals").then(json<EvalRun[]>),
   runEvals: (k = 3) => post("/api/evals/run", { k }).then(json<EvalRun>),
-  usage: () => fetch("/api/usage").then(json<{ monthTokens: number; breakdown: UsageBreakdownRow[] }>),
+  usage: () => fetch("/api/usage").then(json<UsageReport>),
   listBudgets: () => fetch("/api/budgets").then(json<Budget[]>),
   createBudget: (input: { agentId?: string | null; monthlyTokenLimit: number }) =>
     post("/api/budgets", input).then(json<Budget>),

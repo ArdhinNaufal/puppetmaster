@@ -358,6 +358,66 @@ export interface RouterConfig {
   openaiBaseUrl?: string;
   openaiApiKey?: string;
   ollamaBaseUrl?: string;
+  /** Stage 9B health/cooldown tuning; unset fields use the defaults below. */
+  health?: Partial<RouterHealthConfig>;
+}
+
+// --- Candidate health & cooldowns (Stage 9B, docs/9ROUTER-ADOPTION.md) --------------
+// In-memory only: cooldowns are seconds-scale, so persisting them across a
+// restart would outlive their own usefulness.
+
+export interface RouterHealthConfig {
+  /** Consecutive failures before a candidate cools down. */
+  failureThreshold: number;
+  /** Cooldown after crossing the threshold; doubles per repeat cycle. */
+  baseCooldownMs: number;
+  /** Cooldown after a quota/rate-limit error (429), used when no retry-after. */
+  quotaCooldownMs: number;
+  /** Upper bound for any cooldown, including provider retry-after hints. */
+  maxCooldownMs: number;
+}
+
+const HEALTH_DEFAULTS: RouterHealthConfig = {
+  failureThreshold: 3,
+  baseCooldownMs: 30_000,
+  quotaCooldownMs: 60_000,
+  maxCooldownMs: 120_000,
+};
+
+export interface CandidateHealth {
+  state: "healthy" | "cooling";
+  consecutiveFailures: number;
+  /** ISO timestamp the cooldown expires (half-open probe afterwards); null = none. */
+  cooldownUntil: string | null;
+  lastError: string | null;
+}
+
+/** Emitted when a candidate transitions into cooldown — the server audits
+ *  these as `router.cooldown` so route-arounds are visible in the trail. */
+export interface RouterCooldownEvent {
+  model: string;
+  reason: "failures" | "quota";
+  consecutiveFailures: number;
+  cooldownUntil: string;
+  error: string;
+}
+
+interface HealthEntry {
+  consecutiveFailures: number;
+  cooldownUntil: number | null;
+  coolCycles: number;
+  lastError: string | null;
+}
+
+/** Quota/rate-limit classification: HTTP 429 or quota-ish wording. */
+function isQuotaError(msg: string): boolean {
+  return /\b429\b|rate.?limit|quota|too many requests/i.test(msg);
+}
+
+/** Provider retry-after hint, in ms — `retry-after: 17` / `retry after 17s`. */
+function retryAfterMs(msg: string): number | null {
+  const m = msg.match(/retry[-_ ]?after[:\s"]*(\d+)/i);
+  return m ? Number(m[1]) * 1000 : null;
 }
 
 /**
@@ -376,20 +436,110 @@ export interface RouterConfig {
 export class ModelRouter {
   private readonly config: RouterConfig;
   private readonly failures = new Map<string, number>();
+  private readonly healthCfg: RouterHealthConfig;
+  private readonly health = new Map<string, HealthEntry>();
   private profileResolver: ProfileResolver | null = null;
+  private cooldownSink: ((e: RouterCooldownEvent) => void) | null = null;
   totalUsage: ChatUsage = { inputTokens: 0, outputTokens: 0 };
 
   constructor(config: RouterConfig = {}) {
     this.config = config;
+    // Only positive finite overrides apply — undefined env values must not
+    // clobber the defaults through the spread.
+    this.healthCfg = { ...HEALTH_DEFAULTS };
+    for (const key of Object.keys(HEALTH_DEFAULTS) as (keyof RouterHealthConfig)[]) {
+      const v = config.health?.[key];
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) this.healthCfg[key] = v;
+    }
   }
 
   setProfileResolver(resolver: ProfileResolver): void {
     this.profileResolver = resolver;
   }
 
+  /** Cooldown transitions are pushed here (Stage 9B) — the server audits them. */
+  setCooldownSink(sink: (e: RouterCooldownEvent) => void): void {
+    this.cooldownSink = sink;
+  }
+
   /** Per-model failure counts across fallback attempts (reliability signal). */
   failureStats(): Record<string, number> {
     return Object.fromEntries(this.failures);
+  }
+
+  /** Health snapshot for GET /api/usage: state, cooldown expiry, last error. */
+  healthStats(): Record<string, CandidateHealth> {
+    const out: Record<string, CandidateHealth> = {};
+    const nowMs = Date.now();
+    for (const [model, h] of this.health) {
+      out[model] = {
+        state: h.cooldownUntil !== null && nowMs < h.cooldownUntil ? "cooling" : "healthy",
+        consecutiveFailures: h.consecutiveFailures,
+        cooldownUntil:
+          h.cooldownUntil !== null && nowMs < h.cooldownUntil
+            ? new Date(h.cooldownUntil).toISOString()
+            : null,
+        lastError: h.lastError,
+      };
+    }
+    return out;
+  }
+
+  private isCooling(model: string): boolean {
+    const h = this.health.get(model);
+    return h !== undefined && h.cooldownUntil !== null && Date.now() < h.cooldownUntil;
+  }
+
+  private recordSuccess(model: string): void {
+    const h = this.health.get(model);
+    if (!h) return;
+    h.consecutiveFailures = 0;
+    h.cooldownUntil = null;
+    h.coolCycles = 0;
+    h.lastError = null;
+  }
+
+  /** Failure bookkeeping: quota errors cool immediately (retry-after honoured,
+   *  capped); other errors cool after `failureThreshold` consecutive misses,
+   *  doubling per repeat cycle up to `maxCooldownMs`. Expiry is the half-open
+   *  probe — the counter is NOT reset, so one more failure re-arms at once. */
+  private recordFailure(model: string, err: unknown): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    const h: HealthEntry = this.health.get(model) ?? {
+      consecutiveFailures: 0,
+      cooldownUntil: null,
+      coolCycles: 0,
+      lastError: null,
+    };
+    h.consecutiveFailures++;
+    h.lastError = msg.slice(0, 300);
+    const wasCooling = h.cooldownUntil !== null && Date.now() < h.cooldownUntil;
+
+    const quota = isQuotaError(msg);
+    let cooldownMs: number | null = null;
+    if (quota) {
+      cooldownMs = Math.min(retryAfterMs(msg) ?? this.healthCfg.quotaCooldownMs, this.healthCfg.maxCooldownMs);
+    } else if (h.consecutiveFailures >= this.healthCfg.failureThreshold) {
+      cooldownMs = Math.min(
+        this.healthCfg.baseCooldownMs * 2 ** h.coolCycles,
+        this.healthCfg.maxCooldownMs,
+      );
+    }
+    if (cooldownMs !== null) {
+      h.cooldownUntil = Date.now() + cooldownMs;
+      h.coolCycles = Math.min(h.coolCycles + 1, 8);
+      // Audit only the transition into cooling, not every failure inside it.
+      if (!wasCooling) {
+        this.cooldownSink?.({
+          model,
+          reason: quota ? "quota" : "failures",
+          consecutiveFailures: h.consecutiveFailures,
+          cooldownUntil: new Date(h.cooldownUntil).toISOString(),
+          error: h.lastError,
+        });
+      }
+    }
+    this.health.set(model, h);
   }
 
   private candidatesOf(model: string): string[] {
@@ -437,18 +587,27 @@ export class ModelRouter {
       req.model,
       req.enforceGatedFloor ?? false,
     );
+    // Health-aware ordering (Stage 9B): cooling candidates are deprioritized,
+    // not removed — healthy ones are tried first, cooling ones remain as the
+    // last resort so the chain never fails closed on stale health state.
+    const healthy = attempts.filter((c) => !this.isCooling(c));
+    const ordered = healthy.length === attempts.length || healthy.length === 0
+      ? attempts
+      : [...healthy, ...attempts.filter((c) => this.isCooling(c))];
     let lastErr: unknown = null;
-    for (const candidate of attempts) {
+    for (const candidate of ordered) {
       try {
         const res = await run(candidate);
         res.servedBy = candidate;
         if (profile) res.profile = profile.name;
+        this.recordSuccess(candidate);
         this.totalUsage.inputTokens += res.usage.inputTokens;
         this.totalUsage.outputTokens += res.usage.outputTokens;
         return res;
       } catch (err) {
         lastErr = err;
         this.failures.set(candidate, (this.failures.get(candidate) ?? 0) + 1);
+        this.recordFailure(candidate, err);
       }
     }
     // A floored profile that exhausted its eligible candidates surfaces as a
