@@ -1,8 +1,16 @@
 # Puppetmaster — AI SDLC Workflow Integration Plan
 
-**Version:** 1.0 · **Date:** 2026-07-06 · **Status: PLAN ONLY — nothing in this document has
-been executed.** Each work package runs only on the owner's explicit go-ahead, in order,
-following the same convention as `docs/RESEARCH-ROADMAP.md`.
+**Version:** 1.1 · **Date:** 2026-07-06 · **Status: APPROVED — execution not yet started.**
+The owner's rulings on all six open decisions are recorded in §8 (2026-07-06). WP0 and WP1
+are unblocked and begin on the owner's start signal; each subsequent work package runs only
+on explicit go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
+
+**v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
+**`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
+**hybrid** (headless coding CLI for EXECUTE via `bench.delegate`, native agents for
+interview/plan/review) and re-sizes WP5 M accordingly; narrows WP1's ADR-002 spike to a
+feasibility check; marks v1 audience as Track B/C only; confirms WP0 at full scope; makes
+this plan the active roadmap ahead of Tauri packaging and remaining M5 work.
 
 **Sources analyzed:** all 15 files in `docs/software-engineering-development-ai-workflow/`
 (7 core documents + 8 research ledgers), read in full, against `docs/PRD.md`,
@@ -21,8 +29,8 @@ model*), a per-task mode switch (supervised vs. gated-autonomous, chosen by the
 pass@k/pass^k question), durable artifacts (spec, plan, todos, learnings, ADRs), and four
 on-demand quality layers (architecture, refactoring, documentation, scalability).
 
-**Recommendation: integrate it as a dedicated product feature — a "Dev Pipeline"
-subsystem — built in phases that *begin* as an operation-style composition of existing
+**Approved direction (§8 ruling 1): integrate it as a dedicated product feature — the
+Workshop — built in phases that *begin* as an operation-style composition of existing
 primitives, plus a near-free Work Package 0 that adopts the workflow for developing
 Puppetmaster itself.** The full analysis is §2; the short version:
 
@@ -38,8 +46,8 @@ Puppetmaster itself.** The full analysis is §2; the short version:
    copilot. The mapping is §3.
 3. But three mechanisms cannot be faithfully composed from existing primitives:
    **deterministic gates** (approval nodes are human-only; the corpus's Stop-hook analog
-   needs a machine-verdict node), **durable pipeline artifacts** (spec/todos/learnings have
-   no home — agent memory and KB are the wrong shape), and a **dev-workspace tool surface**
+   needs a machine-verdict node), **durable project artifacts** (spec/todos/learnings have
+   no home — agent memory and KB are the wrong shape), and a **workbench tool surface**
    (git + test execution; sandboxed code nodes are FS/network-isolated by design). Those
    gaps are what makes this a *feature*, not just an operation. Gap analysis is §4.
 4. The corpus's own escalation rule ("automate a behavior only after you've repeated it
@@ -113,10 +121,11 @@ five phases expressed with today's node kinds (agent, approval, code, logic); ar
 stored as KB documents; policies via `approval_policies`. Operators run it like any other
 mission from Command/Canvas/NEXUS. No new tables, node kinds, or views.
 
-**Option B — dedicated feature.** A first-class "Dev Pipeline" subsystem: new domain
-entities (pipelines, artifacts, evidence), a deterministic `verify` node kind, a
-dev-workspace tool surface (git/test execution), pipeline-aware UI (progress, artifact
-inspector, evidence panel in the approval inbox), and builtin templates on top.
+**Option B — dedicated feature.** A first-class SDLC subsystem (named **the Workshop** per
+the §8 ruling): new domain entities (projects, artifacts, evidence), a deterministic
+`verify` node kind, a workbench tool surface (git/test execution), workshop-aware UI
+(progress, artifact inspector, evidence panel in the approval inbox), and builtin templates
+on top.
 
 ### 2.2 Decision matrix
 
@@ -125,11 +134,11 @@ inspector, evidence panel in the approval inbox), and builtin templates on top.
 | Time to first value | Days — templates + agents only | Weeks — schema, kernel, UI |
 | Fidelity to Invariant 2 (deterministic gates) | **Fails.** Approval nodes are human-only; a "gate" acted by an LLM judging itself is the self-preferential bias the corpus disqualifies. Code nodes can compute a verdict but can't run tests (no FS/network) and can't *block with retry-instruction semantics* | Native: `verify` node runs a real check, exit-code gates, stderr becomes the agent's instruction, N-block override |
 | Artifact durability & audit | Weak — KB is a retrieval store; no typed task state, no active/backlog/completed lifecycle, no todo↔mission linkage | Typed artifact store; todos link to the missions that completed them (the corpus's "51 completed todos = audit trail") |
-| Can execute real SDLC work (git, tests, coverage) | **No.** No repo tool surface exists at all | Yes, via a dev-workspace connector (the single biggest work item, §5.3) |
+| Can execute real SDLC work (git, tests, coverage) | **No.** No repo tool surface exists at all | Yes, via a workbench connector (the single biggest work item, §5.3) |
 | Evidence-on-PR mechanism | Prose in mission output — unenforceable | Evidence entities attached to gates; approval inbox renders them |
 | Product differentiation (PRD §3) | Invisible — looks like any template | A headline capability: "SDLC with verifiable gates" |
 | Risk of over-building (corpus §5 anti-example) | None | Real — mitigated by phasing: build each piece only when the composed version has demonstrated the need |
-| Blast radius | ~0 | Schema + kernel + security surface (dev-workspace) |
+| Blast radius | ~0 | Schema + kernel + security surface (workbench) |
 
 ### 2.3 One honest complication: the corpus is written for a coding CLI
 
@@ -138,25 +147,24 @@ Puppetmaster means *translating mechanisms, not copying files*:
 
 | Corpus construct | Puppetmaster analog |
 |---|---|
-| Slash command (`/spec`, `/next`…) | Pipeline phase = template + agent behavior (persona + task prompt + tool grants) |
-| Stop hook (test-gate, refactor-gate…) | `verify` node in the pipeline graph + policy checks |
+| Slash command (`/spec`, `/next`…) | Workshop phase = template + agent behavior (persona + task prompt + tool grants) |
+| Stop hook (test-gate, refactor-gate…) | `verify` node in the project's graph + policy checks |
 | Skill (on-demand expertise) | Procedural memory entry / KB document retrieved per-task (Stage 4 already models "task → steps that worked") |
 | CLAUDE.md / MEMORY.md | Agent persona (lean) + workspace KB |
 | Session / clear / compact | Agent tick boundaries; Stage 9C compaction; fresh nested mission via `agent.ask` = fresh context |
-| Git worktree / repo | Dev-workspace (new tool surface, §5.3) |
+| Git worktree / repo | Workbench (new tool surface, §5.3) |
 
-There is also a load-bearing open decision (ADR-002, §8): does the EXECUTE phase's coding
-work run on **(a)** Puppetmaster's native agent runtime armed with dev-workspace tools,
-**(b)** an external headless coding CLI (e.g. `claude -p`) orchestrated as an MCP tool
-inside the dev-workspace container, or **(c)** hybrid (native for small edits, headless CLI
-for full features)? Option (b) reuses a mature coding agent and keeps Puppetmaster in the
-role the corpus assigns to the *human-built harness*: gates, evidence, artifacts, audit.
-Option (a) is more self-contained but re-implements a coding agent. Invariant 2 holds
-either way — Puppetmaster's value is the verification machinery around the executor, not
-the executor itself. **This is the first decision to make in WP1, and it swings WP5's
-size.**
+The executor question — who does the EXECUTE phase's actual coding — was the plan's
+highest-variance decision and is now **ruled (ADR-002, §8): hybrid.** The EXECUTE phase
+delegates coding tasks to a **headless coding CLI running inside the workbench container**
+(`bench.delegate`), while the interview, plan, and review phases run on **Puppetmaster's
+native agent runtime**. This reuses a mature coding agent where coding depth matters, keeps
+Puppetmaster in the role the corpus assigns to the *harness* — gates, evidence, artifacts,
+audit — and preserves the native path as fallback (§9 risk table). Invariant 2 holds either
+way: Puppetmaster's value is the verification machinery around the executor, not the
+executor itself.
 
-### 2.4 Recommendation
+### 2.4 Recommendation — **accepted (§8 ruling 1)**
 
 **Build Option B — a dedicated feature — phased so that its first shippable increment is
 Option A's composition, plus a Work Package 0 that costs almost nothing:**
@@ -167,13 +175,21 @@ Option A's composition, plus a Work Package 0 that costs almost nothing:**
   it works, then crystallize") applied at product scale — and pays back immediately in the
   repo's existing session-handoff practice (HANDOFF.md is already a hand-rolled version of
   the corpus's session-resume ritual).
-- **WP2–WP4 before UI:** the artifact store, the dev-workspace, and the `verify` node are
+- **WP2–WP4 before UI:** the artifact store, the workbench, and the `verify` node are
   the three things composition can't fake; they are the feature's spine.
-- **Templates last, not first:** the pipeline templates ship (WP8) once the machinery they
+- **Templates last, not first:** the project templates ship (WP8) once the machinery they
   reference exists, becoming the marketplace's flagship builtin.
 
-The name for the feature ("Dev Pipeline" is used throughout this plan; "Forge" and
-"Assembly" are candidates) is an owner decision — ADR-001.
+**Naming (§8 ruling 3).** The feature is **the Workshop**; the domain entity is a
+**`project`**; the per-project isolated dev container is a **`workbench`** (tools
+`bench.*`). Rationale: "pipeline" collides with the existing *workflow* vocabulary (two
+process-nouns in one DAG product guarantees permanent confusion); "project" is what the
+entity actually is — a repo plus its spec/todos/learnings/ADRs — and collides with nothing;
+"the Workshop" follows the house grammar that gives differentiating subsystems theatrical
+names (the Bridge, the Construct, NEXUS) while entities stay plain — in puppetry, the
+workshop is where marionettes are built and strung before they take the stage. "Workbench"
+also removes v1.0's latent `ws.*`-reads-as-workspace ambiguity. Formalized in ADR-001
+(WP1), where the owner may still veto.
 
 ---
 
@@ -185,22 +201,22 @@ Status: ✅ exists · 🟡 partial (exists but needs extension) · ❌ gap (new 
 |---|---|---|---|
 | 1 | Verification rung 4 — independent judge in fresh context | `agent.ask` nested mission (Stage 8): different agent, fresh context, own tool tiers | ✅ |
 | 2 | pass^k eval discipline | Stage 5 harness: golden tasks k×, DB-state predicates, trajectory assertions, `pnpm eval` | ✅ |
-| 3 | Skills as crystallized learning | Stage 4 procedural memory ("task → tool steps that worked") | 🟡 needs per-task retrieval into pipeline prompts + a curation/promotion path (org layer §2) |
+| 3 | Skills as crystallized learning | Stage 4 procedural memory ("task → tool steps that worked") | 🟡 needs per-task retrieval into workshop prompts + a curation/promotion path (org layer §2) |
 | 4 | Quarantine pattern for untrusted input | Stage 1 untrusted-data envelopes + tiers gating resulting actions | ✅ |
 | 5 | Human review gate | Approval nodes + inbox + `approval_policies` | 🟡 needs evidence attachment (org layer §1) |
 | 6 | Deterministic gate (Stop hook / test-gate) | — (approval nodes are human-only; code nodes can't run tests) | ❌ `verify` node kind |
 | 7 | Artifacts: SPEC / PLAN / todos / learnings / ADRs | — (KB is retrieval-shaped; agent memories are agent-scoped) | ❌ typed artifact store |
-| 8 | Dev workspace: git, test runner, coverage, fitness tools | — (code nodes are FS/network-isolated by design; no git connector) | ❌ dev-workspace connector |
+| 8 | Dev workspace: git, test runner, coverage, fitness tools | — (code nodes are FS/network-isolated by design; no git connector) | ❌ workbench connector |
 | 9 | Spec interview (restate-first, forcing sections pull coverage) | Stage 6 copilot NL→draft (draft-never-autosaved is the same human-in-command stance) | 🟡 interview loop + forcing-section templates are new |
 | 10 | Plan phase (read-only explore → editable PLAN) | Agent tick with read-tier grants; copilot draft pattern | 🟡 |
-| 11 | Mode switch: supervised `/next` vs. gated `/loop` | Approval-after-every-task vs. run-until-gate are both expressible as graph shapes | 🟡 needs the two pipeline graph templates + the pass@k/pass^k chooser surfaced to the operator |
+| 11 | Mode switch: supervised `/next` vs. gated `/loop` | Approval-after-every-task vs. run-until-gate are both expressible as graph shapes | 🟡 needs the two execute-mode graph templates + the pass@k/pass^k chooser surfaced to the operator |
 | 12 | Session lifecycle / context rot management | Ticks, Stage 9C compaction, memory admission control | ✅ |
 | 13 | Artifact-sync enforcement (require-todo-sync) | — | ❌ rides the `verify` node (check: spec changed ⇒ todos changed) |
-| 14 | Refactor contract (coverage precondition, two-hats, no test-expectation edits) | — | ❌ refactor pipeline template + verify checks (`git diff --diff-filter=M` on test paths) |
+| 14 | Refactor contract (coverage precondition, two-hats, no test-expectation edits) | — | ❌ refactor project template + verify checks (`git diff --diff-filter=M` on test paths) |
 | 15 | Architecture fitness (`/arch-verify`, legacy ratchet) | Graph linter exists for *workflow* graphs — same pattern, different target | ❌ per-repo fitness config + verify check |
 | 16 | ADRs (immutable, reconsider-when) | — | ❌ artifact type + template; also adopt for our own repo in WP0 |
 | 17 | Evidence-on-PR (org layer) | Audit log + mission traces record everything already | 🟡 needs evidence surfaced *at the gate*, not just in the trace |
-| 18 | Tracks A/B/C (sort people by what they can verify) | RBAC roles (owner/admin/builder/member) | 🟡 mapping: which roles may run which pipeline modes (member = supervised only, builder+ = gated, admin = policy edits) |
+| 18 | Tracks A/B/C (sort people by what they can verify) | RBAC roles (owner/admin/builder/member) | 🟡 mapping: which roles may run which project modes (member = supervised only, builder+ = gated, admin = policy edits) |
 | 19 | Org rollout / shared-context curation | Templates + marketplace (M5), workspace scoping | 🟡 promotion-by-traction needs usage counting |
 | 20 | Budget discipline (rungs, token budgets) | Stage 5 cost ledger + budgets gating ticks | ✅ |
 | 21 | Model-quality floors for risky work | Stage 9A router profiles `minClassForGatedTools` | ✅ |
@@ -216,14 +232,14 @@ alone was rejected.
 
 | # | Gap | Today | Needed |
 |---|---|---|---|
-| W1 | Deterministic verification gate | Approval = human; code node = no FS/exec | `verify` node kind: runs a declared check (tool call / script in dev-workspace), exit code gates the DAG, failure output feeds back to the acting agent as instruction, N-consecutive-failure escalation to a human approval (the corpus's 8-block override, made policy) |
-| W2 | Pipeline artifact store | No typed home for spec/plan/todos/learnings/ADRs | `pipeline_artifacts` (typed, versioned, workspace-scoped, linked to pipelines and missions); todo lifecycle active→completed with mission linkage |
-| W3 | Dev-workspace tool surface | No git/exec/coverage tools; sandbox is JS-only, isolated | A containerized dev-workspace per pipeline: git ops, dependency install, test/coverage/fitness execution — least-privilege, egress-allowlisted, credentials via vault. **Largest security surface in this plan** |
-| W4 | Pipeline entity & phase state | Missions are single runs; a feature = many runs across phases | `pipelines` entity grouping missions per phase with the artifact set; or a long-lived workflow + convention. Decide in WP1 (ADR-003) |
+| W1 | Deterministic verification gate | Approval = human; code node = no FS/exec | `verify` node kind: runs a declared check (tool call / script in the workbench), exit code gates the DAG, failure output feeds back to the acting agent as instruction, N-consecutive-failure escalation to a human approval (the corpus's 8-block override, made policy) |
+| W2 | Project artifact store | No typed home for spec/plan/todos/learnings/ADRs | `project_artifacts` (typed, versioned, workspace-scoped, linked to projects and missions); todo lifecycle active→completed with mission linkage |
+| W3 | Workbench tool surface | No git/exec/coverage tools; sandbox is JS-only, isolated | A containerized workbench per project: git ops, dependency install, test/coverage/fitness execution — least-privilege, egress-allowlisted, credentials via vault. **Largest security surface in this plan** |
+| W4 | Project entity & phase state | Missions are single runs; a feature = many runs across phases | `projects` entity grouping missions per phase with the artifact set; or a long-lived workflow + convention. Decide in WP1 (ADR-003) |
 | W5 | Interview elicitation loop | Copilot is one-shot NL→draft | Multi-turn interview with restate-first and forcing-section pull; runs in Command view against the Interviewer agent |
 | W6 | Evidence at gates | Trace has the data; inbox shows only a prompt | Evidence records (test output, diffs, screenshots, state assertions) attached to `verify`/approval steps; inbox renders them |
-| W7 | Quality-layer knowledge delivery | Personas or nothing | On-demand injection per task type (architecture / refactoring / docs / scalability guidance), 0 standing lines — via procedural memory or KB retrieval keyed by pipeline phase + task tags |
-| W8 | Mode governance | Any builder can run anything | Role × mode matrix (track A/B/C analog); gated-autonomous requires the pipeline to have a passing verify configuration first ("you haven't built the infrastructure that makes /loop safe" — pipeline refuses, like the corpus's verifier refusals) |
+| W7 | Quality-layer knowledge delivery | Personas or nothing | On-demand injection per task type (architecture / refactoring / docs / scalability guidance), 0 standing lines — via procedural memory or KB retrieval keyed by project phase + task tags |
+| W8 | Mode governance | Any builder can run anything | Role × mode matrix (track B/C analog); gated-autonomous requires the project to have a passing verify configuration first ("you haven't built the infrastructure that makes /loop safe" — the project refuses, like the corpus's verifier refusals) |
 
 ---
 
@@ -234,14 +250,14 @@ This is a sketch to size the work packages, not a binding design; WP1 turns it i
 ### 5.1 Domain model additions (`packages/shared`, `packages/db`)
 
 ```
-pipelines            id, workspaceId, name, repoRef, mode (supervised|gated),
+projects             id, workspaceId, name, repoRef, mode (supervised|gated),
                      phase (specify|plan|execute|verify|record|idle),
-                     devWorkspaceId, createdAt, status
-pipeline_artifacts   id, pipelineId, kind (spec|plan|todo|learning|adr|evidence),
+                     workbenchId, createdAt, status
+project_artifacts    id, projectId, kind (spec|plan|todo|learning|adr|evidence),
                      status (todo: active|backlog|completed; adr: proposed|accepted|superseded),
                      title, body (md/json), version, supersedesId,
                      missionId (which run produced/consumed it), createdAt
-verify_checks        id, pipelineId, name (test|arch|refactor-gate|todo-sync|load|custom),
+verify_checks        id, projectId, name (test|arch|refactor-gate|todo-sync|load|custom),
                      command/toolRef, baseline (legacy ratchet), enabled, earnedNote
 evidence             id, stepId/approvalId, kind (test-output|diff|screenshot|state-assert),
                      content/ref, createdAt
@@ -250,46 +266,46 @@ evidence             id, stepId/approvalId, kind (test-output|diff|screenshot|st
 ### 5.2 Kernel additions (`packages/kernel`)
 
 - **`verify` node kind** (W1): config = `{checkRef | inline command, retriesBeforeEscalate}`;
-  handler executes in the pipeline's dev-workspace, stores evidence, and on failure loops
+  handler executes in the project's workbench, stores evidence, and on failure loops
   control back to the paired agent node with stderr as instruction (bounded, then escalates
-  to a human approval). Graph linter learns: *gated-autonomous pipeline with no verify node
-  between agent and terminal = lint error* (mirror of today's "write action with no
-  approval upstream").
+  to a human approval). Graph linter learns: *gated project with no verify node between
+  agent and terminal = lint error* (mirror of today's "write action with no approval
+  upstream").
 - **Executor support** for the bounded agent↔verify retry loop (today edges + resume
   cursor cover most of this; the bounded-loop counter is new).
-- **Pipeline orchestrator**: phase transitions, artifact read/write tools exposed to agents
-  (`pipeline.artifact.read/write/list`, `pipeline.todo.next/complete` — read/write tiers).
+- **Project orchestrator**: phase transitions, artifact read/write tools exposed to agents
+  (`project.artifact.read/write/list`, `project.todo.next/complete` — read/write tiers).
 
-### 5.3 Dev-workspace connector (`packages/mcp-connectors`) — the big rock (W3)
+### 5.3 Workbench connector (`packages/mcp-connectors`) — the big rock (W3)
 
-A bundled MCP server managing per-pipeline containerized workspaces:
-`ws.clone`, `ws.git` (status/diff/commit/branch; push is **write-approved**),
-`ws.exec` (allowlisted commands: install/test/coverage/fitness; **write tier**),
-`ws.read`/`ws.write` files (write tier), `ws.destroy` (**destructive**).
-Constraints carried over from Stage 1 posture: egress allowlist per workspace, credentials
+A bundled MCP server managing per-project containerized workbenches:
+`bench.clone`, `bench.git` (status/diff/commit/branch; push is **write-approved**),
+`bench.exec` (allowlisted commands: install/test/coverage/fitness; **write tier**),
+`bench.read`/`bench.write` files (write tier), `bench.destroy` (**destructive**).
+Constraints carried over from Stage 1 posture: egress allowlist per workbench, credentials
 injected from the vault at spawn, everything audited, results through untrusted-data
-envelopes. If ADR-002 chooses the headless-CLI executor, it runs *inside* this container as
-`ws.delegate` and inherits the same walls (filesystem *and* network isolation — the corpus
-Track C sandbox rule, verbatim).
+envelopes. Per the ADR-002 ruling (hybrid), the headless coding CLI runs *inside* this
+container as **`bench.delegate(task, budget)`** and inherits the same walls (filesystem
+*and* network isolation — the corpus Track C sandbox rule, verbatim).
 
 ### 5.4 Agents (builtin templates, `kind: agent`)
 
 - **Interviewer** — runs SPECIFY: restate-first, forcing sections pull the interview, writes
-  the spec artifact + initial todos. Read-tier only.
+  the spec artifact + initial todos. Read-tier only. Native runtime.
 - **Foreman** — orchestrates phases, decomposes the plan into todos, dispatches EXECUTE
-  tasks, enforces the mode switch. Write-approved.
+  tasks (via `bench.delegate` per ADR-002), enforces the mode switch. Write-approved.
 - **Reviewer** — rung 4: fresh context via `agent.ask`, reads only the diff + spec +
   failure-class list (never the builder's conversation), attacks named failure classes,
-  returns findings by severity. Read-tier.
+  returns findings by severity. Read-tier. Native runtime.
 
 ### 5.5 UI (`apps/web`)
 
-- **Pipelines view** + NEXUS task pane (`PIPELINE` chip; a stratum comes later if earned):
-  phase progress, artifact browser (spec/todos/learnings/ADRs), verify-check dashboard with
-  baselines.
+- **Workshop view** + NEXUS task pane (`WORKSHOP` chip; a Construct stratum comes later if
+  earned): project list + detail — phase progress, artifact browser
+  (spec/todos/learnings/ADRs), verify-check dashboard with baselines.
 - **Approval inbox extension**: evidence panel (test output, diff, screenshots) rendered
   with the approval — org layer §1 made concrete.
-- **Canvas**: `verify` node skin (FUI: a gate glyph; green/red state ring), pipeline
+- **Canvas**: `verify` node skin (FUI: a gate glyph; green/red state ring), project
   templates openable/editable like any workflow (human-in-command preserved).
 
 ---
@@ -301,7 +317,7 @@ Track C sandbox rule, verbatim).
 > Dependencies form a DAG; WP0 and WP1 can start in parallel; nothing else starts before
 > WP1 lands.
 
-### WP0 — Dogfood: adopt the workflow for developing Puppetmaster itself · size S · independent
+### WP0 — Dogfood: adopt the workflow for developing Puppetmaster itself · size S · independent · **scope ruled: full, as written (§8 ruling 5)**
 
 *The "operation" track. Zero product code. Immediately useful; field-tests every mechanism
 we later productize.*
@@ -331,97 +347,108 @@ and zero otherwise.
 
 ### WP1 — Decisions & ADRs (spike) · size S · gates everything
 
-1. ADR-001: feature name and scope boundary (what "Dev Pipeline" v1 will NOT do — e.g.,
-   no multi-repo pipelines, no CI-provider integration in v1).
-2. ADR-002: **executor choice** (native agent runtime vs. headless coding CLI in the
-   dev-workspace vs. hybrid). Includes a ½-day spike per option against a toy repo.
-   This is the plan's highest-variance decision (swings WP5 by ±L).
-3. ADR-003: pipeline state representation (new `pipelines` entity vs. long-lived workflow
+*Rulings 2–4 and 6 (§8) pre-resolve the largest questions; WP1 formalizes them as ADRs and
+closes the rest.*
+
+1. ADR-001: formalize the feature name (**ruled: the Workshop / `project` / `workbench`**
+   — owner veto window at ADR review) and the v1 scope boundary (what the Workshop v1 will
+   NOT do — e.g., no multi-repo projects, no CI-provider integration in v1).
+2. ADR-002: document the **ruled hybrid executor** (headless coding CLI inside the
+   workbench via `bench.delegate` for EXECUTE; native agents for interview/plan/review).
+   The spike narrows from option-comparison to **feasibility validation**: run a headless
+   coding CLI inside a candidate container image against a toy repo, proving budget
+   enforcement (token/time caps), progress streaming into a mission trace, and clean exit
+   semantics. Include the fallback trigger ("Reconsider when") for the native path.
+3. ADR-003: project state representation (new `projects` entity vs. long-lived workflow
    + conventions). Recommendation going in: new entity (missions stay single runs; the
    corpus is explicit that the loop spans many sessions).
-4. ADR-004: artifact storage (typed `pipeline_artifacts` vs. KB reuse). Recommendation:
+4. ADR-004: artifact storage (typed `project_artifacts` vs. KB reuse). Recommendation:
    typed table; optionally *mirror* accepted specs/learnings into KB for retrieval.
-5. ADR-005: dev-workspace isolation technology (container per pipeline vs. per exec;
+5. ADR-005: workbench isolation technology (container per project vs. per exec;
    image contents; resource caps) and its egress/credential policy.
-6. Rule on the role × mode matrix (W8) and on which corpus tracks v1 serves (recommend:
-   Track B/C personas only; Track A "operator builds an app by interview" is a v2 goal).
+6. Formalize the role × mode matrix (W8). v1 audience is **ruled: Track B/C only**
+   (§8 ruling 4) — the standing suggestion (member = supervised + interviews, builder+ =
+   gated, admin = check config/policies) becomes the ADR'd default.
 
 **Acceptance:** five accepted ADRs in `docs/adr/` (WP0 format), each with alternatives
-considered and a "Reconsider when" trigger; owner sign-off recorded.
+considered and a "Reconsider when" trigger; ADR-002's feasibility spike has a recorded
+pass (budget cap provably enforced, trace populated); owner sign-off recorded.
 
 ### WP2 — Domain model & artifact store · size M · needs WP1
 
-1. `packages/shared`: zod schemas for `Pipeline`, `PipelineArtifact` (all kinds + todo/ADR
+1. `packages/shared`: zod schemas for `Project`, `ProjectArtifact` (all kinds + todo/ADR
    status enums), `VerifyCheck`, `Evidence`; extend `WorkflowNodeKind` with `verify`.
-2. `packages/db`: tables + repos (`pipeline-repo.ts`), idempotent migration, workspace
-   scoping, indexes on `(pipelineId, kind, status)`.
+2. `packages/db`: tables + repos (`project-repo.ts`), idempotent migration, workspace
+   scoping, indexes on `(projectId, kind, status)`.
 3. Artifact lifecycle rules in the repo layer: ADR immutability (supersede, never edit);
    todo transitions require a `missionId`; learnings are append-only.
-4. Kernel tools: `pipeline.artifact.*`, `pipeline.todo.*` (read/write tiers per PRD §4)
+4. Kernel tools: `project.artifact.*`, `project.todo.*` (read/write tiers per PRD §4)
    registered in the shared catalog so both agents and workflow nodes use them (one-catalog
    rule preserved).
-5. REST: `/api/pipelines` CRUD + `/api/pipelines/:id/artifacts` (builder+); audit entries
+5. REST: `/api/projects` CRUD + `/api/projects/:id/artifacts` (builder+); audit entries
    for artifact writes.
 
 **Acceptance:** `pnpm typecheck && pnpm build && pnpm test` green; a golden eval task
-creates a pipeline, writes a spec artifact, advances a todo to completed with a mission
+creates a project, writes a spec artifact, advances a todo to completed with a mission
 link, and a DB-state predicate verifies the lifecycle rules (editing an accepted ADR
 fails; completing a todo without a mission fails).
 
-### WP3 — Dev-workspace connector · size L · needs WP1 (ADR-005); parallel with WP2
+### WP3 — Workbench connector · size L · needs WP1 (ADR-005); parallel with WP2
 
-1. Workspace lifecycle: create (clone from `repoRef`, vault-injected credentials),
+1. Workbench lifecycle: create (clone from `repoRef`, vault-injected credentials),
    suspend/resume, destroy (destructive tier). Container per ADR-005.
-2. Tools: `ws.git.*`, `ws.exec` (command allowlist from pipeline config), `ws.read/write`,
-   with tiers as §5.3; results wrapped in untrusted-data envelopes; Stage 9C compaction
-   applies to bulky outputs (test logs are exactly the corpus's "stale tool output" case).
+2. Tools: `bench.git.*`, `bench.exec` (command allowlist from project config),
+   `bench.read/write`, with tiers as §5.3; results wrapped in untrusted-data envelopes;
+   Stage 9C compaction applies to bulky outputs (test logs are exactly the corpus's "stale
+   tool output" case).
 3. Security hardening: no ambient network (explicit egress allowlist), resource caps
    (CPU/mem/disk/time), workspace-scoped secrets only, `mcp_tool_pins` posture for the
    connector's own descriptions.
-4. If ADR-002 = headless CLI: `ws.delegate(task, budget)` — run the coding CLI headless
+4. `bench.delegate(task, budget)` per the ADR-002 ruling — run the coding CLI headless
    inside the container, stream progress to the mission trace, hard token/time budget.
-5. Golden eval: clone a fixture repo, run its test suite via `ws.exec`, assert exit-code
-   propagation and that a disallowed egress attempt is refused **and audited**.
+5. Golden eval: clone a fixture repo, run its test suite via `bench.exec`, assert
+   exit-code propagation and that a disallowed egress attempt is refused **and audited**.
 
 **Acceptance:** the eval above passes under `pnpm eval`; a penetration-style golden task
-(tool output containing an injection attempting `ws.git.push`) shows the push gated behind
-approval — the Stage 1 structural-enforcement story extended to the new surface.
+(tool output containing an injection attempting `bench.git.push`) shows the push gated
+behind approval — the Stage 1 structural-enforcement story extended to the new surface.
 
 ### WP4 — Verification gate machinery · size M · needs WP2 + WP3
 
-1. `verify` node handler: executes a `VerifyCheck` in the pipeline's dev-workspace,
+1. `verify` node handler: executes a `VerifyCheck` in the project's workbench,
    persists an `Evidence` record, exit code gates the edge.
 2. Bounded retry loop: verify-fail routes back to the paired agent node with the check's
    stderr as instruction; after `retriesBeforeEscalate` (default 8 — the corpus's
    override constant, now a policy) an approval is raised instead (human sees evidence).
-3. Standard check library (each an *earned* option, off by default, enable per pipeline):
+3. Standard check library (each an *earned* option, off by default, enable per project):
    `test` (suite pass), `todo-sync` (spec artifact changed ⇒ todos changed),
    `refactor-gate` (`--diff-filter=M` on test paths in refactor-tagged work),
    `arch` (fitness tool with ratchet baseline), `load` (SLO thresholds; skips without
    declared numbers — refusal is correct behavior, verbatim from the scalability layer).
-4. Graph linter rules: gated pipeline without a verify node = error; verify node whose
+4. Graph linter rules: gated project without a verify node = error; verify node whose
    check is disabled = warning; fitness-config/baseline edits inside an execute mission =
    flagged for review (the "agent edits the verifier" failure shape).
 5. Evidence in the approval inbox (server: include evidence with approvals; web: render
    test output/diff blocks in the inbox and NEXUS AUTH pane).
 
-**Acceptance:** golden tasks — (a) failing test blocks the pipeline, agent receives stderr,
+**Acceptance:** golden tasks — (a) failing test blocks the project, agent receives stderr,
 fix attempt reruns, pass proceeds (trajectory-asserted); (b) 8 consecutive failures
 escalate to approval with evidence attached; (c) refactor-gate blocks a run whose diff
 modifies test expectations but passes one that only adds test files.
 
-### WP5 — Pipeline phases as agent behaviors · size L (M if ADR-002 = headless CLI) · needs WP2–WP4
+### WP5 — Workshop phases as agent behaviors · size M (per ADR-002 ruling: EXECUTE delegates to the headless CLI) · needs WP2–WP4
 
 1. **SPECIFY:** Interviewer agent + Command-view flow: restate-first, forcing sections
    (tech stack; the five architecture declarations; scale & ops; documentation plan; edge
    cases; out of scope; verification steps) pull the interview; output = spec artifact +
    seeded todos. Include the untranslatable-declaration refusal ("architecture theater"
    detector) when WP4's arch check can't parse a declaration.
-2. **PLAN:** read-only explore in the dev-workspace → plan artifact, editable in UI before
+2. **PLAN:** read-only explore in the workbench → plan artifact, editable in UI before
    execution (draft-never-autosaved, same as copilot). Skip affordance: one-sentence-diff
    tasks go straight to execute.
-3. **EXECUTE — supervised mode:** one todo per mission; implement → test → evidence →
-   approval → artifact updates → stop. (The `/next` contract as a graph shape.)
+3. **EXECUTE — supervised mode:** one todo per mission; implement (`bench.delegate`) →
+   test → evidence → approval → artifact updates → stop. (The `/next` contract as a graph
+   shape.)
 4. **EXECUTE — gated mode:** run todos in order; verify gates between tasks; stop on
    `[review]`-tagged todo or gate escalation. (`/loop` as a graph shape.) Mode chooser in
    the UI asks the pass@k/pass^k question in plain words ("must this work every time
@@ -431,7 +458,7 @@ modifies test expectations but passes one that only adds test files.
    list assembled from the quality layers; RECORD writes learnings (append-only), completes
    todos, mirrors accepted artifacts to KB, and — where a hard task succeeded after
    iteration — proposes a procedural-memory entry (skill extraction, human-approved).
-6. **Refactor pipeline variant:** the behavior-preserving contract as a template — before
+6. **Refactor project variant:** the behavior-preserving contract as a template — before
    results recorded, coverage precondition (default 70%, spec-overridable) with the
    characterization-test route, small steps, after-results must match before-results,
    refactor-gate check enabled by default in this variant only.
@@ -451,7 +478,7 @@ independence is checked, not assumed) → learnings artifact grew.
    (five AI failure modes + smell vocabulary), documentation (ADR gotchas, Diátaxis
    compass, style highlights), scalability (YAGNI counterweight + strategy ladder +
    negative triggers verbatim — they matter more than the positive ones).
-2. Injection rule: pipeline phase + task tags select at most one pack per tick; measured
+2. Injection rule: project phase + task tags select at most one pack per tick; measured
    via audit so unused packs get pruned (the corpus: a gotcha that never fires gets cut).
 3. Reviewer failure-class assembly from active packs (ten-minute test, names-carry-intent,
    abstraction-earns-its-keep, compliance-without-gaming, tangled-refactor,
@@ -467,41 +494,41 @@ decision without "Reconsider when" fails the record phase's todo-sync-style chec
 
 ### WP7 — UI surfaces · size M · needs WP4 (inbox) / WP5 (view)
 
-1. Pipelines view: list + detail (phase stepper, todo board active/backlog/completed,
-   artifact reader with version history, verify-check panel with baselines and evidence
-   history, mode indicator).
-2. NEXUS: `PIPELINE` task-pane chip in the tray registry (per NEXUS §4 pane conventions);
-   Construct stratum deferred until pipelines earn ambient presence (complexity budget).
+1. Workshop view: project list + detail (phase stepper, todo board
+   active/backlog/completed, artifact reader with version history, verify-check panel with
+   baselines and evidence history, mode indicator).
+2. NEXUS: `WORKSHOP` task-pane chip in the tray registry (per NEXUS §4 pane conventions);
+   Construct stratum deferred until projects earn ambient presence (complexity budget).
 3. Approval inbox evidence panel (from WP4.5) polished: diff viewer, test-output block,
    screenshot display; FUI grammar per DESIGN-LANGUAGE.
 4. Canvas: verify-node skin + config inspector (check picker, retries-before-escalate);
-   pipeline templates open in the canvas like any workflow.
+   project templates open in the canvas like any workflow.
 5. Command view: interview session UX (restate card, forcing-section progress meter — the
    spec's unfilled sections are the interview's progress bar).
 
 **Acceptance:** manual UAT script appended to `docs/uat/` covering: run a supervised
-pipeline from NEXUS only; approve a gated escalation from the inbox seeing its evidence;
+project from NEXUS only; approve a gated escalation from the inbox seeing its evidence;
 edit a plan artifact before execution. Keyboard + reduced-motion checks per
 DESIGN-LANGUAGE hard requirements.
 
 ### WP8 — Templates, packaging, org layer · size S · needs WP5
 
-1. Builtin templates: `dev-pipeline-supervised`, `dev-pipeline-gated`,
-   `dev-pipeline-refactor`, plus Interviewer/Foreman/Reviewer agent templates —
-   `builtin: true`, category `dev`.
-2. Role × mode enforcement (W8) at the gateway; member = run supervised + answer
-   interviews; builder = gated + template edits; admin = check config + policies.
-3. Evidence-on-PR as workspace policy: a toggle requiring every gated pipeline's terminal
+1. Builtin templates: `workshop-supervised`, `workshop-gated`, `workshop-refactor`, plus
+   Interviewer/Foreman/Reviewer agent templates — `builtin: true`, category `dev`.
+2. Role × mode enforcement (W8, per ADR from WP1.6) at the gateway; member = run
+   supervised + answer interviews; builder = gated + template edits; admin = check config
+   + policies.
+3. Evidence-on-PR as workspace policy: a toggle requiring every gated project's terminal
    approval to carry evidence records (default on).
 4. Shared-context curation: procedural-memory promotion flow (sandbox → traction counter →
    workspace-shared), usage measured, prune list surfaced in EVALS view.
 5. Ownership line (org layer §3): one paragraph in the workspace settings — who owns
-   pipeline-produced code — shown at pipeline creation. Cheapest item in the corpus;
+   project-produced code — shown at project creation. Cheapest item in the corpus;
    included because its failure mode is an incident, not friction.
 
 **Acceptance:** fresh workspace: instantiate the supervised template and reach the
 interview in <5 minutes without touching the canvas; member role cannot start a gated
-pipeline (403, audited); a gated pipeline with the evidence policy on refuses to finish
+project (403, audited); a gated project with the evidence policy on refuses to finish
 without evidence.
 
 ### WP9 — Evals, failure-mode hardening, docs · size M · needs WP5; grows with each WP
@@ -515,10 +542,10 @@ without evidence.
    (delete-and-recreate in refactor variant), artifact drift (spec changed ⇒ todo gate),
    invented load thresholds (every threshold traces to a declared SLO), premature-scaling
    (scaling infra without measured failure — reviewer class), stateful-but-replicated.
-3. Product docs: `docs/PIPELINES.md` (operator guide: the five phases, the mode question,
+3. Product docs: `docs/WORKSHOP.md` (operator guide: the five phases, the mode question,
    the earned-checks philosophy), ARCHITECTURE.md §3.11, PRD update (use case 3 →
    implemented-by), NEXUS registry update.
-4. Dogfood closure: run WP0's repo pipeline *through the product itself* on a small real
+4. Dogfood closure: run WP0's repo workflow *through the product itself* on a small real
    task (self-hosting smoke test) and record learnings.
 
 **Acceptance:** `pnpm eval` green with the new suite at k≥2 (pass^k, not pass@k — this
@@ -541,25 +568,25 @@ started.)*
 - [ ] (earned, deferred) `test-gate` hook — install only after the failure bites
 
 **WP1 — Decisions**
-- [ ] ADR-001 feature name + v1 scope boundary
-- [ ] ADR-002 executor choice (+ spike per option)
-- [ ] ADR-003 pipeline state representation
+- [ ] ADR-001 feature name (ruled: Workshop/project/workbench) + v1 scope boundary
+- [ ] ADR-002 hybrid executor (ruled) + feasibility spike (CLI-in-workbench, budgets, trace)
+- [ ] ADR-003 project state representation
 - [ ] ADR-004 artifact storage
-- [ ] ADR-005 dev-workspace isolation + egress/credential policy
-- [ ] Role × mode ruling; v1 tracks ruling (B/C only?)
+- [ ] ADR-005 workbench isolation + egress/credential policy
+- [ ] Role × mode matrix formalized (v1 tracks ruled: B/C only)
 
 **WP2 — Domain model**
-- [ ] Shared zod schemas (Pipeline, PipelineArtifact, VerifyCheck, Evidence, `verify` kind)
+- [ ] Shared zod schemas (Project, ProjectArtifact, VerifyCheck, Evidence, `verify` kind)
 - [ ] DB tables + repos + migration + lifecycle rules (ADR immutability, todo↔mission)
-- [ ] `pipeline.artifact.*` / `pipeline.todo.*` catalog tools (tiered)
-- [ ] `/api/pipelines` REST + audit
+- [ ] `project.artifact.*` / `project.todo.*` catalog tools (tiered)
+- [ ] `/api/projects` REST + audit
 - [ ] Golden eval: artifact lifecycle predicates
 
-**WP3 — Dev-workspace connector**
-- [ ] Workspace lifecycle (create/suspend/destroy) per ADR-005
-- [ ] `ws.git.*`, `ws.exec`, `ws.read/write` with tiers + envelopes + compaction
+**WP3 — Workbench connector**
+- [ ] Workbench lifecycle (create/suspend/destroy) per ADR-005
+- [ ] `bench.git.*`, `bench.exec`, `bench.read/write` with tiers + envelopes + compaction
 - [ ] Egress allowlist, resource caps, vault-only secrets
-- [ ] (if ADR-002 = CLI) `ws.delegate` with hard budgets
+- [ ] `bench.delegate` with hard budgets (per ADR-002 ruling)
 - [ ] Golden evals: exit-code propagation; injection→push gated; egress refusal audited
 
 **WP4 — Verification gates**
@@ -573,7 +600,7 @@ started.)*
 **WP5 — Phases**
 - [ ] Interviewer + SPECIFY flow (restate-first; forcing sections; theater refusal)
 - [ ] PLAN (read-only explore → editable artifact; skip affordance)
-- [ ] EXECUTE supervised template (`/next` contract)
+- [ ] EXECUTE supervised template (`/next` contract; `bench.delegate`)
 - [ ] EXECUTE gated template (`/loop` contract; mode chooser; no-verify ⇒ refuse)
 - [ ] Reviewer via `agent.ask` + RECORD (learnings, todo completion, skill-extraction proposal)
 - [ ] Refactor variant (coverage precondition, characterization route, contract checks)
@@ -587,59 +614,60 @@ started.)*
 - [ ] Eval predicates (right pack, only the right pack)
 
 **WP7 — UI**
-- [ ] Pipelines view (stepper, todo board, artifact reader, checks panel)
-- [ ] NEXUS `PIPELINE` pane chip
+- [ ] Workshop view (stepper, todo board, artifact reader, checks panel)
+- [ ] NEXUS `WORKSHOP` pane chip
 - [ ] Inbox evidence panel polish (diff/test/screenshot)
 - [ ] Canvas verify-node skin + inspector
 - [ ] Interview UX (restate card, section progress)
 - [ ] UAT script in `docs/uat/` (incl. keyboard/reduced-motion)
 
 **WP8 — Packaging & org**
-- [ ] Three pipeline templates + three agent templates (builtin)
+- [ ] Three project templates + three agent templates (builtin)
 - [ ] Role × mode gateway enforcement
 - [ ] Evidence-required workspace policy
 - [ ] Memory promotion-by-traction + prune surfacing
-- [ ] Ownership statement at pipeline creation
+- [ ] Ownership statement at project creation
 
 **WP9 — Hardening**
 - [ ] Failure-mode mapping doc (corpus tables → eval/linter/accepted-risk; zero unmapped)
 - [ ] Priority evals (anchoring, verifier-edit, rewrite, drift, invented thresholds, premature scaling, stateful-replica)
-- [ ] `docs/PIPELINES.md` + ARCHITECTURE/PRD/NEXUS updates
+- [ ] `docs/WORKSHOP.md` + ARCHITECTURE/PRD/NEXUS updates
 - [ ] Self-hosting smoke test + learnings
 
 ---
 
-## 8. Open decisions for the owner (blocking, in order)
+## 8. Decision log — owner rulings, 2026-07-06
 
-1. **Go/no-go on the recommendation** (§2.4): dedicated feature, phased, with WP0.
-   Alternative if capacity is tight: WP0 + WP1 only now; product feature deferred intact.
-2. **ADR-002 executor** — the highest-variance choice (§2.3). Plan default if undecided:
-   hybrid with headless-CLI for EXECUTE, native agents for interview/plan/review.
-3. **Feature name** (ADR-001) and whether "pipeline" collides with existing vocabulary.
-4. **v1 audience** — recommend Track B/C only (builders/engineers); Track A operator flow
-   (build-by-interview for non-coders) deferred to v2.
-5. **WP0 scope** — full as written, or minimal (todos + ADRs only, no commands)?
-6. **Sequencing vs. the existing roadmap** — this plan does not preempt
-   RESEARCH-ROADMAP stages; the owner decides where WP1+ slots relative to Tauri/desktop
-   and remaining M5 work.
+| # | Question (as put to the owner) | Ruling | Effect on this plan |
+|---|---|---|---|
+| 1 | Go/no-go on the recommendation (§2.4): dedicated feature, phased, with WP0 | **Go** | Plan approved; this document is the active roadmap for the feature |
+| 2 | ADR-002 executor: native agents vs. headless coding CLI vs. hybrid | **Hybrid** | EXECUTE delegates to a headless coding CLI inside the workbench (`bench.delegate`); interview/plan/review run on the native agent runtime. WP1's spike narrows to feasibility validation; WP5 sizes M |
+| 3 | Feature name; does "pipeline" collide with existing vocabulary? | **Delegated to Claude — recommendation adopted:** the **Workshop** (feature), **`project`** (entity), **`workbench`** (dev container, `bench.*` tools) | Applied throughout (v1.1). Rationale in §2.4. Formal veto window remains at ADR-001 review |
+| 4 | v1 audience: Track B/C only, Track A deferred? | **Yes** | Track B/C (builders/engineers) only in v1; Track A no-code operator flow stays out of scope (§10). Role × mode matrix formalized in WP1.6 |
+| 5 | WP0 scope: full as written, or minimal? | **Full as written** | WP0 runs all six items, including commands and the arch-fitness ratchet |
+| 6 | Sequencing vs. the existing roadmap | **Yes — this plan takes priority** | WP0/WP1 slot ahead of Tauri packaging and remaining M5 marketplace work; RESEARCH-ROADMAP stages already shipped are unaffected |
+
+**Still open (in-WP1, non-blocking to WP0):** ADR-003 (state representation), ADR-004
+(artifact storage), ADR-005 (isolation technology) — recommendations are stated in WP1 and
+§5; they get decided at WP1 with alternatives on record.
 
 ## 9. Risk register (product-level; corpus-derived risks live in WP9's mapping)
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Dev-workspace = arbitrary code execution surface | High | WP3 hardening; FS **and** network isolation (either alone is escapable — corpus §8); destructive tier on destroy; egress allowlist default-closed for pipelines |
+| Workbench = arbitrary code execution surface | High | WP3 hardening; FS **and** network isolation (either alone is escapable — corpus §8); destructive tier on destroy; egress allowlist default-closed for workbenches |
 | Over-building (the ECC anti-example: capability ahead of pain) | Medium | Phasing; earned-checks off by default; WP6 packs pruned by measured usage; no Construct stratum until earned |
-| Executor bet ages badly (headless CLI API drift) | Medium | ADR-002 isolates it behind `ws.delegate`; native path remains |
+| Executor bet ages badly (headless CLI API drift) | Medium | ADR-002 isolates it behind `bench.delegate`; native path remains as fallback; "Reconsider when" trigger recorded in the ADR |
 | Verification theater (gates exist, checks weak) | Medium | Checks ship with honest refusal semantics (skip ≠ pass, loudly); reviewer class "compliance without gaming"; WP9 evals |
-| Token cost of gated pipelines | Medium | Stage 5 budgets gate ticks already; per-pipeline budget field; router profiles floor risky work |
-| Scope creep into a CI system | Low | ADR-001 scope boundary: v1 has no CI-provider integration; verify runs in *our* workspace only |
+| Token cost of gated projects | Medium | Stage 5 budgets gate ticks already; per-project budget field; router profiles floor risky work |
+| Scope creep into a CI system | Low | ADR-001 scope boundary: v1 has no CI-provider integration; verify runs in *our* workbench only |
 
 ## 10. Out of scope (v1)
 
-Multi-repo pipelines; CI-provider integrations (GitHub Actions etc.); Track A no-code
-operator flow; dynamic-workflow rung 6 (agent-written orchestration harnesses); fine-tuned
-review models; Windows dev-workspaces; marketplace *sale* of pipelines (sharing yes, per
-M5).
+Multi-repo projects; CI-provider integrations (GitHub Actions etc.); Track A no-code
+operator flow (ruled: v2 — §8 ruling 4); dynamic-workflow rung 6 (agent-written
+orchestration harnesses); fine-tuned review models; Windows workbenches; marketplace
+*sale* of projects (sharing yes, per M5).
 
 ---
 
