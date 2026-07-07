@@ -110,6 +110,7 @@ import {
   QueueRunner,
   RedisEventBus,
   createBuiltinCheckRunner,
+  DockerCommandExecutor,
   mirrorArtifactToKb,
   registerBridgeTools,
   registerKbTools,
@@ -250,14 +251,21 @@ const auditSink: typeof baseAuditSink = async (entry) => {
     }
   }
 };
+// Workshop WP3b.2: shell-backed verify checks (test/arch/custom) need a command
+// executor. WORKBENCH_MODE=docker wires the containerized executor (ADR-005;
+// verified on a Docker host via scripts/verify-workbench.mjs). Default off — no
+// executor means shell checks refuse honestly (DB-native checks still run). A
+// local (host-subprocess) executor is deliberately NOT offered here: running
+// project commands on the host is not the container isolation model.
+const workbenchExecutor =
+  process.env.WORKBENCH_MODE === "docker" ? new DockerCommandExecutor() : undefined;
+if (workbenchExecutor) app.log.info("workbench: docker executor enabled (shell verify checks active)");
 const executor = new WorkflowExecutor({
   db,
   bus,
   tools,
   audit: auditSink,
-  // Workshop WP4: DB-native checks (todo-sync) run here; shell-backed checks
-  // refuse until the workbench runner (WP3) replaces this.
-  checkRunner: createBuiltinCheckRunner({ db }),
+  checkRunner: createBuiltinCheckRunner({ db, executor: workbenchExecutor }),
 });
 const agentRuntime = new AgentRuntime({
   db,
