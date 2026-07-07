@@ -86,3 +86,13 @@ spike must exercise the *actual* mechanism (files created/owned inside the conta
 convenient stand-in — a bind-mount shortcut tests a code path the design explicitly avoids
 and manufactures a false negative. Fix: create the toy files inside the container as the
 workbench user.
+
+## 2026-07-06 — WP3b resume point (Docker-host verification pending)
+
+DockerCommandExecutor (packages/kernel/src/workbench.ts) is authored, typechecks, and
+builds here, but its acceptance can only run on a Docker host — this session has no daemon.
+To verify: on a Docker-capable host, `pnpm build && node scripts/verify-workbench.mjs`
+(exit 0 = ensure/idempotent/non-root/exit-codes/in-container-check/destroy all hold; exit
+3 = no daemon). Only after that PASS should WP3b.2 (server wiring behind WORKBENCH_MODE)
+and WP3b.3 (bench.* tools) proceed. Same discipline as the ADR-002 spike: author here,
+verify on the host, record the PASS before building on top.

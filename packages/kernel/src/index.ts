@@ -27,3 +27,4 @@ export * from "./compaction.js";
 export * from "./project-tools.js";
 export * from "./verify.js";
 export * from "./command-runner.js";
+export * from "./workbench.js";
