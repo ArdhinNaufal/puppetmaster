@@ -24,10 +24,10 @@ seam + `LocalCommandExecutor`) with two golden evals at pass^3 — suite now 14/
 remains is **WP3b** (the containerized connector: `DockerCommandExecutor`, `bench.*` tools,
 `bench.delegate`, lifecycle) plus WP5/WP6/WP7/WP9 remainders — the container-executing parts
 need a Docker host for their golden evals, though the substrate is spike-validated and the
-shell-check logic they reuse is already proven. **WP3b.1/.2 authored** (Docker executor +
-workbench lifecycle + env-gated server wiring); the **resume point** is a Docker-host run
-of `node scripts/verify-workbench.mjs` (WP3b.1 acceptance) before WP3b.3 (`bench.*` tools)
-builds on it — see `todos/backlog/wp3-workbench-connector.md`. Each work package runs
+shell-check logic they reuse is already proven. **WP3b.1/.2 authored; WP3b.1 host-verified
+2026-07-07** (`WORKBENCH EXECUTOR PASS`, which caught + fixed a real root-owned-volume bug —
+commit e8c520f). WP3b.3 (`bench.*` tools) is now cleared to build on the proven executor —
+see `todos/backlog/wp3-workbench-connector.md`. Each work package runs
 only on explicit go-ahead, in order, following the same convention as
 `docs/RESEARCH-ROADMAP.md`.
 

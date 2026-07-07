@@ -87,6 +87,35 @@ convenient stand-in — a bind-mount shortcut tests a code path the design expli
 and manufactures a false negative. Fix: create the toy files inside the container as the
 workbench user.
 
+## 2026-07-07 — A fresh named volume inherits the image mount-point's ownership
+
+WP3b.1's host acceptance failed only its file-writing assertion (`before=0, after=0` on the
+fail-before/pass-after check) while every read-only assertion passed. Root cause: the ADR-005
+per-project **named volume** mounts at `/workbench`, and Docker seeds a fresh empty named
+volume with the *ownership and permissions of the image's directory at that path*. `WORKDIR
+/workbench` creates that directory **root-owned**, but the container runs as non-root `bench`
+(uid 10001) — so `bench` could not write to `/workbench`, the fixture's `printf > add.mjs`
+failed silently (the setup step's exit code wasn't checked), `node --test` found no tests and
+exited 0 both times. Fix: `RUN mkdir -p /workbench && chown bench:bench /workbench` before
+`USER bench` so the fresh volume inherits bench ownership. Lesson: this is the *same*
+permission class learnings already flagged for bind-mounts (2026-07-06), but it also bites the
+named volume the design deliberately chose — a non-root container that writes to a mounted
+volume must own the mount-point in the image, not just the WORKDIR. Also: a setup/`arrange`
+step whose exit code is ignored can turn a real failure into a confusing null result — when a
+"pass-after" check yields the pass value on *both* sides, suspect the arrange step never ran.
+Verifier: `scripts/verify-workbench.mjs` (its in-container check assertion now covers this).
+
+## 2026-07-07 — The verify-workbench ritual must build the image first
+
+The WP3b resume instructions said `pnpm --filter … build && node scripts/verify-workbench.mjs`
+but omitted `docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .`.
+`DockerCommandExecutor` defaults to the **local** image tag `puppetmaster-workbench:spike`
+(`workbench.ts` DEFAULTS.image), so with no local build `docker run` tries to *pull* it and
+dies with `pull access denied … repository does not exist or may require 'docker login'` — a
+confusing error that reads like an auth/registry problem, not a missing local build. Lesson:
+when a script depends on a locally-built image, the build step is part of the ritual, not a
+prerequisite the reader is assumed to know. The RESUME POINT now lists both commands in order.
+
 ## 2026-07-06 — WP3b resume point (Docker-host verification pending)
 
 DockerCommandExecutor (packages/kernel/src/workbench.ts) is authored, typechecks, and

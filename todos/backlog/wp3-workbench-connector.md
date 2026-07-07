@@ -16,8 +16,11 @@ Docker socket proxy.
 - [x] **WP3b.1** `DockerCommandExecutor implements CommandExecutor`
       (`packages/kernel/src/workbench.ts`) — `docker exec` into the per-project container
       (same interface as `LocalCommandExecutor`; WP3a's shell checks run unchanged).
-      ensure/status/destroy lifecycle with ADR-005 caps. Authored + typechecks + builds
-      here; **container behavior pending a Docker-host run** (see resume point).
+      ensure/status/destroy lifecycle with ADR-005 caps. **Host-verified 2026-07-07:**
+      `WORKBENCH EXECUTOR PASS` on a real Docker daemon (all 7 assertions incl. the
+      in-container fail-before/pass-after check). Surfaced + fixed a real bug — the
+      named volume mounted root-owned so the non-root `bench` user couldn't write
+      (`docker/workbench.Dockerfile` now `chown`s `/workbench` to bench; commit e8c520f).
 - [x] **WP3b.2** server wiring — `WORKBENCH_MODE=docker` constructs the executor and
       activates shell checks (default off = honest refusal). Boots both ways.
 - [ ] **WP3b.3** `bench.*` tool namespace (git/exec/read/write) with tiers +
@@ -35,17 +38,29 @@ Docker socket proxy.
 
 ---
 
-## ▶ RESUME POINT (2026-07-06)
+## ▶ RESUME POINT — WP3b.1 host-verified 2026-07-07 ✅ (WP3b.3 cleared to start)
 
-**The single next action is yours, on a Docker-capable host:**
+**Done:** `WORKBENCH EXECUTOR PASS` on a real Docker host. The next builder starts WP3b.3
+(`bench.*` tools) on a proven executor foundation. Keep the verify ritual below — re-run it
+after any change to `workbench.ts` or `docker/workbench.Dockerfile`.
+
+**The verify ritual (Docker-capable host), in order — the image must be built first:**
 
 ```
+docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .
 pnpm --filter "@puppetmaster/kernel..." build && node scripts/verify-workbench.mjs
 ```
 
-Build **kernel only** — the script imports just `packages/kernel/dist/workbench.js`, so it
-does not need the web app. (`pnpm build` also works but drags in the apps/web build, which
-needs a synced `pnpm install` for its `@fontsource` imports — unrelated to the workbench.)
+The `docker build` is not optional: `DockerCommandExecutor` defaults to the
+`puppetmaster-workbench:spike` **local** image tag (`workbench.ts` `DEFAULTS.image`). Skip
+the build and `docker run` tries to *pull* it and fails with `pull access denied … may
+require 'docker login'` (this bit the first host run — the earlier resume point omitted the
+build step).
+
+Build **kernel only** for the second command — the script imports just
+`packages/kernel/dist/workbench.js`, so it does not need the web app. (`pnpm build` also
+works but drags in the apps/web build, which needs a synced `pnpm install` for its
+`@fontsource` imports — unrelated to the workbench.)
 
 Expect `WORKBENCH EXECUTOR PASS: ensure/idempotent/non-root/exit-codes/in-container
 check/destroy` (exit 3 = no daemon). This is WP3b.1's acceptance — it drives the built
@@ -57,16 +72,11 @@ install on the host. Fix separately with `pnpm install` (syncs node_modules to t
 committed lockfile, incl. the WP0 dependency-cruiser addition). Does not block the
 workbench verification above.
 
-- **If PASS:** record it in `docs/adr/spike-002-record.md` (a WP3b.1 row), then WP3b.3
-  (`bench.*` tools) is cleared to start — the executor foundation is proven.
-- **If FAIL:** paste the output. A failure is a real signal about the executor code or
-  the ADR-005 image; fix before building `bench.*` on top.
-
-**Why work stopped here (principled, not just usage):** WP3b.3+ build on the container
-executor. Per the discipline that's governed this whole integration — verify a foundation
-before building on it (exactly how the ADR-002 spike was handled) — the honest move is to
-prove WP3b.1 on real Docker before writing the `bench.*` tools that depend on it. This
-session has no Docker daemon, so that proof is the owner's to run.
+**Verified (2026-07-07):** the host run PASSed and, as designed, the acceptance caught a
+real bug on the first attempt (root-owned named volume → non-root write denied), fixed in
+commit e8c520f before WP3b.3 proceeds. This is the discipline working: verify the
+foundation on real Docker, fix what the proof surfaces, *then* build `bench.*` on top —
+exactly how the ADR-002 spike was handled. WP3b.3 is now cleared to start.
 
 **Largest security surface in the plan — ADR-005 posture spike-confirmed (non-root,
 `--network none`, resource caps); review ADR-005 before WP3b.3+.**
