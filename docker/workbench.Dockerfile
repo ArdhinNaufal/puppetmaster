@@ -21,6 +21,12 @@ RUN corepack enable
 # Non-root workbench user. The per-project volume mounts at /workbench (ADR-005:
 # named volume, no host mounts); code the container runs never runs as root.
 RUN useradd --create-home --uid 10001 bench
+
+# /workbench must be owned by bench: a fresh named volume inherits the image
+# mount-point's ownership on first mount. WORKDIR alone creates it root-owned,
+# so the non-root user could not write there — checks that create files (e.g.
+# `node --test` fixtures) would fail silently. Own it before the volume mounts.
+RUN mkdir -p /workbench && chown bench:bench /workbench
 WORKDIR /workbench
 USER bench
 
