@@ -7,9 +7,11 @@ six open decisions are recorded in §8; the owner's start signal was given 2026-
 except one item:** the ADR-002 container spike half is blocked on a docker-capable host
 (the headless-CLI half PASSED — `docs/adr/spike-002-record.md`). ADRs 000–007 are written.
 **WP2 is complete** (domain model + artifact store + tools + REST; golden eval
-`workshop-artifact-lifecycle` green at pass^3). Next in the dependency order is WP3
-(workbench connector), which is gated on the ADR-002 container spike passing on a
-docker-capable host; WP4 needs WP2+WP3. Each work package runs only on explicit
+`workshop-artifact-lifecycle` green at pass^3). **WP4's workbench-independent core is
+complete** (verify node + evidence + bounded fix loop + escalation + todo-sync check +
+inbox evidence; four golden evals green at pass^3) — its shell-backed check runner rides
+WP3. Next in the dependency order is WP3 (workbench connector), gated on the ADR-002
+container spike passing on a docker-capable host. Each work package runs only on explicit
 go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
@@ -607,13 +609,22 @@ started.)*
 - [ ] `bench.delegate` with hard budgets (per ADR-002 ruling)
 - [ ] Golden evals: exit-code propagation; injection→push gated; egress refusal audited
 
-**WP4 — Verification gates**
-- [ ] `verify` node handler + Evidence persistence
-- [ ] Bounded retry loop + escalation-to-approval (default 8)
-- [ ] Check library: test / todo-sync / refactor-gate / arch(ratchet) / load(skip-without-SLOs)
-- [ ] Linter rules (gated-without-verify; verifier-edit flag)
-- [ ] Evidence rendered in approval inbox
-- [ ] Golden evals (block/recover; escalate-with-evidence; refactor-gate M-vs-A)
+**WP4 — Verification gates** — ✅ workbench-independent core complete 2026-07-06
+- [x] `verify` node handler + Evidence persistence (fail-closed on missing/disabled
+      check or absent runner)
+- [x] Bounded retry loop (fix agent as nested child mission, instruction = check
+      failure output) + escalation-to-approval (default 8; override recorded honestly)
+- [x] Check library: todo-sync live (DB-native); test / refactor-gate / arch(ratchet) /
+      load(skip-without-SLOs) refused-with-pointer until the WP3 workbench runner
+      replaces the builtin (noted in the WP3 todo)
+- [x] Linter rules (verify-invalid-config; gated-without-verify +
+      gated-agent-without-verify behind projectMode — WP5 wires the mode)
+- [ ] Linter/review flag for verifier-edit (fitness config/baseline) — workbench
+      territory, rides WP3
+- [x] Evidence rendered in approval inbox (API + AUTHORIZATIONS panel)
+- [x] Golden evals: gate-pass w/ step evidence; escalate-with-evidence; bounded
+      fix loop (2 attempts → 1 nested fix mission); disabled-check fails closed
+      (refactor-gate M-vs-A eval rides WP3's runner)
 
 **WP5 — Phases**
 - [ ] Interviewer + SPECIFY flow (restate-first; forcing sections; theater refusal)

@@ -1,8 +1,15 @@
 import {
   completeTodo,
+  createAgent,
   createProject,
+  createVerifyCheck,
+  getMission,
   getMissionSteps,
   listArtifacts,
+  listApprovals,
+  listChildMissions,
+  listEvidenceForApproval,
+  listEvidenceForStep,
   searchMemories,
   updateArtifact,
   writeArtifact,
@@ -32,6 +39,9 @@ export interface GoldenTask {
   /** Seed fixture rows before the run; the returned object is merged into the
    *  workflow input so nodes can reference ids via {{input.*}} templating. */
   setup?: (db: Db, ctx: { workspaceId: string }) => Promise<Record<string, unknown>>;
+  /** Expected terminal status (default "succeeded") — verify-gate scenarios
+   *  legitimately end awaiting_approval or failed. */
+  expectStatus?: "succeeded" | "failed" | "awaiting_approval";
   expectOutput?: (output: unknown) => boolean;
   expectState?: (
     db: Db,
@@ -216,6 +226,159 @@ export const GOLDEN_TASKS: GoldenTask[] = [
     trajectory: {
       mustCall: ["project.artifact.write", "project.todo.complete"],
       mayCallOnly: ["project.artifact.write", "project.todo.complete"],
+    },
+  },
+  {
+    id: "workshop-verify-gate-pass",
+    description:
+      "Workshop WP4: an in-sync project passes the todo-sync verify gate; evidence is persisted on the step and the gated action runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-gate-pass" });
+      await writeArtifact(db, { projectId: project.id, kind: "spec", title: "Spec", body: "v1" });
+      await new Promise((r) => setTimeout(r, 15));
+      await writeArtifact(db, { projectId: project.id, kind: "todo", title: "task", status: "active" });
+      await createVerifyCheck(db, { projectId: project.id, name: "todo-sync", enabled: true, earnedNote: "eval fixture" });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "todo-sync gate", config: { projectId: "{{input.projectId}}", check: "todo-sync" } },
+        { id: "util__echo", kind: "action", label: "gated work", config: { server: "util", tool: "echo", args: { value: "gated-ok" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectOutput: (o) => o === "gated-ok",
+    expectState: async (db, ctx) => {
+      const steps = await getMissionSteps(db, ctx.missionId);
+      const gate = steps.find((s) => s.kind === "verify");
+      if (!gate || gate.status !== "succeeded") return false;
+      const out = gate.output as { passed?: boolean; check?: string } | null;
+      if (out?.passed !== true || out?.check !== "todo-sync") return false;
+      const ev = await listEvidenceForStep(db, gate.id);
+      return ev.length === 1 && ev[0]!.kind === "state-assert";
+    },
+    trajectory: { mustCall: ["util.echo"], mayCallOnly: ["util.echo"] },
+  },
+  {
+    id: "workshop-verify-gate-escalates",
+    description:
+      "Workshop WP4: an out-of-sync project fails the todo-sync gate with no fix agent — the mission pauses on an escalation approval carrying evidence; the gated action never runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-gate-block" });
+      await writeArtifact(db, { projectId: project.id, kind: "todo", title: "stale task", status: "active" });
+      await new Promise((r) => setTimeout(r, 15));
+      await writeArtifact(db, { projectId: project.id, kind: "spec", title: "Spec", body: "changed after todos" });
+      await createVerifyCheck(db, { projectId: project.id, name: "todo-sync", enabled: true, earnedNote: "eval fixture" });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "todo-sync gate", config: { projectId: "{{input.projectId}}", check: "todo-sync" } },
+        { id: "util__echo", kind: "action", label: "gated work", config: { server: "util", tool: "echo", args: { value: "should-not-run" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      if (!approval || !approval.prompt.includes("todo-sync")) return false;
+      const ev = await listEvidenceForApproval(db, approval.id);
+      if (ev.length !== 1) return false;
+      const content = ev[0]!.content as { runs?: unknown[] } | null;
+      return Array.isArray(content?.runs) && content!.runs!.length === 1;
+    },
+    trajectory: { mayCallOnly: [] },
+  },
+  {
+    id: "workshop-verify-fix-loop-bounded",
+    description:
+      "Workshop WP4: a failing gate with a fix agent runs the bounded loop — N check attempts, N-1 nested fix missions with the failure instruction — then escalates with the full run history as evidence",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-gate-loop" });
+      await writeArtifact(db, { projectId: project.id, kind: "todo", title: "stale task", status: "active" });
+      await new Promise((r) => setTimeout(r, 15));
+      await writeArtifact(db, { projectId: project.id, kind: "spec", title: "Spec", body: "changed after todos" });
+      await createVerifyCheck(db, { projectId: project.id, name: "todo-sync", enabled: true, earnedNote: "eval fixture" });
+      // The mock provider replies with text (it cannot act on the multi-sentence
+      // instruction) — deliberately: this pins the LOOP and the ESCALATION, not
+      // a scripted fix. The full fix-recovery e2e lands with WP5's executor.
+      const fixer = await createAgent(db, {
+        workspaceId: ctx.workspaceId,
+        name: "eval-fixer",
+        persona: "You fix verify-gate failures.",
+        model: "mock",
+      });
+      return { projectId: project.id, fixAgentId: fixer.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "gate",
+          kind: "verify",
+          label: "todo-sync gate",
+          config: {
+            projectId: "{{input.projectId}}",
+            check: "todo-sync",
+            fixAgentId: "{{input.fixAgentId}}",
+            retriesBeforeEscalate: 2,
+          },
+        },
+      ],
+      edges: [{ from: "t", to: "gate" }],
+    },
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      // Bounded loop shape: 2 check attempts -> exactly 1 nested fix mission.
+      const children = await listChildMissions(db, ctx.missionId);
+      if (children.length !== 1) return false;
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      if (!approval || !approval.prompt.includes("after 2 attempt(s)")) return false;
+      const ev = await listEvidenceForApproval(db, approval.id);
+      const content = ev[0]?.content as { runs?: { fixMissionId?: string }[] } | null;
+      return (
+        Array.isArray(content?.runs) &&
+        content!.runs!.length === 2 &&
+        content!.runs![0]!.fixMissionId === children[0]!.id
+      );
+    },
+  },
+  {
+    id: "workshop-verify-disabled-fails-closed",
+    description:
+      "Workshop WP4: gating on a disabled check fails the mission loudly (earned policies are off by default; absence must never pass)",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-gate-disabled" });
+      await createVerifyCheck(db, { projectId: project.id, name: "todo-sync", enabled: false });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "gate", config: { projectId: "{{input.projectId}}", check: "todo-sync" } },
+      ],
+      edges: [{ from: "t", to: "gate" }],
+    },
+    expectStatus: "failed",
+    expectState: async (db, ctx) => {
+      const mission = await getMission(db, ctx.missionId);
+      return Boolean(mission?.error?.includes("disabled"));
     },
   },
 ];

@@ -5,6 +5,7 @@ import {
   ProjectMode,
   ProjectPhase,
   ProjectStatus,
+  VerifyCheckName,
   WorkflowGraph,
 } from "@puppetmaster/shared";
 import {
@@ -26,6 +27,7 @@ import {
   deleteBudget,
   completeTodo,
   createAgent,
+  createVerifyCheck,
   createDb,
   createProject,
   createTemplate,
@@ -45,6 +47,7 @@ import {
   getMissionSteps,
   getProject,
   getTemplate,
+  getVerifyCheckByName,
   getWorkflow,
   getWorkflowVersionById,
   getWorkflowWithGraph,
@@ -52,6 +55,8 @@ import {
   listAgents,
   listApprovals,
   listArtifacts,
+  listEvidenceForApproval,
+  listVerifyChecks,
   listAudit,
   insertEvalRun,
   listBudgets,
@@ -81,6 +86,7 @@ import {
   updateMemory,
   updateMission,
   updateProject,
+  updateVerifyCheck,
   updateWorkspace,
   writeArtifact,
   type DbHandle,
@@ -103,6 +109,7 @@ import {
   lintWorkflowGraph,
   QueueRunner,
   RedisEventBus,
+  createBuiltinCheckRunner,
   registerBridgeTools,
   registerKbTools,
   registerProjectTools,
@@ -242,7 +249,15 @@ const auditSink: typeof baseAuditSink = async (entry) => {
     }
   }
 };
-const executor = new WorkflowExecutor({ db, bus, tools, audit: auditSink });
+const executor = new WorkflowExecutor({
+  db,
+  bus,
+  tools,
+  audit: auditSink,
+  // Workshop WP4: DB-native checks (todo-sync) run here; shell-backed checks
+  // refuse until the workbench runner (WP3) replaces this.
+  checkRunner: createBuiltinCheckRunner({ db }),
+});
 const agentRuntime = new AgentRuntime({
   db,
   bus,
@@ -686,6 +701,77 @@ app.post("/api/projects/:id/artifacts", async (req, reply) => {
   } catch (err) {
     return reply.code(400).send({ error: err instanceof Error ? err.message : "invalid artifact" });
   }
+});
+
+// Verify checks (WP4): earned policies — created disabled unless explicitly
+// enabled with a note on what failure earned them. Mutations are admin
+// (ADR-001 role matrix: check config is admin).
+app.get("/api/projects/:id/checks", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  return listVerifyChecks(db, id);
+});
+
+app.post("/api/projects/:id/checks", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const body = req.body as {
+    name?: string;
+    command?: string;
+    baseline?: number;
+    enabled?: boolean;
+    earnedNote?: string;
+  };
+  const name = VerifyCheckName.safeParse(body.name);
+  if (!name.success) return reply.code(400).send({ error: "invalid check name" });
+  if (await getVerifyCheckByName(db, id, name.data)) {
+    return reply.code(409).send({ error: `check "${name.data}" already exists for this project` });
+  }
+  const row = await createVerifyCheck(db, {
+    projectId: id,
+    name: name.data,
+    command: body.command ?? null,
+    baseline: body.baseline ?? null,
+    enabled: body.enabled ?? false,
+    earnedNote: body.earnedNote ?? "",
+  });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "project.check.create",
+    target: row.id,
+    detail: { projectId: id, name: name.data, enabled: row.enabled },
+  });
+  return reply.code(201).send(row);
+});
+
+app.put("/api/projects/:id/checks/:checkId", async (req, reply) => {
+  const { id, checkId } = req.params as { id: string; checkId: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const body = req.body as { command?: string; baseline?: number; enabled?: boolean; earnedNote?: string };
+  const row = await updateVerifyCheck(db, checkId, body);
+  if (!row || row.projectId !== id) return reply.code(404).send({ error: "check not found" });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "project.check.update",
+    target: checkId,
+    detail: { projectId: id, ...body },
+  });
+  return row;
 });
 
 /** Complete a todo. The completing mission's id is mandatory — the lifecycle
@@ -1479,7 +1565,15 @@ app.get("/api/missions/:id/replay", async (req, reply) => {
 // --- Approvals ---------------------------------------------------------------
 app.get("/api/approvals", async (req) => {
   const { status } = req.query as { status?: string };
-  return listApprovals(db, status);
+  const rows = await listApprovals(db, status);
+  // Workshop WP4 (org layer §1): the inbox judges evidence, not assertions —
+  // verify-gate escalations carry their check runs alongside the prompt.
+  return Promise.all(
+    rows.map(async (a: { id: string }) => ({
+      ...a,
+      evidence: await listEvidenceForApproval(db, a.id),
+    })),
+  );
 });
 
 app.post("/api/approvals/:id", async (req, reply) => {

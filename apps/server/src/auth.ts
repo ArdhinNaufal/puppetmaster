@@ -77,6 +77,9 @@ const POLICY: PolicyRule[] = [
   { methods: ["GET", "PUT", "DELETE"], path: /^\/api\/credentials(\/|$)/, role: "admin" },
   { methods: ["GET", "POST", "PUT", "DELETE"], path: /^\/api\/policies(\/|$)/, role: "admin" },
   // Builder surface: authoring and operating workflows/agents, resolving approvals.
+  // Workshop verify-check config is admin (ADR-001 role matrix) — must come
+  // before the broader builder rule for /api/projects.
+  { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/projects\/[^/]+\/checks(\/|$)/, role: "admin" },
   // The Workshop (AI-SDLC plan WP2): browsing projects/artifacts is member;
   // creating/updating projects and writing artifacts is builder+ (ADR-001).
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/projects(\/|$)/, role: "builder" },

@@ -61,6 +61,12 @@ export interface MissionStep {
   output: unknown;
   error: string | null;
 }
+export interface ApprovalEvidence {
+  id: string;
+  kind: string;
+  content: unknown;
+  ref: string | null;
+}
 export interface Approval {
   id: string;
   missionId: string;
@@ -69,6 +75,9 @@ export interface Approval {
   tier: string;
   status: string;
   createdAt: string;
+  /** Workshop WP4: verify-gate escalations carry their check runs — the
+   *  inbox judges evidence, not assertions (org layer §1). */
+  evidence?: ApprovalEvidence[];
 }
 
 export interface LintIssue {

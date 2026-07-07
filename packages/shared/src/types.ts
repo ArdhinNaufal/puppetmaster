@@ -244,6 +244,20 @@ export const VerifyCheck = z.object({
 });
 export type VerifyCheck = z.infer<typeof VerifyCheck>;
 
+/** Config for the `verify` node kind (WP4): a deterministic gate. The check
+ *  runs via the deployment's CheckRunner; on failure the executor loops the
+ *  fix agent (if configured) up to `retriesBeforeEscalate` times with the
+ *  check's failure output as instruction, then escalates to a human approval
+ *  with evidence attached (the corpus's 8-block override, made policy).
+ *  `projectId` / `fixAgentId` support `{{input.*}}` templating like action args. */
+export const VerifyNodeConfig = z.object({
+  projectId: z.string().min(1),
+  check: z.enum(["test", "arch", "refactor-gate", "todo-sync", "load", "custom"]),
+  fixAgentId: z.string().optional(),
+  retriesBeforeEscalate: z.number().int().min(1).max(20).default(8),
+});
+export type VerifyNodeConfig = z.infer<typeof VerifyNodeConfig>;
+
 export const EvidenceKind = z.enum(["test-output", "diff", "screenshot", "state-assert"]);
 export type EvidenceKind = z.infer<typeof EvidenceKind>;
 

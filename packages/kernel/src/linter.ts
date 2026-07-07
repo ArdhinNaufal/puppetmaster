@@ -1,4 +1,4 @@
-import { WorkflowGraph } from "@puppetmaster/shared";
+import { VerifyNodeConfig, WorkflowGraph } from "@puppetmaster/shared";
 import type { ToolInfo } from "./tools.js";
 
 /**
@@ -19,6 +19,11 @@ export interface LintIssue {
 export function lintWorkflowGraph(
   graphInput: unknown,
   toolInfo?: (server: string, tool: string) => ToolInfo | null,
+  opts?: {
+    /** Workshop WP4: graphs run under a gated project need verify gates —
+     *  every agent node must have a verify node downstream. */
+    projectMode?: "supervised" | "gated";
+  },
 ): LintIssue[] {
   const parsed = WorkflowGraph.safeParse(graphInput);
   if (!parsed.success) {
@@ -157,16 +162,47 @@ export function lintWorkflowGraph(
         nodeId: n.id,
       });
     }
-    // Workshop WP2: the verify node kind exists in the schema, but its
-    // execution machinery ships in WP4 — running it now would fail the
-    // mission with "unsupported node kind". Say so at lint time instead.
-    if (n.kind === "verify") {
+    // Workshop WP4: verify nodes must carry a valid gate config.
+    if (n.kind === "verify" && !VerifyNodeConfig.safeParse(n.config).success) {
       issues.push({
         severity: "error",
-        code: "verify-not-executable",
-        message: `verify node "${n.label}": deterministic gates land with the Workshop gate machinery (WP4); this node cannot execute yet`,
+        code: "verify-invalid-config",
+        message: `verify node "${n.label}" needs { projectId, check } (check: test | arch | refactor-gate | todo-sync | load | custom)`,
         nodeId: n.id,
       });
+    }
+  }
+
+  // Workshop WP4 (gap W8): a gated project's graph must gate its agents —
+  // every agent node needs a verify node downstream, and the graph needs at
+  // least one verify gate at all.
+  if (opts?.projectMode === "gated") {
+    const verifyIds = new Set(graph.nodes.filter((n) => n.kind === "verify").map((n) => n.id));
+    if (verifyIds.size === 0) {
+      issues.push({
+        severity: "error",
+        code: "gated-without-verify",
+        message: "gated project: the graph has no verify gate — gated execution without a deterministic check is unverified autonomy",
+      });
+    }
+    const reachesVerify = (start: string, seen = new Set<string>()): boolean => {
+      for (const next of adj.get(start) ?? []) {
+        if (seen.has(next)) continue;
+        seen.add(next);
+        if (verifyIds.has(next)) return true;
+        if (reachesVerify(next, seen)) return true;
+      }
+      return false;
+    };
+    for (const n of graph.nodes) {
+      if (n.kind === "agent" && !reachesVerify(n.id)) {
+        issues.push({
+          severity: "error",
+          code: "gated-agent-without-verify",
+          message: `gated project: agent node "${n.label}" has no verify gate downstream`,
+          nodeId: n.id,
+        });
+      }
     }
   }
 

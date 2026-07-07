@@ -479,6 +479,9 @@ export const projectArtifacts = pgTable("project_artifacts", {
   supersedesId: uuid("supersedes_id"),
   missionId: uuid("mission_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Set on every legal mutation (todo transitions, ADR acceptance) — the
+   *  todo-sync check compares this against the latest spec's createdAt. */
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 /** Deterministic checks for a project's verify nodes (WP4). Earned policies:

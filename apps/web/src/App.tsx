@@ -564,6 +564,17 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               <li key={a.id} className="appr">
                 <span className="appr-tag">PENDING · {a.tier.replace(/_/g, " ").toUpperCase()}</span>
                 <div className="appr-prompt">{a.prompt}</div>
+                {(a.evidence ?? []).map((e) => {
+                  const runs = (e.content as { runs?: { attempt: number; ok: boolean; summary: string }[] } | null)?.runs;
+                  return (
+                    <pre key={e.id} className="appr-evidence">
+                      {`EVIDENCE · ${e.kind.toUpperCase()}\n`}
+                      {runs
+                        ? runs.map((r) => `  #${r.attempt} ${r.ok ? "PASS" : "FAIL"} — ${r.summary}`).join("\n")
+                        : JSON.stringify(e.content, null, 1)?.slice(0, 400)}
+                    </pre>
+                  );
+                })}
                 {canBuild ? (
                   <div className="appr-actions">
                     <HoldButton tiny onComplete={() => decide(a.id, true)} title="Hold to authorize">

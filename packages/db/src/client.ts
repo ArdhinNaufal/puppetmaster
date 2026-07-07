@@ -372,6 +372,7 @@ const DDL: string[] = [
      ref text,
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `ALTER TABLE project_artifacts ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()`,
   `CREATE INDEX IF NOT EXISTS projects_workspace_idx ON projects(workspace_id)`,
   `CREATE INDEX IF NOT EXISTS project_artifacts_project_idx ON project_artifacts(project_id, kind, status)`,
   `CREATE INDEX IF NOT EXISTS verify_checks_project_idx ON verify_checks(project_id)`,

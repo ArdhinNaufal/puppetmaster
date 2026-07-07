@@ -41,3 +41,17 @@ gives B the output of A, so B's args can't reference payload fields. Idiom: add 
 `trigger → B` edge declared BEFORE the `A → B` edge — input resolution takes the first
 satisfied edge's upstream output (the payload), while the second edge still enforces
 ordering. Verifier: pinned by the `workshop-artifact-lifecycle` golden task.
+
+## 2026-07-06 — Undefined CSS custom properties fail silently
+
+`var(--line)` compiled and rendered without any error — the design system's border token
+is `--stroke` (see fui.css `:root`). Neither tsc nor Vite validates CSS variable names.
+Check new rules against the tokens actually defined in fui.css; an invalid var() just
+computes to nothing at runtime.
+
+## 2026-07-06 — Eval predicates go through repo functions, not raw tables
+
+Importing `drizzle-orm` in apps/server (for eval DB-state predicates) fails: the server
+doesn't depend on drizzle directly and must not — table access belongs to
+@puppetmaster/db. The fix that keeps the dependency direction honest: add the tiny query
+helper (`listChildMissions`) to the db package and call it from the eval.

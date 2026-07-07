@@ -13,6 +13,7 @@ import {
   createAgentInvoker,
   createEmbedder,
   InMemoryEventBus,
+  createBuiltinCheckRunner,
   ModelRouter,
   registerProjectTools,
   startAgentTick,
@@ -64,7 +65,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
     const bus = new InMemoryEventBus();
     const router = new ModelRouter({});
     const embedder = createEmbedder({});
-    const executor = new WorkflowExecutor({ db, bus, tools });
+    const executor = new WorkflowExecutor({ db, bus, tools, checkRunner: createBuiltinCheckRunner({ db }) });
     const runtime = new AgentRuntime({ db, bus, router, tools, embedder });
     executor.setAgentInvoker(createAgentInvoker({ db, runtime }));
 
@@ -104,8 +105,9 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
     const steps = await getMissionSteps(db, missionId);
     const notes: string[] = [];
 
-    let pass = mission?.status === "succeeded";
-    if (!pass) notes.push(`status=${mission?.status}: ${mission?.error ?? ""}`);
+    const wantStatus = task.expectStatus ?? "succeeded";
+    let pass = mission?.status === wantStatus;
+    if (!pass) notes.push(`status=${mission?.status} (wanted ${wantStatus}): ${mission?.error ?? ""}`);
     if (pass && task.expectOutput && !task.expectOutput(mission!.output)) {
       pass = false;
       notes.push(`output predicate failed: ${JSON.stringify(mission!.output)?.slice(0, 120)}`);

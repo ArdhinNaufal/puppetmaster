@@ -8,3 +8,8 @@ destructive tier on destroy); `bench.git.*`, `bench.exec` (allowlisted), `bench.
 `bench.delegate(task, budget)` per ADR-002; egress allowlist default-closed, resource caps,
 vault-only secrets. Golden evals: exit-code propagation; injection→push gated; egress
 refusal audited. **Largest security surface in the plan — review ADR-005 before starting.**
+
+**Added from WP4 (2026-07-06):** the workbench must also ship the shell-backed
+`CheckRunner` (test / arch / refactor-gate / load / custom) replacing the kernel's
+builtin runner refusals — the verify-node machinery, evidence, bounded fix loop, and
+escalation are already live (WP4) and only need the runner swapped in.

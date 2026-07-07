@@ -4,6 +4,7 @@ import {
   AgentNodeConfig,
   ApprovalConfig,
   CodeConfig,
+  VerifyNodeConfig,
   LogicConfig,
   WorkflowGraph,
   type MissionStatus,
@@ -18,6 +19,7 @@ import {
   findCommittedExecution,
   getMission,
   getMissionSteps,
+  createEvidence,
   getWorkflowVersionById,
   insertStep,
   updateMission,
@@ -26,6 +28,7 @@ import {
 } from "@puppetmaster/db";
 import type { EventBus } from "./bridge.js";
 import type { AuditSink } from "./audit-sink.js";
+import type { CheckRunner } from "./verify.js";
 import { runCodeNode } from "./sandbox.js";
 import { BuiltinToolRegistry, type ToolRegistry } from "./tools.js";
 import { wrapUntrusted } from "./untrusted.js";
@@ -91,6 +94,8 @@ export interface ExecutorDeps {
   bus: EventBus;
   tools?: ToolRegistry;
   audit?: AuditSink;
+  /** Executes verify-node checks (Workshop WP4). Absent → verify nodes fail closed. */
+  checkRunner?: CheckRunner;
 }
 
 /**
@@ -104,6 +109,7 @@ export class WorkflowExecutor {
   private readonly bus: EventBus;
   private readonly tools: ToolRegistry;
   private readonly audit: AuditSink | null;
+  private readonly checkRunner: CheckRunner | null;
   private agentInvoker: AgentInvoker | null = null;
 
   constructor(deps: ExecutorDeps) {
@@ -111,6 +117,7 @@ export class WorkflowExecutor {
     this.bus = deps.bus;
     this.tools = deps.tools ?? new BuiltinToolRegistry();
     this.audit = deps.audit ?? null;
+    this.checkRunner = deps.checkRunner ?? null;
   }
 
   /** Best-effort audit; never let a logging failure break execution. */
@@ -237,6 +244,134 @@ export class WorkflowExecutor {
         await this.recordStep(missionId, node, "succeeded", 0, nodeInput ?? null, nodeInput ?? null, null, stepIdByNode);
         await persistCursor();
         continue;
+      }
+
+      // Verify gate (Workshop WP4): a deterministic check gates the edge.
+      // Fail → bounded fix loop via the agent bridge (the check's failure
+      // output is the agent's instruction), then escalation to a human
+      // approval with evidence attached — the corpus's 8-block override as
+      // policy. Approve = override recorded; reject = mission fails.
+      if (node.kind === "verify") {
+        const cfg = VerifyNodeConfig.parse(node.config);
+        const projectId = resolveTemplate(cfg.projectId, nodeInput);
+        const fixAgentId = cfg.fixAgentId ? resolveTemplate(cfg.fixAgentId, nodeInput) : null;
+
+        const existing = await findApprovalForNode(this.db, missionId, node.id);
+        if (existing) {
+          if (existing.status === "pending") {
+            await this.recordStep(missionId, node, "awaiting_approval", 0, nodeInput ?? null, null, null, stepIdByNode);
+            await persistCursor();
+            await updateMission(this.db, missionId, { status: "awaiting_approval" });
+            return "awaiting_approval";
+          }
+          if (existing.status === "rejected") {
+            await this.recordStep(missionId, node, "failed", 0, nodeInput ?? null, null, "verify gate rejected", stepIdByNode);
+            return this.finishMission(missionId, "failed", null, `verify gate "${cfg.check}" rejected by operator`);
+          }
+          // Approved = the human overrode the failing gate. Record that
+          // honestly: the check did NOT pass; the gate was overridden.
+          const output = { check: cfg.check, passed: false, overridden: true, approvalId: existing.id };
+          outputs[node.id] = output;
+          completed.add(node.id);
+          await this.recordStep(missionId, node, "succeeded", 0, nodeInput ?? null, output, null, stepIdByNode);
+          await this.recordAudit({
+            workspaceId: mission.workspaceId,
+            actorKind: "system",
+            actorLabel: "verify-gate",
+            missionId,
+            action: "verify.override",
+            target: cfg.check,
+            detail: { node: node.id, approvalId: existing.id },
+          });
+          await persistCursor();
+          continue;
+        }
+
+        if (!this.checkRunner) {
+          const msg = `verify node "${node.id}": no check runner configured — gated execution is unavailable in this deployment`;
+          await this.recordStep(missionId, node, "failed", 0, nodeInput ?? null, null, msg, stepIdByNode);
+          return this.finishMission(missionId, "failed", null, msg);
+        }
+
+        const maxAttempts = fixAgentId && this.agentInvoker ? cfg.retriesBeforeEscalate : 1;
+        const runs: { attempt: number; ok: boolean; summary: string; fixMissionId?: string }[] = [];
+        let result: Awaited<ReturnType<CheckRunner["run"]>>;
+        let attempt = 0;
+        try {
+          for (;;) {
+            attempt++;
+            result = await this.checkRunner.run({ projectId, check: cfg.check, missionId });
+            const run: (typeof runs)[number] = { attempt, ok: result.ok, summary: result.summary };
+            runs.push(run);
+            if (result.ok || attempt >= maxAttempts) break;
+            // Fix loop: the check's failure instruction becomes the agent's task,
+            // run as a nested child mission (trace nests; tiers still gate).
+            const fix = await this.agentInvoker!({
+              agentId: fixAgentId!,
+              message: result.instruction ?? result.summary,
+              parentMissionId: missionId,
+            });
+            run.fixMissionId = fix.missionId;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.recordStep(missionId, node, "failed", attempt, nodeInput ?? null, null, msg, stepIdByNode);
+          return this.finishMission(missionId, "failed", null, msg);
+        }
+
+        if (result.ok) {
+          const output = { check: cfg.check, passed: true, attempts: attempt, summary: result.summary };
+          outputs[node.id] = output;
+          completed.add(node.id);
+          await this.recordStep(missionId, node, "succeeded", attempt, nodeInput ?? null, output, null, stepIdByNode);
+          const stepId = stepIdByNode.get(node.id);
+          if (stepId) {
+            await createEvidence(this.db, {
+              stepId,
+              kind: result.evidenceKind,
+              content: { check: cfg.check, runs, detail: result.detail ?? null },
+            });
+          }
+          await persistCursor();
+          continue;
+        }
+
+        // Exhausted (or no fix agent): escalate to a human approval with the
+        // evidence attached. The inbox shows what failed and how many times.
+        const approval = await createApproval(this.db, {
+          missionId,
+          nodeId: node.id,
+          prompt:
+            `Verify gate "${cfg.check}" failed after ${attempt} attempt(s): ${result.summary}. ` +
+            `Approve to OVERRIDE the gate and continue; reject to fail the mission.`,
+          tier: "write_approved",
+        });
+        await createEvidence(this.db, {
+          approvalId: approval.id,
+          kind: result.evidenceKind,
+          content: { check: cfg.check, runs, detail: result.detail ?? null },
+        });
+        await this.recordStep(missionId, node, "awaiting_approval", attempt, nodeInput ?? null, null, null, stepIdByNode);
+        await persistCursor();
+        await updateMission(this.db, missionId, { status: "awaiting_approval" });
+        await this.recordAudit({
+          workspaceId: mission.workspaceId,
+          actorKind: "system",
+          actorLabel: "verify-gate",
+          missionId,
+          action: "verify.escalated",
+          target: cfg.check,
+          detail: { node: node.id, attempts: attempt, approvalId: approval.id },
+        });
+        await this.bus.publish({
+          type: "approval.requested",
+          missionId,
+          nodeId: node.id,
+          approvalId: approval.id,
+          prompt: approval.prompt,
+          at: now().toISOString(),
+        });
+        return "awaiting_approval";
       }
 
       // Execute with per-node retries + timeout.
@@ -422,6 +557,12 @@ export class WorkflowExecutor {
       ...(error ? { error } : {}),
     });
   }
+}
+
+/** Resolve one templatable string (verify-node config fields). */
+function resolveTemplate(value: string, input: unknown): string {
+  const resolved = resolveArgs({ v: value }, input).v;
+  return resolved == null ? "" : String(resolved);
 }
 
 /** Replace `{{input}}` / `{{input.path}}` placeholders in string args. */

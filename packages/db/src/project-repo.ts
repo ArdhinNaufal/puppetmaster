@@ -1,6 +1,6 @@
 import { and, asc, desc, eq } from "drizzle-orm";
 import type { Db } from "./client.js";
-import { projectArtifacts, projects } from "./schema.js";
+import { evidence, missions, projectArtifacts, projects, verifyChecks } from "./schema.js";
 
 /**
  * Workshop repository (AI-SDLC plan WP2, ADR-003/004). The artifact lifecycle
@@ -196,6 +196,7 @@ export async function updateArtifact(
   if (patch.body !== undefined) values.body = patch.body;
   if (patch.status !== undefined) values.status = patch.status;
   if (Object.keys(values).length === 0) return row;
+  values.updatedAt = new Date();
   const [updated] = await db
     .update(projectArtifacts)
     .set(values)
@@ -215,7 +216,7 @@ export async function completeTodo(db: Db, id: string, missionId: string): Promi
   if (row.status === "completed") throw new Error("todo is already completed");
   const [updated] = await db
     .update(projectArtifacts)
-    .set({ status: "completed", missionId })
+    .set({ status: "completed", missionId, updatedAt: new Date() })
     .where(eq(projectArtifacts.id, id))
     .returning();
   return updated!;
@@ -246,7 +247,7 @@ export async function supersedeAdr(
     .returning();
   await db
     .update(projectArtifacts)
-    .set({ status: "superseded" })
+    .set({ status: "superseded", updatedAt: new Date() })
     .where(eq(projectArtifacts.id, old.id));
   return next!;
 }
@@ -269,4 +270,123 @@ export async function nextTodo(db: Db, projectId: string): Promise<ProjectArtifa
     if (row) return row;
   }
   return null;
+}
+
+/* ————— Verify checks (WP4) — earned policies, disabled by default ————— */
+
+export type VerifyCheckRow = typeof verifyChecks.$inferSelect;
+
+export async function createVerifyCheck(
+  db: Db,
+  input: {
+    projectId: string;
+    name: string;
+    command?: string | null;
+    baseline?: number | null;
+    enabled?: boolean;
+    earnedNote?: string;
+  },
+): Promise<VerifyCheckRow> {
+  const [row] = await db
+    .insert(verifyChecks)
+    .values({
+      projectId: input.projectId,
+      name: input.name,
+      command: input.command ?? null,
+      baseline: input.baseline ?? null,
+      enabled: input.enabled ?? false,
+      earnedNote: input.earnedNote ?? "",
+    })
+    .returning();
+  return row!;
+}
+
+export async function listVerifyChecks(db: Db, projectId: string): Promise<VerifyCheckRow[]> {
+  return db
+    .select()
+    .from(verifyChecks)
+    .where(eq(verifyChecks.projectId, projectId))
+    .orderBy(asc(verifyChecks.createdAt));
+}
+
+export async function getVerifyCheckByName(
+  db: Db,
+  projectId: string,
+  name: string,
+): Promise<VerifyCheckRow | null> {
+  const [row] = await db
+    .select()
+    .from(verifyChecks)
+    .where(and(eq(verifyChecks.projectId, projectId), eq(verifyChecks.name, name)))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function updateVerifyCheck(
+  db: Db,
+  id: string,
+  patch: { command?: string | null; baseline?: number | null; enabled?: boolean; earnedNote?: string },
+): Promise<VerifyCheckRow | null> {
+  const values: Record<string, unknown> = {};
+  if (patch.command !== undefined) values.command = patch.command;
+  if (patch.baseline !== undefined) values.baseline = patch.baseline;
+  if (patch.enabled !== undefined) values.enabled = patch.enabled;
+  if (patch.earnedNote !== undefined) values.earnedNote = patch.earnedNote;
+  if (Object.keys(values).length === 0) {
+    const [row] = await db.select().from(verifyChecks).where(eq(verifyChecks.id, id)).limit(1);
+    return row ?? null;
+  }
+  const [row] = await db.update(verifyChecks).set(values).where(eq(verifyChecks.id, id)).returning();
+  return row ?? null;
+}
+
+/* ————— Evidence (WP4) — attached to verify steps / escalation approvals ————— */
+
+export type EvidenceRow = typeof evidence.$inferSelect;
+
+export async function createEvidence(
+  db: Db,
+  input: {
+    stepId?: string | null;
+    approvalId?: string | null;
+    kind: string;
+    content?: unknown;
+    ref?: string | null;
+  },
+): Promise<EvidenceRow> {
+  if (!input.stepId && !input.approvalId) {
+    throw new Error("evidence must attach to a step or an approval");
+  }
+  const [row] = await db
+    .insert(evidence)
+    .values({
+      stepId: input.stepId ?? null,
+      approvalId: input.approvalId ?? null,
+      kind: input.kind,
+      content: input.content ?? null,
+      ref: input.ref ?? null,
+    })
+    .returning();
+  return row!;
+}
+
+export async function listEvidenceForApproval(db: Db, approvalId: string): Promise<EvidenceRow[]> {
+  return db
+    .select()
+    .from(evidence)
+    .where(eq(evidence.approvalId, approvalId))
+    .orderBy(asc(evidence.createdAt));
+}
+
+export async function listEvidenceForStep(db: Db, stepId: string): Promise<EvidenceRow[]> {
+  return db.select().from(evidence).where(eq(evidence.stepId, stepId)).orderBy(asc(evidence.createdAt));
+}
+
+/** Nested missions launched under a parent (verify fix loops, bridge calls). */
+export async function listChildMissions(db: Db, parentMissionId: string) {
+  return db
+    .select()
+    .from(missions)
+    .where(eq(missions.parentMissionId, parentMissionId))
+    .orderBy(asc(missions.createdAt));
 }
