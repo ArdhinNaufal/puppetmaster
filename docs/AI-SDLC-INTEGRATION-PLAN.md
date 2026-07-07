@@ -3,9 +3,10 @@
 **Version:** 1.1 · **Date:** 2026-07-06 · **Status: IN EXECUTION.** Owner rulings on all
 six open decisions are recorded in §8; the owner's start signal was given 2026-07-06.
 **WP0 is complete** (dogfood assets live: `todos/`, `learnings.md`, `docs/adr/`,
-`.claude/commands/`, `scripts/verify-arch.sh` with acceptance verified). **WP1 is complete
-except one item:** the ADR-002 container spike half is blocked on a docker-capable host
-(the headless-CLI half PASSED — `docs/adr/spike-002-record.md`). ADRs 000–007 are written.
+`.claude/commands/`, `scripts/verify-arch.sh` with acceptance verified). **WP1 is complete** — the ADR-002
+spike passed BOTH halves (host-half headless-CLI contract + container-half 5/5 on the
+owner's Docker host, `docs/adr/spike-002-record.md`); ADRs 000–007 are written. **WP3 is
+now unblocked.**
 **WP2 is complete** (domain model + artifact store + tools + REST; golden eval
 `workshop-artifact-lifecycle` green at pass^3). **WP4's workbench-independent core is
 complete** (verify node + evidence + bounded fix loop + escalation + todo-sync check +
@@ -590,12 +591,10 @@ started.)*
 - [x] HANDOFF.md §0 points at the session-resume ritual
 - [ ] (earned, deferred by design) `test-gate` hook — install only after the failure bites
 
-**WP1 — Decisions** — ✅ complete 2026-07-06 except the container spike half
+**WP1 — Decisions** — ✅ complete 2026-07-06
 - [x] ADR-001 feature name (ruled: Workshop/project/workbench) + v1 scope boundary
-- [x] ADR-002 hybrid executor (ruled); spike headless-CLI half PASSED
-      (`docs/adr/spike-002-record.md`: stream output, turn budget, clean exit, scope kept)
-- [ ] ADR-002 spike container half — blocked: no Docker daemon in the dev environment;
-      rerun `scripts/spike-adr002.sh --container` on a docker-capable host (WP3 precondition)
+- [x] ADR-002 hybrid executor (ruled); spike **both halves PASS** — headless-CLI contract
+      (host) + container 5/5 on the owner's Docker host (`docs/adr/spike-002-record.md`)
 - [x] ADR-003 project state representation (first-class `projects` entity)
 - [x] ADR-004 artifact storage (typed table, KB mirror on acceptance)
 - [x] ADR-005 workbench isolation (sibling container per project, default-closed egress)

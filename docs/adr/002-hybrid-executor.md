@@ -43,10 +43,10 @@ Protocol committed as `scripts/spike-adr002.sh`. Two halves:
 2. **Container half** — validates the ADR-005 isolation substrate: the candidate image
    (`docker/workbench.Dockerfile`) has the toolchain, runs non-root, executes a
    deterministic check inside, refuses egress under `--network none`, and accepts CPU/
-   memory/pid caps. **Status: IMPLEMENTED, NOT YET RUN — the dev session has a Docker
-   client but no daemon.** Run `scripts/spike-adr002.sh --container` on a docker-capable
-   host and record the result in `docs/adr/spike-002-record.md` (tracked in
-   todos/active/wp1-workshop-adrs.md). WP3 must not start before this passes.
+   memory/pid caps. **Status: PASSED (5/5) on the owner's Docker host, 2026-07-06** after
+   an assertion-3 harness fix (host bind mount → in-container file creation as `bench`).
+   Evidence in `docs/adr/spike-002-record.md`. Both halves of the spike now pass; ADR-002
+   is validated and WP3 is unblocked.
 
 ## Consequences
 
