@@ -87,6 +87,29 @@ convenient stand-in — a bind-mount shortcut tests a code path the design expli
 and manufactures a false negative. Fix: create the toy files inside the container as the
 workbench user.
 
+## 2026-07-07 — Tool autonomy tiers are enforced in the agent runtime, not workflow nodes
+
+Workflow `action` nodes call `tools.callTool(...)` directly regardless of the tool's tier
+(`executor.ts`) — a workflow gates only via explicit `approval` nodes the graph author
+inserts. The per-call tier gate (read auto-runs; write/destructive pause behind an approval)
+lives in the **agent runtime** (`agent-runtime.ts`). Consequence for testing a tool's tier:
+a golden *workflow* task proves the tool *executes* but says nothing about its tier; to prove
+"write/destructive pauses" you need a golden *agent* task (mock message `use <server.tool>
+{args}` → mission ends `awaiting_approval`, the pending approval's `tier`/`prompt` assert the
+gate). WP3b.3's bench tests use both: workflow tasks for execution (read/write/exec/git),
+agent tasks for the write/push tier gates.
+
+## 2026-07-07 — The mock provider's `use` scripting dropped multi-segment tool names
+
+`MockProvider` parsed `use <server.tool> {args}` with `name.split(".")` and destructured the
+first two segments — so a dotted tool like `bench.git.push` or `project.artifact.write` lost
+everything after the second segment (emitted `bench__git`, not `bench__git.push`). Any eval
+that scripts an agent to call a sub-namespaced tool would silently call the wrong (or a
+non-existent) tool. Fixed to split on the *first* dot only (`server = before`, `tool = after`);
+single-dot calls are unchanged. Lesson: tool names are `server` + a possibly-dotted `tool`
+path (the registry key is `${server}.${tool}`, the wire name `${server}__${tool}`); split on
+the first separator, never greedily.
+
 ## 2026-07-07 — A fresh named volume inherits the image mount-point's ownership
 
 WP3b.1's host acceptance failed only its file-writing assertion (`before=0, after=0` on the

@@ -23,13 +23,25 @@ Docker socket proxy.
       (`docker/workbench.Dockerfile` now `chown`s `/workbench` to bench; commit e8c520f).
 - [x] **WP3b.2** server wiring — `WORKBENCH_MODE=docker` constructs the executor and
       activates shell checks (default off = honest refusal). Boots both ways.
-- [ ] **WP3b.3** `bench.*` tool namespace (git/exec/read/write) with tiers +
-      untrusted-data envelopes + Stage 9C compaction — **do NOT start until WP3b.1 is
-      host-verified** (don't build on an unverified executor)
+- [x] **WP3b.3** `bench.*` tool namespace (`packages/kernel/src/bench-tools.ts`):
+      `bench.read` (read_auto), `bench.exec`/`bench.write`/`bench.git.commit`
+      (write_approved), `bench.git.status`/`bench.git.diff` (read_auto),
+      `bench.git.push` (destructive_confirmed — the injection→push gate). Thin,
+      tiered surface on the existing `CommandExecutor.run()` seam (no new boundary);
+      workspace-scoped like `project.*`; path guard confines read/write to the
+      workbench. Untrusted-data envelope + Stage 9C compaction are inherited from
+      agent-runtime (every non-runtime tool result is wrapped + compacted) — nothing
+      bench-specific needed. No executor wired ⇒ honest refusal by name. Wired in
+      `main.ts` behind the same `WORKBENCH_MODE` executor. 4 golden tasks (write/read
+      round-trip, exec+git.status, write-gated, push-gated) → suite 14→18 at pass^3.
+      **exec allowlist deferred** (approval tier is the gate) — see below.
 - [ ] **WP3b.4** `bench.delegate` with hard token/time budgets, progress → mission trace;
       pinned CLI layer in the Dockerfile (ADR-002)
 - [ ] **WP3b.5** Security: egress proxy allowlist (unblocks clone/install under
-      `--network none`), socket-proxy launch, vault secrets
+      `--network none`), socket-proxy launch, vault secrets. **Fold in the deferred
+      `bench.exec` command allowlist here** (WP3b.3 left exec gated only by its
+      write_approved tier; a command-string allowlist is a policy layer that belongs
+      with the rest of the security surface, not bolted onto the tool).
 - [ ] **WP3b.6** `refactor-gate` (git `--diff-filter=M` on test paths) and `load`
       (k6/locust, skip-without-SLOs) checks
 - [ ] **WP3b.7** Golden evals **(Docker host)**: clone a fixture repo → `bench.exec` runs

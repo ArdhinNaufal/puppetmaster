@@ -16,6 +16,7 @@ import {
   createBuiltinCheckRunner,
   LocalCommandExecutor,
   ModelRouter,
+  registerBenchTools,
   registerProjectTools,
   startAgentTick,
   startWorkflow,
@@ -66,6 +67,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
     const router = new ModelRouter({});
     const embedder = createEmbedder({});
     registerProjectTools(tools, { db, workspaceId, kb: { db, workspaceId, embedder } });
+    registerBenchTools(tools, { db, workspaceId, executor: new LocalCommandExecutor() });
     const executor = new WorkflowExecutor({ db, bus, tools, checkRunner: createBuiltinCheckRunner({ db, executor: new LocalCommandExecutor() }) });
     const runtime = new AgentRuntime({ db, bus, router, tools, embedder });
     executor.setAgentInvoker(createAgentInvoker({ db, runtime }));

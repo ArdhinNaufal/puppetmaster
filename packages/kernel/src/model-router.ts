@@ -315,7 +315,11 @@ export class MockProvider implements ModelProvider {
     const text = lastUser?.text ?? "";
     const useMatch = text.match(/^use\s+([\w.]+)\s*(\{.*\})?$/s);
     if (useMatch) {
-      const [server, tool] = useMatch[1]!.split(".");
+      // Split on the FIRST dot only, so dotted tool names (e.g. bench.git.push,
+      // project.artifact.write) keep their sub-path instead of losing it.
+      const dot = useMatch[1]!.indexOf(".");
+      const server = useMatch[1]!.slice(0, dot);
+      const tool = useMatch[1]!.slice(dot + 1);
       return {
         text: "",
         toolCalls: [

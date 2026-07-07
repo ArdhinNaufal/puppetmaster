@@ -580,4 +580,138 @@ export const GOLDEN_TASKS: GoldenTask[] = [
       return Array.isArray(detail?.runs) && detail!.runs!.length >= 1 && !ranEcho;
     },
   },
+  {
+    id: "bench-write-read-roundtrip-local",
+    description:
+      "Workshop WP3b.3: bench.write then bench.read round-trip a file through the workbench executor — the write/read tools drive real commands, content survives byte-for-byte",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-bench-rw" });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "bench__write",
+          kind: "action",
+          label: "write",
+          config: {
+            server: "bench",
+            tool: "write",
+            args: { projectId: "{{input.projectId}}", path: "note.txt", content: "hello-bench" },
+          },
+        },
+        {
+          id: "bench__read",
+          kind: "action",
+          label: "read",
+          config: {
+            server: "bench",
+            tool: "read",
+            args: { projectId: "{{input.projectId}}", path: "note.txt" },
+          },
+        },
+      ],
+      // The direct trigger→read edge (declared before write→read) makes read's
+      // input the payload (with projectId); write→read enforces ordering. Idiom
+      // per learnings.md: input resolves against the first satisfied edge.
+      edges: [
+        { from: "t", to: "bench__write" },
+        { from: "t", to: "bench__read" },
+        { from: "bench__write", to: "bench__read" },
+      ],
+    },
+    expectOutput: (o) => o === "hello-bench",
+    trajectory: { mustCall: ["bench.write", "bench.read"], mayCallOnly: ["bench.write", "bench.read"] },
+  },
+  {
+    id: "bench-exec-git-status-local",
+    description:
+      "Workshop WP3b.3: bench.exec runs a shell command in the workbench and bench.git.status reads its git state — exec + git tools construct and run real commands, exit code and porcelain output flow back",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-bench-git" });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "bench__exec",
+          kind: "action",
+          label: "exec",
+          config: {
+            server: "bench",
+            tool: "exec",
+            args: {
+              projectId: "{{input.projectId}}",
+              command: "git init -q && printf hi > tracked.txt && git add -A",
+            },
+          },
+        },
+        {
+          id: "bench__git.status",
+          kind: "action",
+          label: "status",
+          config: { server: "bench", tool: "git.status", args: { projectId: "{{input.projectId}}" } },
+        },
+      ],
+      edges: [
+        { from: "t", to: "bench__exec" },
+        { from: "t", to: "bench__git.status" },
+        { from: "bench__exec", to: "bench__git.status" },
+      ],
+    },
+    expectOutput: (o) => {
+      const r = o as { code?: number; stdout?: string } | null;
+      return r?.code === 0 && typeof r?.stdout === "string" && r.stdout.includes("tracked.txt");
+    },
+    trajectory: { mustCall: ["bench.exec", "bench.git.status"], mayCallOnly: ["bench.exec", "bench.git.status"] },
+  },
+  {
+    id: "bench-write-gated",
+    description:
+      "Workshop WP3b.3: bench.write is write-tier — an agent's call pauses for approval before touching the workbench; the mutation never auto-runs",
+    kind: "agent",
+    message: 'use bench.write {"projectId":"p","path":"x.txt","content":"y"}',
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      return (
+        !!approval &&
+        (approval as { tier: string }).tier === "write_approved" &&
+        approval.prompt.includes("bench.write")
+      );
+    },
+    // Nothing executed: the tick paused at the tier gate before the tool ran.
+    trajectory: { mayCallOnly: [] },
+  },
+  {
+    id: "bench-push-gated",
+    description:
+      "Workshop WP3b.3: bench.git.push is destructive — an agent's call always pauses for confirmation (the corpus's injection→push gate)",
+    kind: "agent",
+    message: 'use bench.git.push {"projectId":"p"}',
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      return (
+        !!approval &&
+        (approval as { tier: string }).tier === "destructive_confirmed" &&
+        approval.prompt.includes("bench.git.push")
+      );
+    },
+    trajectory: { mayCallOnly: [] },
+  },
 ];

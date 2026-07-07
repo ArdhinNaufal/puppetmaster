@@ -112,6 +112,7 @@ import {
   createBuiltinCheckRunner,
   DockerCommandExecutor,
   mirrorArtifactToKb,
+  registerBenchTools,
   registerBridgeTools,
   registerKbTools,
   registerProjectTools,
@@ -323,6 +324,11 @@ registerKbTools(tools, kbDeps);
 // The Workshop (AI-SDLC plan WP2): project artifacts/todos join the shared
 // catalog — same surface for agents and workflow action nodes.
 registerProjectTools(tools, { db, workspaceId, kb: kbDeps });
+
+// Workbench tools (WP3b.3): bench.read/exec/write + bench.git.* drive a
+// project's container over the same executor as the shell verify checks.
+// Shares the WORKBENCH_MODE executor — unset ⇒ every bench call refuses by name.
+registerBenchTools(tools, { db, workspaceId, executor: workbenchExecutor });
 
 // --- Tool layer: MCP servers (ARCHITECTURE.md §3.4) ---------------------------
 // Bundled utils connector by default; extend/override via MCP_SERVERS JSON.
