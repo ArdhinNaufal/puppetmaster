@@ -38,26 +38,33 @@ if [ "$MODE" = "--container" ]; then
     echo "FAIL: container runs as root by default" >&2; FAILS=1; fi
 
   echo "== 3. a deterministic verify check runs inside (toy 'test' check) =="
-  TOY=$(mktemp -d)
-  printf 'export function add(a, b) { return a - b; } // BUG\n' > "$TOY/add.mjs"
-  cat > "$TOY/add.test.mjs" <<'JS'
+  # Files are created INSIDE the container by the non-root bench user — the way
+  # ADR-005 delivers code (named volume / in-container clone), NOT a host bind
+  # mount. The whole toy check runs in one `sh -s` so ownership/uid never cross
+  # the host boundary. Exit 0 = fail-before + pass-after; 20 = buggy passed;
+  # any other non-zero = fixed check didn't pass.
+  set +e
+  docker run --rm -i "$IMG" sh -s <<'INNER'
+set -e
+cd "$(mktemp -d)"
+printf 'export function add(a, b) { return a - b; }\n' > add.mjs
+cat > add.test.mjs <<'JS'
 import test from "node:test";
 import assert from "node:assert";
 import { add } from "./add.mjs";
 test("add", () => assert.strictEqual(add(2, 3), 5));
 JS
-  chmod -R a+rX "$TOY"  # bind mount readable by the non-root container user
-  if docker run --rm -v "$TOY":/w:ro -w /w "$IMG" node --test >/dev/null 2>&1; then
-    echo "FAIL: buggy toy test unexpectedly passed inside the container" >&2; FAILS=1
-  else
-    printf 'export function add(a, b) { return a + b; }\n' > "$TOY/add.mjs"
-    if docker run --rm -v "$TOY":/w:ro -w /w "$IMG" node --test >/dev/null 2>&1; then
-      echo "  ok (fail-before, pass-after — the container executes the check WP3's runner drives)"
-    else
-      echo "FAIL: fixed toy test did not pass inside the container" >&2; FAILS=1
-    fi
-  fi
-  rm -rf "$TOY"
+if node --test >/dev/null 2>&1; then echo "BUG_PASSED" >&2; exit 20; fi
+printf 'export function add(a, b) { return a + b; }\n' > add.mjs
+node --test >/dev/null 2>&1
+INNER
+  RC=$?
+  set -e
+  case "$RC" in
+    0)  echo "  ok (fail-before, pass-after — the container creates files and runs the check WP3's runner drives)";;
+    20) echo "FAIL: buggy toy test unexpectedly passed inside the container" >&2; FAILS=1;;
+    *)  echo "FAIL: fixed toy test did not pass inside the container (rc=$RC)" >&2; FAILS=1;;
+  esac
 
   echo "== 4. network isolation by default (--network none blocks egress) =="
   set +e

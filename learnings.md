@@ -73,3 +73,16 @@ can be *authored* in this session but must be *run* on a Docker-capable host. Th
 script distinguishes the two: exit 3/SKIP when no daemon, real assertions otherwise —
 so the same script does genuine work wherever a daemon exists. Don't confuse "the script
 printed its no-op branch" with "the mechanism was validated".
+
+## 2026-07-06 — Spike file-delivery must match the system it validates
+
+The ADR-002 container spike failed assertion 3 (a check running inside the workbench) — but
+only because the harness delivered files via a host `:ro` bind mount read by the non-root
+container user, whose "other"-read permission fails under Docker Desktop's VirtioFS. That
+is NOT how the system works: ADR-005 delivers code via a named volume / in-container clone
+owned by the workbench user, never a host mount. The three real isolation assertions
+(non-root, --network none egress block, resource caps) all passed. Lesson: a feasibility
+spike must exercise the *actual* mechanism (files created/owned inside the container), not a
+convenient stand-in — a bind-mount shortcut tests a code path the design explicitly avoids
+and manufactures a false negative. Fix: create the toy files inside the container as the
+workbench user.
