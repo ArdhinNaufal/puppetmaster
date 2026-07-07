@@ -408,6 +408,74 @@ export const kbApi = {
     fetch(`/api/kb/search?q=${encodeURIComponent(q)}&limit=${limit}`).then(json<KbSearchHit[]>),
 };
 
+
+// --- The Workshop (AI-SDLC plan WP7a) ----------------------------------------------
+export interface Project {
+  id: string;
+  workspaceId: string;
+  name: string;
+  repoRef: string;
+  mode: "supervised" | "gated";
+  phase: "idle" | "specify" | "plan" | "execute" | "verify" | "record";
+  status: "active" | "archived";
+  workbenchId: string | null;
+  createdAt: string;
+}
+export interface ProjectArtifact {
+  id: string;
+  projectId: string;
+  kind: "spec" | "plan" | "todo" | "learning" | "adr";
+  status: string | null;
+  title: string;
+  body: string;
+  version: number;
+  supersedesId: string | null;
+  missionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface VerifyCheckRow {
+  id: string;
+  projectId: string;
+  name: string;
+  command: string | null;
+  baseline: number | null;
+  enabled: boolean;
+  earnedNote: string;
+  createdAt: string;
+}
+
+export const projectApi = {
+  list: () => fetch("/api/projects").then(json<Project[]>),
+  create: (input: { name: string; repoRef?: string; mode?: string }) =>
+    post("/api/projects", input).then(json<Project>),
+  get: (id: string) => fetch(`/api/projects/${id}`).then(json<Project>),
+  update: (id: string, patch: { phase?: string; status?: string; mode?: string }) =>
+    fetch(`/api/projects/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json<Project>),
+  artifacts: (id: string, filter?: { kind?: string; status?: string }) => {
+    const q = new URLSearchParams();
+    if (filter?.kind) q.set("kind", filter.kind);
+    if (filter?.status) q.set("status", filter.status);
+    const qs = q.toString();
+    return fetch(`/api/projects/${id}/artifacts${qs ? `?${qs}` : ""}`).then(json<ProjectArtifact[]>);
+  },
+  writeArtifact: (id: string, input: { kind: string; title: string; body?: string; status?: string }) =>
+    post(`/api/projects/${id}/artifacts`, input).then(json<ProjectArtifact>),
+  checks: (id: string) => fetch(`/api/projects/${id}/checks`).then(json<VerifyCheckRow[]>),
+  createCheck: (id: string, input: { name: string; command?: string; enabled?: boolean; earnedNote?: string }) =>
+    post(`/api/projects/${id}/checks`, input).then(json<VerifyCheckRow>),
+  updateCheck: (id: string, checkId: string, patch: { enabled?: boolean; earnedNote?: string; command?: string }) =>
+    fetch(`/api/projects/${id}/checks/${checkId}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json<VerifyCheckRow>),
+};
+
 // --- Evals & observability (Stage 5) ----------------------------------------------
 
 export interface EvalRun {

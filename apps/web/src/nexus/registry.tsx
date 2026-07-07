@@ -375,6 +375,7 @@ export const TASKS: TaskDef[] = [
   { id: "signal.feed", glyph: "⊚", title: "SIGNAL FEED", category: "OBSERVE", minRole: "member", jumpView: null, width: 360, body: SignalFeedBody },
   { id: "system.snapshot", glyph: "⏣", title: "SYSTEM SNAPSHOT", category: "OBSERVE", minRole: "member", jumpView: null, width: 340, hidden: true, body: SnapshotBody },
   // P6: convert these to live pane bodies, one row per commit (docs/NEXUS.md §10).
+  { id: "workshop", glyph: "⚒", title: "WORKSHOP", category: "BUILD", minRole: "member", jumpView: "workshop", jumpOnly: true },
   { id: "knowledge.ingest", glyph: "⇪", title: "INGEST DOCUMENT", category: "BUILD", minRole: "builder", jumpView: "knowledge", jumpOnly: true },
   { id: "evals.run", glyph: "✓", title: "EVAL SUITE", category: "GOVERN", minRole: "admin", jumpView: "evals", jumpOnly: true },
   { id: "budgets", glyph: "¤", title: "BUDGETS & USAGE", category: "GOVERN", minRole: "admin", jumpView: "evals", jumpOnly: true },

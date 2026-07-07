@@ -905,8 +905,17 @@ app.post("/api/workflows/draft", async (req, reply) => {
 
 /** Graph linter (Stage 6): static checks against the live tool catalog. */
 app.post("/api/workflows/lint", async (req) => {
-  const body = (req.body ?? {}) as { graph?: unknown };
-  return lintWorkflowGraph(body.graph ?? { nodes: [], edges: [] }, (s, t) => tools.info(s, t));
+  const body = (req.body ?? {}) as { graph?: unknown; projectId?: string };
+  // Workshop WP4/W8: graphs linted against a gated project get the gated-mode
+  // rules (every agent node needs a verify gate downstream).
+  let projectMode: "supervised" | "gated" | undefined;
+  if (body.projectId) {
+    const project = await getProject(db, body.projectId);
+    if (project && project.workspaceId === workspaceId) {
+      projectMode = project.mode as "supervised" | "gated";
+    }
+  }
+  return lintWorkflowGraph(body.graph ?? { nodes: [], edges: [] }, (s, t) => tools.info(s, t), { projectMode });
 });
 
 app.post("/api/workflows/:id/run", async (req, reply) => {

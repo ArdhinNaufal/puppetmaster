@@ -27,19 +27,19 @@ import { Palette, type PaletteAction } from "./Palette.js";
 import { SignalRadar, SignalTicker, toSignal, type SignalEntry } from "./Signal.js";
 import { TraceDossier, type StepTiming } from "./Trace.js";
 import { rowFromAudit, rowFromSignal, Watch, type ProcessRow } from "./Watch.js";
-import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, TemplatesView, ToolsView } from "./Views.js";
+import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, TemplatesView, ToolsView, WorkshopView } from "./Views.js";
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 
-const VIEWS = ["nexus", "command", "canvas", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
+const VIEWS = ["nexus", "command", "canvas", "workshop", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
 type View = (typeof VIEWS)[number];
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
 
 /** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
 const ROLE_VIEWS: Record<Role, View[]> = {
-  member: ["nexus", "command", "templates", "knowledge", "missions", "agents", "tools"],
-  builder: ["nexus", "command", "canvas", "templates", "knowledge", "missions", "agents", "tools"],
+  member: ["nexus", "command", "workshop", "templates", "knowledge", "missions", "agents", "tools"],
+  builder: ["nexus", "command", "canvas", "workshop", "templates", "knowledge", "missions", "agents", "tools"],
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
@@ -679,6 +679,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 }}
               />
             )}
+            {view === "workshop" && <WorkshopView canBuild={canBuild} isAdmin={RANK[me.role] >= RANK.admin} />}
             {view === "knowledge" && <KnowledgeView canBuild={canBuild} />}
             {view === "missions" && (
               <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />

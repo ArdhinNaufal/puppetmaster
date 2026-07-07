@@ -8,6 +8,7 @@ import {
   mcpApi,
   memberApi,
   opsApi,
+  projectApi,
   routerApi,
   templateApi,
   workspaceApi,
@@ -24,10 +25,13 @@ import {
   type MemberRow,
   type MemoryHit,
   type Mission,
+  type Project,
+  type ProjectArtifact,
   type Role,
   type RouterProfile,
   type Template,
   type UsageReport,
+  type VerifyCheckRow,
   type Workflow,
   type Workspace,
 } from "./api.js";
@@ -952,6 +956,189 @@ export function KnowledgeView(props: { canBuild: boolean }) {
             </div>
           </Panel>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+/* -------------------------------------------------------------- Workshop */
+
+/** WORKSHOP view (AI-SDLC plan WP7a): projects + their artifact sets and
+ *  verify checks. Phase-flow actions (interview, execute) arrive with WP5's
+ *  remaining increments; this surface reads and manages what WP2/WP4 built. */
+export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selected, setSelected] = useState<Project | null>(null);
+  const [artifacts, setArtifacts] = useState<ProjectArtifact[]>([]);
+  const [checks, setChecks] = useState<VerifyCheckRow[]>([]);
+  const [reading, setReading] = useState<ProjectArtifact | null>(null);
+  const [name, setName] = useState("");
+  const [repoRef, setRepoRef] = useState("");
+  const [gated, setGated] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  const refresh = () => projectApi.list().then(setProjects).catch(() => {});
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  const open = (p: Project) => {
+    setSelected(p);
+    setReading(null);
+    projectApi.artifacts(p.id).then(setArtifacts).catch(() => setArtifacts([]));
+    projectApi.checks(p.id).then(setChecks).catch(() => setChecks([]));
+  };
+
+  const create = async () => {
+    if (!name.trim()) return;
+    try {
+      const p = await projectApi.create({ name: name.trim(), repoRef: repoRef.trim(), mode: gated ? "gated" : "supervised" });
+      setName("");
+      setRepoRef("");
+      setGated(false);
+      refresh();
+      open(p);
+    } catch {
+      setNotice("Create failed.");
+    }
+  };
+
+  const toggleCheck = async (c: VerifyCheckRow) => {
+    if (!props.isAdmin || !selected) return;
+    const note = c.enabled
+      ? c.earnedNote
+      : window.prompt("Checks are earned policies. What failure earned this one?", c.earnedNote) ?? "";
+    if (!c.enabled && !note.trim()) return; // enabling requires the earned note
+    try {
+      await projectApi.updateCheck(selected.id, c.id, { enabled: !c.enabled, earnedNote: note });
+      projectApi.checks(selected.id).then(setChecks);
+    } catch {
+      setNotice("Check update failed.");
+    }
+  };
+
+  const todos = artifacts.filter((a) => a.kind === "todo");
+  const knowledge = artifacts.filter((a) => a.kind !== "todo");
+  const PHASES = ["idle", "specify", "plan", "execute", "verify", "record"] as const;
+
+  return (
+    <div className="view-wrap">
+      <div className="stat-row">
+        <Panel><Stat label="PROJECTS" value={projects.length} tone="accent" /></Panel>
+        <Panel><Stat label="ACTIVE TODOS" value={todos.filter((t) => t.status === "active").length} /></Panel>
+        <Panel><Stat label="COMPLETED" value={todos.filter((t) => t.status === "completed").length} /></Panel>
+        <Panel><Stat label="CHECKS ENABLED" value={checks.filter((c) => c.enabled).length} /></Panel>
+      </div>
+
+      <div className="tool-grid">
+        <Panel title="PROJECTS" index="01" scroll>
+          <ul className="tool-list">
+            {projects.map((p) => (
+              <li key={p.id} className="tool-row" onClick={() => open(p)} style={{ cursor: "pointer" }}>
+                <div className="tool-row-head">
+                  <span className="tool-name">{selected?.id === p.id ? "▸ " : ""}{p.name}</span>
+                  <span className="tag-lo">{p.mode.toUpperCase()} · {p.phase.toUpperCase()}</span>
+                </div>
+                {p.repoRef && <p className="tool-desc">{p.repoRef}</p>}
+              </li>
+            ))}
+            {projects.length === 0 && (
+              <li className="dim pad">No projects yet — the Workshop is where software is built under verifiable gates.</li>
+            )}
+          </ul>
+          {props.canBuild && (
+            <div className="pad" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <input className="text-input" placeholder="Project name" value={name} onChange={(e) => setName(e.target.value)} />
+              <input className="text-input" placeholder="Repo ref (optional until the workbench lands)" value={repoRef} onChange={(e) => setRepoRef(e.target.value)} />
+              <label className="tag-lo" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="checkbox" checked={gated} onChange={(e) => setGated(e.target.checked)} />
+                GATED MODE (autonomous between verify gates — requires enabled checks to run)
+              </label>
+              <button className="chip" disabled={!name.trim()} onClick={create}>CREATE PROJECT</button>
+              {notice && <p className="dim">{notice}</p>}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title={selected ? `DOSSIER · ${selected.name.toUpperCase()}` : "DOSSIER"} index="02" scroll>
+          {!selected && <p className="dim pad">Select a project to inspect its phases, todos, and artifacts.</p>}
+          {selected && (
+            <div className="pad" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {PHASES.map((ph) => (
+                  <span key={ph} className={ph === selected.phase ? "chip tiny" : "tag-lo"} style={{ padding: "2px 6px" }}>
+                    {ph.toUpperCase()}
+                  </span>
+                ))}
+              </div>
+              {(["active", "backlog", "completed"] as const).map((st) => (
+                <div key={st}>
+                  <span className="tag-lo">TODO · {st.toUpperCase()}</span>
+                  <ul className="tool-list">
+                    {todos.filter((t) => t.status === st).map((t) => (
+                      <li key={t.id} className="tool-row">
+                        <div className="tool-row-head">
+                          <span className="tool-name">{t.title}</span>
+                          {t.missionId && <span className="tag-lo" title={t.missionId}>MISSION-LINKED</span>}
+                        </div>
+                      </li>
+                    ))}
+                    {todos.filter((t) => t.status === st).length === 0 && <li className="dim pad">—</li>}
+                  </ul>
+                </div>
+              ))}
+              <span className="tag-lo">KNOWLEDGE ARTIFACTS</span>
+              <ul className="tool-list">
+                {knowledge.map((a) => (
+                  <li key={a.id} className="tool-row" onClick={() => setReading(a)} style={{ cursor: "pointer" }}>
+                    <div className="tool-row-head">
+                      <span className="tool-name">{a.title}</span>
+                      <span className="tag-lo">
+                        {a.kind.toUpperCase()} v{a.version}
+                        {a.status ? ` · ${a.status.toUpperCase()}` : ""}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+                {knowledge.length === 0 && <li className="dim pad">No spec/plan/learnings/ADR artifacts yet.</li>}
+              </ul>
+              {reading && (
+                <pre className="appr-evidence" style={{ maxHeight: 260, overflowY: "auto" }}>
+                  {`${reading.kind.toUpperCase()} · ${reading.title} (v${reading.version})\n\n${reading.body || "(empty)"}`}
+                </pre>
+              )}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="VERIFY CHECKS" index="03" scroll>
+          {!selected && <p className="dim pad">Checks are earned policies, per project — off by default.</p>}
+          {selected && (
+            <ul className="tool-list">
+              {checks.map((c) => (
+                <li key={c.id} className="tool-row">
+                  <div className="tool-row-head">
+                    <span className="tool-name">{c.name}</span>
+                    <span className="tag-lo">
+                      {c.enabled ? "ENABLED" : "DISABLED"}
+                      {c.baseline !== null ? ` · BASELINE ${c.baseline}` : ""}
+                    </span>
+                  </div>
+                  {c.earnedNote && <p className="tool-desc">earned: {c.earnedNote}</p>}
+                  {props.isAdmin && (
+                    <p className="tool-desc">
+                      <button className="chip tiny" onClick={() => toggleCheck(c)}>
+                        {c.enabled ? "DISABLE" : "ENABLE (EARN)"}
+                      </button>
+                    </p>
+                  )}
+                </li>
+              ))}
+              {checks.length === 0 && <li className="dim pad">No checks configured. Gated mode refuses to run without one.</li>}
+            </ul>
+          )}
+        </Panel>
       </div>
     </div>
   );

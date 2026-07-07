@@ -11,11 +11,13 @@ except one item:** the ADR-002 container spike half is blocked on a docker-capab
 complete** (verify node + evidence + bounded fix loop + escalation + todo-sync check +
 inbox evidence; four golden evals green at pass^3) — its shell-backed check runner rides
 WP3. **WP5a (workbench-free WP5 increment) is complete**: the spec-sections theater gate,
-the ADR-004 KB mirror, and the three builtin Workshop agents (suite now 12/12 at pass^3).
-Everything remaining (WP3, WP5 rest, WP6–WP9) funnels through the workbench: WP3 is gated
-on the ADR-002 container spike passing on a docker-capable host. Each work package runs
-only on explicit go-ahead, in order, following the same convention as
-`docs/RESEARCH-ROADMAP.md`.
+the ADR-004 KB mirror, and the three builtin Workshop agents (suite 12/12 at pass^3).
+**WP7a (Workshop UI read/manage surface) is complete**: WORKSHOP view + NEXUS chip +
+projectApi, gated-mode lint wired through the endpoint, all smoke-tested live against a
+booted server. Everything remaining (WP3, WP5/WP7 rest, WP6, WP8, WP9) funnels through
+the workbench: WP3 is gated on the ADR-002 container spike passing on a docker-capable
+host. Each work package runs only on explicit go-ahead, in order, following the same
+convention as `docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
 **`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
@@ -652,13 +654,17 @@ started.)*
 - [ ] ADR flow in SPECIFY/PLAN (ceiling-ADRs require Reconsider-when)
 - [ ] Eval predicates (right pack, only the right pack)
 
-**WP7 — UI**
-- [ ] Workshop view (stepper, todo board, artifact reader, checks panel)
-- [ ] NEXUS `WORKSHOP` pane chip
-- [ ] Inbox evidence panel polish (diff/test/screenshot)
+**WP7 — UI** — 🟡 WP7a (read/manage surface) complete 2026-07-06
+- [x] Workshop view (phase strip, todo board with mission-link badges, artifact
+      reader, checks panel with enable-requires-earned-note) + `projectApi` client;
+      live smoke test against a booted keyless server incl. REST-path KB mirror
+- [x] NEXUS `WORKSHOP` tray chip (jumpOnly per the v0 pane convention)
+- [x] Inbox evidence panel (landed with WP4); diff/screenshot renderers ride WP3's
+      evidence kinds
+- [x] Lint endpoint accepts `projectId` → gated-mode rules verified live
 - [ ] Canvas verify-node skin + inspector
-- [ ] Interview UX (restate card, section progress)
-- [ ] UAT script in `docs/uat/` (incl. keyboard/reduced-motion)
+- [ ] Interview UX (restate card, section progress) — pairs with WP5 interview flow
+- [ ] UAT script in `docs/uat/` (incl. keyboard/reduced-motion) — once full flows exist
 
 **WP8 — Packaging & org**
 - [ ] Three project templates + three agent templates (builtin)
