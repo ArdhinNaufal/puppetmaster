@@ -87,6 +87,22 @@ convenient stand-in — a bind-mount shortcut tests a code path the design expli
 and manufactures a false negative. Fix: create the toy files inside the container as the
 workbench user.
 
+## 2026-07-07 — Default-closed egress needs a network wall, not just HTTP_PROXY env
+
+WP3b.5's egress proxy is enforced at TWO layers, and the network layer is the one that
+actually secures it. The workbench joins a Docker `--internal` network (no gateway to the
+internet), shared with an allowlisting proxy sidecar; the proxy is ALSO attached to `bridge`
+for its own outbound. So the workbench's only route out is the proxy — a process that ignores
+`HTTP(S)_PROXY` simply can't reach anything (default-closed by construction), while
+proxy-aware tools (git, curl, npm) reach exactly the allowlist. Relying on HTTP_PROXY env
+alone would be porous (any direct-socket call escapes). Also: the proxy resolves the target
+host, not the workbench — with `HTTPS_PROXY` set, curl/git send `CONNECT host:443` to the
+proxy and never resolve the host themselves, so the internal network needs no external DNS,
+only Docker's embedded DNS to resolve the proxy's container name. Verifier:
+`scripts/verify-egress.mjs` (Docker host). The proxy's own allow/deny/tunnel logic is
+pure Node and unit-testable without Docker (spawn it, CONNECT to a local origin allowlisted
+vs a denied host — deny=403, allow=real byte tunnel).
+
 ## 2026-07-07 — Screenshotting UI here: use the Chromium binary directly, not `playwright`
 
 The `playwright`/`playwright-core` npm package is NOT in this repo's `node_modules`, so

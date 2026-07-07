@@ -25,9 +25,19 @@ export interface WorkbenchConfig {
   memory?: string;
   cpus?: string;
   pidsLimit?: number;
-  /** Container network; "none" (default) = no egress until the proxy lands. */
+  /** Container network when egress is OFF; "none" (default) = no egress. */
   network?: string;
   dockerBin?: string;
+  /** WP3b.5 (ADR-005): allowlisted egress hostnames. Empty ⇒ `--network none`
+   *  (no egress). Non-empty ⇒ the workbench joins an `--internal` network with
+   *  an egress-proxy sidecar and can reach only these hosts (registry, VCS). */
+  egressAllow?: string[];
+  /** Egress-proxy image (docker/egress-proxy.Dockerfile). */
+  egressProxyImage?: string;
+  /** Vault-resolved secrets injected into the workbench env at spawn only
+   *  (ADR-005 — never written to the volume). e.g. a model API key for
+   *  bench.delegate. Keys must be valid env names. */
+  secrets?: Record<string, string>;
 }
 
 export type WorkbenchStatus = "absent" | "running" | "stopped";
@@ -39,6 +49,12 @@ const DEFAULTS: Required<WorkbenchConfig> = {
   pidsLimit: Number(process.env.WORKBENCH_PIDS_LIMIT ?? "256"),
   network: process.env.WORKBENCH_NETWORK ?? "none",
   dockerBin: process.env.DOCKER_BIN ?? "docker",
+  egressAllow: (process.env.WORKBENCH_EGRESS_ALLOW ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  egressProxyImage: process.env.WORKBENCH_EGRESS_PROXY_IMAGE ?? "puppetmaster-egress-proxy:spike",
+  secrets: {},
 };
 
 function dockerCli(
@@ -87,15 +103,24 @@ export class DockerCommandExecutor implements CommandExecutor {
     return `pm-workbench-vol-${projectId}`;
   }
 
-  async status(projectId: string): Promise<WorkbenchStatus> {
-    const res = await dockerCli(this.cfg.dockerBin, [
-      "inspect",
-      "-f",
-      "{{.State.Running}}",
-      this.containerName(projectId),
-    ]);
+  /** Egress-proxy sidecar container (WP3b.5). */
+  proxyName(projectId: string): string {
+    return `pm-egress-${projectId}`;
+  }
+
+  /** Internal (no-outbound) network the workbench + proxy share (WP3b.5). */
+  networkName(projectId: string): string {
+    return `pm-wb-net-${projectId}`;
+  }
+
+  private async stateOf(name: string): Promise<WorkbenchStatus> {
+    const res = await dockerCli(this.cfg.dockerBin, ["inspect", "-f", "{{.State.Running}}", name]);
     if (res.code !== 0) return "absent";
     return res.stdout.trim() === "true" ? "running" : "stopped";
+  }
+
+  async status(projectId: string): Promise<WorkbenchStatus> {
+    return this.stateOf(this.containerName(projectId));
   }
 
   /** Idempotent: create+start the container if absent, start it if stopped.
@@ -111,15 +136,38 @@ export class DockerCommandExecutor implements CommandExecutor {
       }
       return name;
     }
+    // Egress OFF (default): `--network none`, no proxy — the host-verified path.
+    // Egress ON: join the internal network with an allowlisting proxy sidecar,
+    // routed via HTTP(S)_PROXY. Either way, vault secrets are injected as env.
+    const egress = this.cfg.egressAllow.length > 0;
+    let networkArg = `--network=${this.cfg.network}`;
+    const proxyEnv: string[] = [];
+    if (egress) {
+      await this.ensureEgress(projectId);
+      networkArg = `--network=${this.networkName(projectId)}`;
+      const proxyUrl = `http://${this.proxyName(projectId)}:8080`;
+      proxyEnv.push(
+        "-e", `HTTP_PROXY=${proxyUrl}`,
+        "-e", `HTTPS_PROXY=${proxyUrl}`,
+        "-e", `http_proxy=${proxyUrl}`,
+        "-e", `https_proxy=${proxyUrl}`,
+        "-e", "NO_PROXY=localhost,127.0.0.1",
+        "-e", "no_proxy=localhost,127.0.0.1",
+      );
+    }
+    const secretEnv = Object.entries(this.cfg.secrets).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+
     const run = await dockerCli(this.cfg.dockerBin, [
       "run",
       "-d",
       "--name",
       name,
-      `--network=${this.cfg.network}`,
+      networkArg,
       `--memory=${this.cfg.memory}`,
       `--cpus=${this.cfg.cpus}`,
       `--pids-limit=${this.cfg.pidsLimit}`,
+      ...proxyEnv,
+      ...secretEnv,
       "-v",
       `${this.volumeName(projectId)}:/workbench`,
       this.cfg.image,
@@ -130,6 +178,45 @@ export class DockerCommandExecutor implements CommandExecutor {
       throw new Error(`workbench create failed for ${projectId}: ${run.stderr.trim()}`);
     }
     return name;
+  }
+
+  /** Bring up the egress path (WP3b.5, ADR-005): an `--internal` network (no
+   *  direct outbound) shared by the workbench and an allowlisting proxy; the
+   *  proxy is additionally attached to the default bridge for its own outbound,
+   *  so the workbench's ONLY route out is the declared allowlist. Idempotent. */
+  private async ensureEgress(projectId: string): Promise<void> {
+    const net = this.networkName(projectId);
+    // `network create` fails (non-zero) if it already exists — idempotent, ignore.
+    await dockerCli(this.cfg.dockerBin, ["network", "create", "--internal", net]);
+
+    const proxy = this.proxyName(projectId);
+    const state = await this.stateOf(proxy);
+    if (state === "running") return;
+    if (state === "stopped") {
+      const started = await dockerCli(this.cfg.dockerBin, ["start", proxy]);
+      if (started.code !== 0) {
+        throw new Error(`egress proxy start failed for ${projectId}: ${started.stderr.trim()}`);
+      }
+      return;
+    }
+    const run = await dockerCli(this.cfg.dockerBin, [
+      "run",
+      "-d",
+      "--name",
+      proxy,
+      `--network=${net}`,
+      "-e",
+      `EGRESS_ALLOW=${this.cfg.egressAllow.join(",")}`,
+      this.cfg.egressProxyImage,
+    ]);
+    if (run.code !== 0) {
+      throw new Error(`egress proxy create failed for ${projectId}: ${run.stderr.trim()}`);
+    }
+    // Give the proxy its own outbound path (the internal net has none).
+    const connect = await dockerCli(this.cfg.dockerBin, ["network", "connect", "bridge", proxy]);
+    if (connect.code !== 0) {
+      throw new Error(`egress proxy outbound attach failed for ${projectId}: ${connect.stderr.trim()}`);
+    }
   }
 
   /** Run a shell command in the project's workbench via `docker exec`. Resolves
@@ -143,9 +230,13 @@ export class DockerCommandExecutor implements CommandExecutor {
     );
   }
 
-  /** Destroy the workbench: remove the container and its named volume. */
+  /** Destroy the workbench: remove the container, the egress proxy + its
+   *  network (if any), and the named volume. Each step is best-effort — a
+   *  missing resource returns non-zero, which is fine (nothing to remove). */
   async destroy(projectId: string): Promise<void> {
     await dockerCli(this.cfg.dockerBin, ["rm", "-f", this.containerName(projectId)]);
+    await dockerCli(this.cfg.dockerBin, ["rm", "-f", this.proxyName(projectId)]);
+    await dockerCli(this.cfg.dockerBin, ["network", "rm", this.networkName(projectId)]);
     await dockerCli(this.cfg.dockerBin, ["volume", "rm", "-f", this.volumeName(projectId)]);
   }
 }

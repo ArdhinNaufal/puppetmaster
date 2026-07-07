@@ -36,12 +36,24 @@ Docker socket proxy.
       round-trip, exec+git.status, write-gated, push-gated) → suite 14→18 at pass^3.
       **exec allowlist deferred** (approval tier is the gate) — see below.
 - [ ] **WP3b.4** `bench.delegate` with hard token/time budgets, progress → mission trace;
-      pinned CLI layer in the Dockerfile (ADR-002)
-- [ ] **WP3b.5** Security: egress proxy allowlist (unblocks clone/install under
-      `--network none`), socket-proxy launch, vault secrets. **Fold in the deferred
-      `bench.exec` command allowlist here** (WP3b.3 left exec gated only by its
-      write_approved tier; a command-string allowlist is a policy layer that belongs
-      with the rest of the security surface, not bolted onto the tool).
+      pinned CLI layer in the Dockerfile (ADR-002). **Blocked until WP3b.5 is
+      host-verified** — delegate runs the coding CLI in the workbench, which needs the
+      egress path (model API) + a secret (API key), both from .5. Do not author on an
+      unverified egress path.
+- [~] **WP3b.5** Security. **Egress proxy allowlist + secret injection authored**
+      (host-verify pending): `docker/egress-proxy.mjs` (dependency-free allowlist
+      proxy: HTTPS via CONNECT, plain HTTP forward) + `docker/egress-proxy.Dockerfile`;
+      `DockerCommandExecutor` gains an egress path (`egressAllow` non-empty ⇒ workbench
+      joins an `--internal` network with the proxy sidecar, routed via HTTP(S)_PROXY;
+      the proxy is also on `bridge` for its own outbound, so the workbench's only route
+      out is the allowlist) and `secrets` (vault-resolved env injected at spawn, ADR-005).
+      The no-egress path (`--network none`) is byte-identical to the WP3b.1-verified
+      behaviour. Proxy allow/deny/tunnel logic unit-verified locally; the container
+      orchestration needs a Docker host — see `scripts/verify-egress.mjs` (RESUME POINT).
+      **Remaining under .5:** socket-proxy launch (scoped Docker socket — a deployment/
+      DOCKER_HOST concern, not executor code) and the server-side vault wiring (resolve
+      `{{credential:NAME}}` → `executor.secrets`; needs a per-project/workspace secret
+      declaration). **Also still here:** the deferred `bench.exec` command allowlist.
 - [x] **WP3b.6** `refactor-gate` + `load` checks (`packages/kernel/src/verify.ts`):
       refactor-gate runs `git diff --diff-filter=M --name-only HEAD` and blocks when a
       *modified* (not added) file matches the test-path patterns (default set,
@@ -57,13 +69,28 @@ Docker socket proxy.
 
 ---
 
-## ▶ RESUME POINT — WP3b.1 host-verified 2026-07-07 ✅ (WP3b.3 cleared to start)
+## ▶ RESUME POINT — WP3b.5 egress authored, host-verify PENDING (blocks WP3b.4)
 
-**Done:** `WORKBENCH EXECUTOR PASS` on a real Docker host. The next builder starts WP3b.3
-(`bench.*` tools) on a proven executor foundation. Keep the verify ritual below — re-run it
-after any change to `workbench.ts` or `docker/workbench.Dockerfile`.
+**The single next action is yours, on a Docker-capable host: verify WP3b.5.** Build both
+images (the workbench image now also carries `curl`), then run the egress acceptance:
 
-**The verify ritual (Docker-capable host), in order — the image must be built first:**
+```
+docker build -t puppetmaster-workbench:spike    -f docker/workbench.Dockerfile .
+docker build -t puppetmaster-egress-proxy:spike -f docker/egress-proxy.Dockerfile docker
+pnpm --filter "@puppetmaster/kernel..." build && node scripts/verify-egress.mjs
+```
+
+Expect `EGRESS PROXY PASS` (secret-inject / proxy-env / allowlisted-ok / denied-refused /
+direct-blocked / destroy). Exit 3 = no daemon. Note the egress-proxy build context is
+`docker/` (the script is COPYed from there). Needs outbound internet on the host (it hits
+`example.com` allowlisted and `api.github.com` denied).
+- **If PASS:** WP3b.4 (`bench.delegate`) is cleared — it can rely on the egress path + a
+  vault-injected API key. Record the PASS here first.
+- **If FAIL:** paste the output — a real signal about the network wiring or the proxy image;
+  fix before building delegate on top.
+
+Also re-run the original workbench acceptance if `workbench.ts`/`workbench.Dockerfile`
+changed (the no-egress path stayed byte-identical, so it should still pass):
 
 ```
 docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .
