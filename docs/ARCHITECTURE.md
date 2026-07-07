@@ -208,17 +208,63 @@
   streaming on Anthropic, chunked delivery elsewhere); the Command view renders a live bubble
   replaced by the persisted message.
 
+### 3.11 The Workshop — verifiable software development (AI-SDLC plan)
+The Workshop turns the platform into a software-development environment where work passes
+through **deterministic gates** rather than the model's self-report. Its mechanisms are
+shipped; the full phase orchestration (EXECUTE via a headless CLI) is in progress — see
+`docs/AI-SDLC-INTEGRATION-PLAN.md`.
+- **Domain model** (WP2): a `projects` row (mode `supervised`|`gated`, a phase, optional
+  `repoRef`) owns versioned `project_artifacts` — `spec`/`plan` (new version per re-write),
+  `todo` (backlog|active|completed, completion carries the completing `missionId` as a
+  mandatory audit link), `learning` (append-only), `adr` (proposed→accepted; accepted is
+  immutable). Lifecycle rules live in the repo layer, so agents and workflow action nodes hit
+  the same surface (`project.*` tools) as the REST API.
+- **Verify gates** (WP4): the `verify` node kind runs one named check via the deployment's
+  **CheckRunner** and returns *evidence*, never a bare verdict. Pass opens the edge; failure
+  loops a configured fix agent up to `retriesBeforeEscalate` times with the check's own output
+  as the instruction, then escalates to a human approval with the run history attached (the
+  corpus's 8-block override, made policy). Missing/disabled/misconfigured checks **throw** —
+  a gate fails closed, loudly, never passes by absence. `evidence` rows (test-output, diff,
+  screenshot, state-assert) hang off the step or the approval.
+- **Check library** (`verify.ts`): DB-native checks need no workbench — `todo-sync` (a spec
+  that changed without its todos following blocks) and `spec-sections` (the newest spec must
+  carry every required section with concrete content — the "architecture theater" refusal).
+  Workbench-backed checks run a command through a **CommandExecutor**: `test`/`arch`/`custom`
+  (exit 0 = pass), `refactor-gate` (`git diff --diff-filter=M` on test paths — editing test
+  expectations during a refactor blocks; adding tests is fine, P14), and `load` (refuses
+  without declared SLOs — an invented threshold is the smell, S2; with SLOs, runs the declared
+  command). Checks are **earned policies**: created disabled, enabling requires a note on the
+  failure that earned it.
+- **Workbench executor** (WP3, ADR-002/005): the `CommandExecutor.run()` seam is where the
+  isolation boundary lives. `LocalCommandExecutor` runs on the host (trusted-local, and the way
+  the checks are proven in evals); `DockerCommandExecutor` (`WORKBENCH_MODE=docker`) execs into
+  a per-project container — non-root, `--network none`, resource caps, a named volume at
+  `/workbench` — host-verified via `scripts/verify-workbench.mjs`.
+- **`bench.*` tools** (WP3b.3): `bench.read` (read), `bench.exec`/`bench.write`/`bench.git.commit`
+  (write, gated), `bench.git.status`/`.diff` (read), `bench.git.push` (destructive) — a tiered,
+  workspace-scoped surface over the same executor; results inherit the untrusted-data envelope
+  and Stage 9C compaction like any catalog tool. Absent an executor, every call refuses by name.
+- **Knowledge mirror** (ADR-004): accepted `spec`/`learning` artifacts mirror into the KB on
+  write (one live document per project+kind+title, replaced each version) so `kb.search` and
+  citations work over them; a mirror failure never loses the artifact write.
+- **UI**: the WORKSHOP view (project list, dossier with phase strip + todo board + artifact
+  reader + the **forcing-section coverage meter** reading the same required list the
+  spec-sections gate uses, + the earned-policy check panel); the Canvas `verify` node skin and
+  its structured config inspector (check picker, retries-before-escalate); the approval inbox's
+  evidence panel.
+
 ## 4. Data model (core tables)
 
 `users`, `workspaces`, `memberships(role)`, `agents`, `agent_memories`, `workflows`,
 `workflow_versions`, `missions`, `mission_steps`, `approvals`, `tools(mcp_servers)`,
 `tool_grants`, `credentials`, `templates`, `audit_log`, `ui_preferences(user layouts/themes)`,
-`branding(workspace)`.
+`branding(workspace)`. Workshop (§3.11): `projects`, `project_artifacts`, `verify_checks`,
+`evidence`.
 
 ## 5. Frontend architecture
 
 - App shell implements the FUI design system (see DESIGN-LANGUAGE.md) with a panel/grid layout engine for user-arrangeable dashboards.
-- Views: **Command** (chat + live mission feed), **Canvas** (React Flow editor), **Missions** (trace/timeline/cost), **Agents** (roster + memory inspector), **Tools** (MCP catalog), **Admin** (members, roles, branding).
+- Views: **Command** (chat + live mission feed), **Canvas** (React Flow editor), **Missions** (trace/timeline/cost), **Agents** (roster + memory inspector), **Tools** (MCP catalog), **Workshop** (projects, dossier, verify checks — §3.11), **Admin** (members, roles, branding).
 - Role-based navigation config drives which menus/widgets render; AI-adaptive suggestions come from a usage-stats service.
 - Real-time via WebSocket subscriptions to bus events.
 

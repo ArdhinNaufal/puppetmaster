@@ -18,7 +18,11 @@
       without declared SLOs — S2). Golden tasks at pass^3.
 - [ ] Remaining priority evals that need WP3/WP5 machinery: verifier-edit flag,
       wholesale-rewrite detection; interview-anchoring needs real-model sessions
-- [ ] `docs/WORKSHOP.md` operator guide + ARCHITECTURE.md §3.11 + PRD/NEXUS updates —
-      once the full phase flows exist
+- [x] **ARCHITECTURE.md §3.11** (The Workshop): documents the shipped mechanisms —
+      domain model, verify gates + check library (incl. refactor-gate/load), workbench
+      executor, bench.* tools, KB mirror, UI surfaces; §4 tables + §5 views updated.
+- [ ] `docs/WORKSHOP.md` operator guide + PRD/NEXUS updates — once the full phase flows
+      (SPECIFY→RECORD, EXECUTE) exist; §3.11 covers the architecture reference in the
+      meantime
 - [ ] Self-hosting smoke test (run this repo's workflow through the product) + learnings
 - [ ] Suite stays at k≥2 (currently k=3) as new evals land
