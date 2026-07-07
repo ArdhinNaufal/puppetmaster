@@ -110,6 +110,7 @@ import {
   QueueRunner,
   RedisEventBus,
   createBuiltinCheckRunner,
+  mirrorArtifactToKb,
   registerBridgeTools,
   registerKbTools,
   registerProjectTools,
@@ -313,7 +314,7 @@ registerKbTools(tools, kbDeps);
 
 // The Workshop (AI-SDLC plan WP2): project artifacts/todos join the shared
 // catalog — same surface for agents and workflow action nodes.
-registerProjectTools(tools, { db, workspaceId });
+registerProjectTools(tools, { db, workspaceId, kb: kbDeps });
 
 // --- Tool layer: MCP servers (ARCHITECTURE.md §3.4) ---------------------------
 // Bundled utils connector by default; extend/override via MCP_SERVERS JSON.
@@ -688,6 +689,7 @@ app.post("/api/projects/:id/artifacts", async (req, reply) => {
       body: body.body,
       status: body.status,
     });
+    await mirrorArtifactToKb(kbDeps, row).catch(() => {});
     await appendAudit(db, {
       workspaceId,
       actorKind: "user",

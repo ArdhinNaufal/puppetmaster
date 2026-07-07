@@ -10,9 +10,12 @@ except one item:** the ADR-002 container spike half is blocked on a docker-capab
 `workshop-artifact-lifecycle` green at pass^3). **WP4's workbench-independent core is
 complete** (verify node + evidence + bounded fix loop + escalation + todo-sync check +
 inbox evidence; four golden evals green at pass^3) — its shell-backed check runner rides
-WP3. Next in the dependency order is WP3 (workbench connector), gated on the ADR-002
-container spike passing on a docker-capable host. Each work package runs only on explicit
-go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
+WP3. **WP5a (workbench-free WP5 increment) is complete**: the spec-sections theater gate,
+the ADR-004 KB mirror, and the three builtin Workshop agents (suite now 12/12 at pass^3).
+Everything remaining (WP3, WP5 rest, WP6–WP9) funnels through the workbench: WP3 is gated
+on the ADR-002 container spike passing on a docker-capable host. Each work package runs
+only on explicit go-ahead, in order, following the same convention as
+`docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
 **`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
@@ -626,14 +629,21 @@ started.)*
       fix loop (2 attempts → 1 nested fix mission); disabled-check fails closed
       (refactor-gate M-vs-A eval rides WP3's runner)
 
-**WP5 — Phases**
-- [ ] Interviewer + SPECIFY flow (restate-first; forcing sections; theater refusal)
-- [ ] PLAN (read-only explore → editable artifact; skip affordance)
-- [ ] EXECUTE supervised template (`/next` contract; `bench.delegate`)
-- [ ] EXECUTE gated template (`/loop` contract; mode chooser; no-verify ⇒ refuse)
-- [ ] Reviewer via `agent.ask` + RECORD (learnings, todo completion, skill-extraction proposal)
-- [ ] Refactor variant (coverage precondition, characterization route, contract checks)
-- [ ] End-to-end golden scenario (independence trajectory-asserted)
+**WP5 — Phases** — 🟡 WP5a (workbench-free increment) complete 2026-07-06
+- [x] Theater refusal as a deterministic gate: `spec-sections` builtin check
+      (required sections concrete or the gate escalates with the section list as
+      evidence; per-project override via check command; two golden evals at pass^3)
+- [x] KB mirror (ADR-004): spec/learning writes mirror to the KB via tool + REST
+      paths, one live doc per artifact replaced per version (eval-pinned)
+- [x] Interviewer / Foreman / Reviewer builtin agent templates seeded (corpus
+      contracts as personas; Reviewer read_auto with named failure classes)
+- [ ] Command-view interview UX (restate card, section progress — with WP7)
+- [ ] PLAN (read-only workbench explore → editable artifact) — needs WP3
+- [ ] EXECUTE supervised template (`/next` contract; `bench.delegate`) — needs WP3
+- [ ] EXECUTE gated template (`/loop`; mode chooser; no-verify ⇒ refuse) — needs WP3
+- [ ] RECORD orchestration (ADR-on-accept mirror; skill-extraction proposal)
+- [ ] Refactor variant (coverage precondition, characterization route) — needs WP3
+- [ ] End-to-end golden scenario (independence trajectory-asserted) — needs WP3
 
 **WP6 — Quality layers**
 - [ ] Four knowledge packs (0 standing lines; negative triggers included)

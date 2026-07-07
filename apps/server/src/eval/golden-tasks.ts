@@ -8,6 +8,7 @@ import {
   listArtifacts,
   listApprovals,
   listChildMissions,
+  listDocuments,
   listEvidenceForApproval,
   listEvidenceForStep,
   searchMemories,
@@ -379,6 +380,104 @@ export const GOLDEN_TASKS: GoldenTask[] = [
     expectState: async (db, ctx) => {
       const mission = await getMission(db, ctx.missionId);
       return Boolean(mission?.error?.includes("disabled"));
+    },
+  },
+  {
+    id: "workshop-spec-gate-theater-refusal",
+    description:
+      "Workshop WP5a: the spec-sections gate refuses a vague spec (missing/thin sections) and escalates with the section list as evidence — the theater detector as a deterministic check",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-spec-theater" });
+      await writeArtifact(db, {
+        projectId: project.id,
+        kind: "spec",
+        title: "Spec",
+        body: "## Tech stack\nnode\n## Code architecture\nclean separation of concerns",
+      });
+      await createVerifyCheck(db, { projectId: project.id, name: "spec-sections", enabled: true, earnedNote: "eval fixture" });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "spec gate", config: { projectId: "{{input.projectId}}", check: "spec-sections" } },
+      ],
+      edges: [{ from: "t", to: "gate" }],
+    },
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      if (!approval || !approval.prompt.includes("spec-sections")) return false;
+      const ev = await listEvidenceForApproval(db, approval.id);
+      const detail = (ev[0]?.content as { detail?: { missing?: string[]; thin?: string[] } } | null)?.detail;
+      // "Data model" etc. never appeared; "Tech stack" appeared but is thin.
+      return (
+        Array.isArray(detail?.missing) &&
+        detail!.missing!.includes("Data model") &&
+        Array.isArray(detail?.thin) &&
+        detail!.thin!.includes("Tech stack")
+      );
+    },
+  },
+  {
+    id: "workshop-spec-gate-pass-and-kb-mirror",
+    description:
+      "Workshop WP5a: a concrete spec passes the spec-sections gate; each version is mirrored into the KB exactly once (ADR-004 — one live mirror per artifact, replaced on re-write)",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-spec-mirror" });
+      await createVerifyCheck(db, { projectId: project.id, name: "spec-sections", enabled: true, earnedNote: "eval fixture" });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "w1",
+          kind: "action",
+          label: "write spec v1",
+          config: {
+            server: "project",
+            tool: "artifact.write",
+            args: { projectId: "{{input.projectId}}", kind: "spec", title: "Spec", body: "## Tech stack\nNode 22, Fastify, Postgres with pgvector, Redis, React with Vite frontend.\n## Data model\nOne table of widgets (id, name, state) plus an audit trail of every mutation.\n## Code architecture\napi -> services -> data; nothing imports api; no cycles; max 400 lines per file.\n## Scale & operations\n~50 concurrent users at launch, 12-month growth to ~200. SLO: none - best effort.\n## Edge cases\nDuplicate widget names are rejected; concurrent edits use last-write-wins with audit.\n## Out of scope\nNo multi-tenancy, no mobile app, no offline mode in this iteration.\n## Verification\nRun the suite; create/edit/delete a widget through the UI and see the audit entries." },
+          },
+        },
+        {
+          id: "w2",
+          kind: "action",
+          label: "write spec v2",
+          config: {
+            server: "project",
+            tool: "artifact.write",
+            args: { projectId: "{{input.projectId}}", kind: "spec", title: "Spec", body: "## Tech stack\nNode 22, Fastify, Postgres with pgvector, Redis, React with Vite frontend.\n## Data model\nOne table of widgets (id, name, state) plus an audit trail of every mutation.\n## Code architecture\napi -> services -> data; nothing imports api; no cycles; max 400 lines per file.\n## Scale & operations\n~50 concurrent users at launch, 12-month growth to ~200. SLO: none - best effort.\n## Edge cases\nDuplicate widget names are rejected; concurrent edits use last-write-wins with audit.\n## Out of scope\nNo multi-tenancy, no mobile app, no offline mode in this iteration.\n## Verification\nRun the suite; create/edit/delete a widget through the UI and see the audit entries.\n## Revision\nSecond pass after review." },
+          },
+        },
+        { id: "gate", kind: "verify", label: "spec gate", config: { projectId: "{{input.projectId}}", check: "spec-sections" } },
+      ],
+      edges: [
+        // Payload-input trick (see learnings.md): the trigger edge declared
+        // first hands each node the mission payload; the chain edges order.
+        { from: "t", to: "w1" },
+        { from: "t", to: "w2" },
+        { from: "w1", to: "w2" },
+        { from: "t", to: "gate" },
+        { from: "w2", to: "gate" },
+      ],
+    },
+    expectOutput: (o) => (o as { passed?: boolean } | null)?.passed === true,
+    expectState: async (db, ctx) => {
+      const { listProjects: lp } = await import("@puppetmaster/db");
+      const project = (await lp(db, ctx.workspaceId)).find((p) => p.name === "eval-spec-mirror");
+      if (!project) return false;
+      const specs = await listArtifacts(db, project.id, { kind: "spec" });
+      if (specs.length !== 2) return false;
+      // Exactly ONE live KB mirror, and it is the newest version.
+      const source = `project:${project.id}:spec:Spec`;
+      const mirrors = (await listDocuments(db, ctx.workspaceId)).filter((d) => d.source === source);
+      return mirrors.length === 1 && mirrors[0]!.title.includes("(v2)") && mirrors[0]!.chunkCount > 0;
     },
   },
 ];

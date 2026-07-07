@@ -57,6 +57,7 @@ export function createBuiltinCheckRunner(deps: { db: Db }): CheckRunner {
       }
 
       if (ctx.check === "todo-sync") return runTodoSync(deps.db, ctx.projectId);
+      if (ctx.check === "spec-sections") return runSpecSections(deps.db, ctx.projectId, check.command);
 
       throw new Error(
         `verify check "${ctx.check}" requires a project workbench (WP3) — no shell-capable check runner is wired in this deployment`,
@@ -100,6 +101,86 @@ async function runTodoSync(db: Db, projectId: string): Promise<CheckRunResult> {
     instruction:
       `The spec "${latestSpec.title}" (v${latestSpec.version}) changed but the project's todos were not updated. ` +
       `Review the spec change and create, update, or complete the affected todos so the task state reflects it, then finish.`,
+    evidenceKind: "state-assert",
+    detail,
+  };
+}
+
+/** The corpus's required-output-sections rule as a gate ("theater refusal"):
+ *  the newest spec version must contain every required section with concrete
+ *  content. Presence + substance only — quality stays with the review gate.
+ *  `command` may override the section list as a JSON array of strings. */
+const DEFAULT_SPEC_SECTIONS = [
+  "Tech stack",
+  "Data model",
+  "Code architecture",
+  "Scale & operations",
+  "Edge cases",
+  "Out of scope",
+  "Verification",
+];
+const MIN_SECTION_CHARS = 40;
+
+async function runSpecSections(db: Db, projectId: string, command: string | null): Promise<CheckRunResult> {
+  let required = DEFAULT_SPEC_SECTIONS;
+  if (command) {
+    try {
+      const parsed = JSON.parse(command);
+      if (Array.isArray(parsed) && parsed.every((s) => typeof s === "string") && parsed.length > 0) {
+        required = parsed;
+      }
+    } catch {
+      /* not JSON — keep defaults */
+    }
+  }
+
+  const specs = await listArtifacts(db, projectId, { kind: "spec" });
+  if (specs.length === 0) {
+    return {
+      ok: false,
+      summary: "spec-sections: no spec artifact exists yet",
+      instruction: "No spec artifact exists for this project. Run the interview and write the spec (project.artifact.write, kind spec) before proceeding.",
+      evidenceKind: "state-assert",
+      detail: { required, spec: null },
+    };
+  }
+  const latest = specs.reduce((a, b) => (a.createdAt > b.createdAt ? a : b));
+
+  // Split the body into heading → content blocks (markdown #-headings).
+  const sections = new Map<string, string>();
+  const parts = latest.body.split(/^#{1,6}\s+(.+)$/m);
+  for (let i = 1; i < parts.length; i += 2) {
+    sections.set(parts[i]!.trim().toLowerCase(), (parts[i + 1] ?? "").trim());
+  }
+
+  const missing: string[] = [];
+  const thin: string[] = [];
+  for (const name of required) {
+    const key = [...sections.keys()].find((h) => h.includes(name.toLowerCase()));
+    if (key === undefined) missing.push(name);
+    else if (sections.get(key)!.length < MIN_SECTION_CHARS) thin.push(name);
+  }
+
+  const detail = {
+    spec: { id: latest.id, title: latest.title, version: latest.version },
+    required,
+    missing,
+    thin,
+  };
+  if (missing.length === 0 && thin.length === 0) {
+    return { ok: true, summary: `spec-sections: all ${required.length} required sections are concretely filled`, evidenceKind: "state-assert", detail };
+  }
+  const problems = [
+    ...missing.map((s) => `missing section "${s}"`),
+    ...thin.map((s) => `section "${s}" has no concrete content`),
+  ].join("; ");
+  return {
+    ok: false,
+    summary: `spec-sections: spec "${latest.title}" v${latest.version} is incomplete — ${problems}`,
+    instruction:
+      `The spec "${latest.title}" is not concrete enough to build from: ${problems}. ` +
+      `Keep interviewing until every required section can be filled concretely, then write the ` +
+      `updated spec as a new version (project.artifact.write, kind spec, same title).`,
     evidenceKind: "state-assert",
     detail,
   };

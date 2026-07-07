@@ -226,7 +226,7 @@ export const ProjectArtifact = z.object({
 });
 export type ProjectArtifact = z.infer<typeof ProjectArtifact>;
 
-export const VerifyCheckName = z.enum(["test", "arch", "refactor-gate", "todo-sync", "load", "custom"]);
+export const VerifyCheckName = z.enum(["test", "arch", "refactor-gate", "todo-sync", "spec-sections", "load", "custom"]);
 export type VerifyCheckName = z.infer<typeof VerifyCheckName>;
 
 /** A deterministic check a project's verify nodes run (WP4). Checks are
@@ -252,7 +252,7 @@ export type VerifyCheck = z.infer<typeof VerifyCheck>;
  *  `projectId` / `fixAgentId` support `{{input.*}}` templating like action args. */
 export const VerifyNodeConfig = z.object({
   projectId: z.string().min(1),
-  check: z.enum(["test", "arch", "refactor-gate", "todo-sync", "load", "custom"]),
+  check: VerifyCheckName,
   fixAgentId: z.string().optional(),
   retriesBeforeEscalate: z.number().int().min(1).max(20).default(8),
 });

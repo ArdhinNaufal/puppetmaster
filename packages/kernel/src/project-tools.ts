@@ -1,13 +1,16 @@
 import {
   completeTodo,
+  deleteDocument,
   getArtifact,
   getProject,
   listArtifacts,
+  listDocuments,
   listProjects,
   nextTodo,
   writeArtifact,
   type Db,
 } from "@puppetmaster/db";
+import { kbIngest, type KbDeps } from "./kb.js";
 import type { BuiltinToolRegistry } from "./tools.js";
 
 /**
@@ -17,9 +20,32 @@ import type { BuiltinToolRegistry } from "./tools.js";
  * writes and todo completion are write_approved (PRD §4 tiers). Lifecycle
  * rules are enforced by the repo layer, not here.
  */
+
+/** ADR-004: accepted knowledge artifacts are mirrored into the KB so
+ *  `kb.search` retrieval and citations work over them. The artifact row stays
+ *  the source of truth; the mirror is replaced on every new version (one KB
+ *  document per project+kind+title, keyed by `source`). Spec + learning for
+ *  now; ADR-on-accept rides the WP5 record phase. */
+export async function mirrorArtifactToKb(
+  kb: KbDeps,
+  artifact: { projectId: string; kind: string; title: string; body: string; version: number },
+): Promise<void> {
+  if (artifact.kind !== "spec" && artifact.kind !== "learning") return;
+  const source = `project:${artifact.projectId}:${artifact.kind}:${artifact.title}`;
+  const docs = await listDocuments(kb.db, kb.workspaceId);
+  for (const doc of docs) {
+    if (doc.source === source) await deleteDocument(kb.db, doc.id);
+  }
+  await kbIngest(kb, {
+    title: `${artifact.title} (v${artifact.version})`,
+    content: artifact.body.trim() || artifact.title,
+    source,
+  });
+}
+
 export function registerProjectTools(
   registry: BuiltinToolRegistry,
-  deps: { db: Db; workspaceId: string },
+  deps: { db: Db; workspaceId: string; kb?: KbDeps },
 ): void {
   /** Workspace-scoping guard: a tool must never touch another workspace's
    *  project, whatever id an injected instruction supplies. */
@@ -106,6 +132,10 @@ export function registerProjectTools(
         body: args.body === undefined ? undefined : String(args.body),
         status: args.status === undefined ? undefined : String(args.status),
       });
+      if (deps.kb) {
+        // Best-effort: a mirror failure must not lose the artifact write.
+        await mirrorArtifactToKb(deps.kb, row).catch(() => {});
+      }
       return { id: row.id, kind: row.kind, status: row.status, title: row.title, version: row.version };
     },
   );

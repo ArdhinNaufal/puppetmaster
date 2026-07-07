@@ -55,3 +55,12 @@ Importing `drizzle-orm` in apps/server (for eval DB-state predicates) fails: the
 doesn't depend on drizzle directly and must not — table access belongs to
 @puppetmaster/db. The fix that keeps the dependency direction honest: add the tiny query
 helper (`listChildMissions`) to the db package and call it from the eval.
+
+## 2026-07-06 — Escaping stacks up when generating code through heredocs
+
+A spec fixture written via a Python heredoc used `\\n`, which lands in the TypeScript
+source as `\n`-the-two-characters, not a newline — the markdown headings never started a
+line and the spec-sections gate correctly refused a "complete" spec. The gate caught the
+fixture bug, which is the system working; the lesson is about tooling: when a generator
+script writes string literals into source code, count escaping levels per layer
+(shell → python → TS), and prefer real newlines in the generator over escape sequences.
