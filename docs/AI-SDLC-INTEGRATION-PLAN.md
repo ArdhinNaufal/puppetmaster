@@ -24,7 +24,10 @@ seam + `LocalCommandExecutor`) with two golden evals at pass^3 — suite now 14/
 remains is **WP3b** (the containerized connector: `DockerCommandExecutor`, `bench.*` tools,
 `bench.delegate`, lifecycle) plus WP5/WP6/WP7/WP9 remainders — the container-executing parts
 need a Docker host for their golden evals, though the substrate is spike-validated and the
-shell-check logic they reuse is already proven. Each work package runs
+shell-check logic they reuse is already proven. **WP3b.1/.2 authored** (Docker executor +
+workbench lifecycle + env-gated server wiring); the **resume point** is a Docker-host run
+of `node scripts/verify-workbench.mjs` (WP3b.1 acceptance) before WP3b.3 (`bench.*` tools)
+builds on it — see `todos/backlog/wp3-workbench-connector.md`. Each work package runs
 only on explicit go-ahead, in order, following the same convention as
 `docs/RESEARCH-ROADMAP.md`.
 
@@ -619,13 +622,16 @@ started.)*
       check runs* boundary (`packages/kernel/src/command-runner.ts`)
 - [x] Shell checks `test`/`arch`/`custom` in the builtin runner (run `check.command`, exit
       gates, output = evidence); two golden evals at pass^3 with real `node --test`
-- [ ] `DockerCommandExecutor` (`docker exec` into the workbench; same interface) — WP3b
-- [ ] Workbench lifecycle (create/suspend/destroy) per ADR-005 — WP3b, Docker host
-- [ ] `bench.git.*`, `bench.exec`, `bench.read/write` with tiers + envelopes + compaction — WP3b
-- [ ] Egress allowlist, resource caps, vault-only secrets — WP3b (ADR-005 spike-confirmed)
-- [ ] `bench.delegate` with hard budgets (per ADR-002 ruling) — WP3b
-- [ ] `refactor-gate` + `load` checks (git-diff / running system) — WP3b
-- [ ] Golden evals **on a Docker host**: exit-code propagation; injection→push gated; egress refusal audited
+- [x] `DockerCommandExecutor` + workbench lifecycle (`packages/kernel/src/workbench.ts`)
+      — WP3b.1, authored/typechecked/built here; **host-verify via
+      `node scripts/verify-workbench.mjs`** before building on it
+- [x] Server wiring `WORKBENCH_MODE=docker` (env-gated, default off) — WP3b.2
+- [ ] `bench.git.*`, `bench.exec`, `bench.read/write` with tiers + envelopes + compaction
+      — WP3b.3 (gated on WP3b.1 host-verify)
+- [ ] `bench.delegate` with hard budgets (ADR-002) — WP3b.4
+- [ ] Egress proxy, socket-proxy launch, vault secrets — WP3b.5 (ADR-005 spike-confirmed)
+- [ ] `refactor-gate` + `load` checks (git-diff / running system) — WP3b.6
+- [ ] Golden evals **on a Docker host**: exit-code propagation; injection→push gated; egress refusal audited — WP3b.7
 
 **WP4 — Verification gates** — ✅ workbench-independent core complete 2026-07-06
 - [x] `verify` node handler + Evidence persistence (fail-closed on missing/disabled

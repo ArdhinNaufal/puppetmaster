@@ -13,18 +13,50 @@ container — the pinned layer commented in `docker/workbench.Dockerfile`); egre
 default-closed via proxy sidecar, resource caps, vault-only secrets, launched via a scoped
 Docker socket proxy.
 
-- [ ] `DockerCommandExecutor implements CommandExecutor` — `docker exec` into the
-      project's workbench container (same interface as `LocalCommandExecutor`; WP3a's
-      shell checks run unchanged through it). Wire it into the server's CheckRunner
-      (replaces the executor-less refusal)
-- [ ] Workbench lifecycle tools + volume/clone; `bench.*` tool namespace with tiers
-- [ ] `bench.delegate` with hard token/time budgets, progress → mission trace
-- [ ] Security: egress proxy allowlist, resource caps, socket-proxy launch, vault secrets
-- [ ] `refactor-gate` (git `--diff-filter=M` on test paths) and `load` (k6/locust,
-      skip-without-SLOs) checks — need git-diff / a running system
-- [ ] Golden evals **(run on a Docker host)**: clone a fixture repo → `bench.exec` runs
+- [x] **WP3b.1** `DockerCommandExecutor implements CommandExecutor`
+      (`packages/kernel/src/workbench.ts`) — `docker exec` into the per-project container
+      (same interface as `LocalCommandExecutor`; WP3a's shell checks run unchanged).
+      ensure/status/destroy lifecycle with ADR-005 caps. Authored + typechecks + builds
+      here; **container behavior pending a Docker-host run** (see resume point).
+- [x] **WP3b.2** server wiring — `WORKBENCH_MODE=docker` constructs the executor and
+      activates shell checks (default off = honest refusal). Boots both ways.
+- [ ] **WP3b.3** `bench.*` tool namespace (git/exec/read/write) with tiers +
+      untrusted-data envelopes + Stage 9C compaction — **do NOT start until WP3b.1 is
+      host-verified** (don't build on an unverified executor)
+- [ ] **WP3b.4** `bench.delegate` with hard token/time budgets, progress → mission trace;
+      pinned CLI layer in the Dockerfile (ADR-002)
+- [ ] **WP3b.5** Security: egress proxy allowlist (unblocks clone/install under
+      `--network none`), socket-proxy launch, vault secrets
+- [ ] **WP3b.6** `refactor-gate` (git `--diff-filter=M` on test paths) and `load`
+      (k6/locust, skip-without-SLOs) checks
+- [ ] **WP3b.7** Golden evals **(Docker host)**: clone a fixture repo → `bench.exec` runs
       its suite, exit-code propagation; injection→`bench.git.push` gated; egress refusal
       audited
 
-**Largest security surface in the plan — the ADR-005 posture is spike-confirmed
-(non-root, `--network none`, resource caps); review ADR-005 before starting.**
+---
+
+## ▶ RESUME POINT (2026-07-06)
+
+**The single next action is yours, on a Docker-capable host:**
+
+```
+pnpm build && node scripts/verify-workbench.mjs
+```
+
+Expect `WORKBENCH EXECUTOR PASS: ensure/idempotent/non-root/exit-codes/in-container
+check/destroy` (exit 3 = no daemon). This is WP3b.1's acceptance — it drives the built
+`DockerCommandExecutor` against a real daemon.
+
+- **If PASS:** record it in `docs/adr/spike-002-record.md` (a WP3b.1 row), then WP3b.3
+  (`bench.*` tools) is cleared to start — the executor foundation is proven.
+- **If FAIL:** paste the output. A failure is a real signal about the executor code or
+  the ADR-005 image; fix before building `bench.*` on top.
+
+**Why work stopped here (principled, not just usage):** WP3b.3+ build on the container
+executor. Per the discipline that's governed this whole integration — verify a foundation
+before building on it (exactly how the ADR-002 spike was handled) — the honest move is to
+prove WP3b.1 on real Docker before writing the `bench.*` tools that depend on it. This
+session has no Docker daemon, so that proof is the owner's to run.
+
+**Largest security surface in the plan — ADR-005 posture spike-confirmed (non-root,
+`--network none`, resource caps); review ADR-005 before WP3b.3+.**
