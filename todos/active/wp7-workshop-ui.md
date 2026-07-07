@@ -24,7 +24,13 @@
 
 ## Remaining
 
-- [ ] Canvas verify-node skin + config inspector (check picker, retries)
+- [x] Canvas verify-node skin + config inspector: `verify` added to the frontend
+      `NodeKind`, `NODE_META` (✓ glyph), `DEFAULT_CONFIG`, and a `.kind-verify`
+      rail skin — verify nodes now render on the canvas and appear in the ADD
+      palette. The inspector shows a structured form for verify nodes (project id,
+      check picker over the check-name list, retries-before-escalate 1–20, optional
+      fix-agent) instead of raw JSON. (`FlowNode.tsx`, `Canvas.tsx`, `api.ts`,
+      `fui.css`.) Typecheck + web build clean; rendered skin/inspector verified.
 - [~] Interview UX — **forcing-section progress meter landed** in the WORKSHOP
       dossier (`GET /api/projects/:id/spec-coverage` → present/thin/missing vs the
       gate's required list; bar + per-section markers). **Restate card deferred** to

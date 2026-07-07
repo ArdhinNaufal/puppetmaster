@@ -13,7 +13,7 @@ import {
   type Node,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, type LintIssue, type NodeKind, type StepStatus, type WorkflowGraph } from "./api.js";
+import { api, VERIFY_CHECK_NAMES, type LintIssue, type NodeKind, type StepStatus, type WorkflowGraph } from "./api.js";
 import { FlowNode, NODE_META, type FlowNodeData } from "./FlowNode.js";
 
 const nodeTypes = { fui: FlowNode };
@@ -25,6 +25,7 @@ const DEFAULT_CONFIG: Record<NodeKind, Record<string, unknown>> = {
   code: { source: "return input;" },
   agent: { agentId: "", message: "{{input}}" },
   approval: { prompt: "Approve this step?" },
+  verify: { projectId: "{{input.projectId}}", check: "test", retriesBeforeEscalate: 8 },
 };
 
 function graphToFlow(graph: WorkflowGraph): { nodes: Node[]; edges: Edge[] } {
@@ -355,23 +356,30 @@ export function Canvas(props: {
                     onChange={(e) => patchNode({ label: e.target.value })}
                   />
                 </label>
-                <label className="ins-field">
-                  <span>Config (JSON)</span>
-                  <textarea
-                    rows={10}
-                    spellCheck={false}
-                    defaultValue={JSON.stringify((selectedNode.data as FlowNodeData).config, null, 2)}
-                    key={selectedNode.id}
-                    onBlur={(e) => {
-                      try {
-                        patchNode({ config: JSON.parse(e.target.value) });
-                        setMsg(null);
-                      } catch {
-                        setMsg("config is not valid JSON");
-                      }
-                    }}
+                {(selectedNode.data as FlowNodeData).kind === "verify" ? (
+                  <VerifyConfigFields
+                    node={selectedNode}
+                    onPatch={(cfg) => patchNode({ config: cfg })}
                   />
-                </label>
+                ) : (
+                  <label className="ins-field">
+                    <span>Config (JSON)</span>
+                    <textarea
+                      rows={10}
+                      spellCheck={false}
+                      defaultValue={JSON.stringify((selectedNode.data as FlowNodeData).config, null, 2)}
+                      key={selectedNode.id}
+                      onBlur={(e) => {
+                        try {
+                          patchNode({ config: JSON.parse(e.target.value) });
+                          setMsg(null);
+                        } catch {
+                          setMsg("config is not valid JSON");
+                        }
+                      }}
+                    />
+                  </label>
+                )}
                 <p className="ins-hint">kind: {(selectedNode.data as FlowNodeData).kind}</p>
               </>
             )}
@@ -390,5 +398,70 @@ export function Canvas(props: {
         )}
       </div>
     </div>
+  );
+}
+
+/** Structured config inspector for verify nodes (WP7.4): a check picker +
+ *  retries-before-escalate + project / optional fix-agent, instead of raw JSON
+ *  — the verify node's config is a fixed shape (shared VerifyNodeConfig), so a
+ *  typed form beats a JSON blob for the earned-gate the corpus centres on. */
+function VerifyConfigFields(props: { node: Node; onPatch: (cfg: Record<string, unknown>) => void }) {
+  const cfg = (props.node.data as FlowNodeData).config as {
+    projectId?: string;
+    check?: string;
+    retriesBeforeEscalate?: number;
+    fixAgentId?: string;
+  };
+  const set = (patch: Record<string, unknown>) => props.onPatch({ ...cfg, ...patch });
+  return (
+    <>
+      <label className="ins-field">
+        <span>Project ID</span>
+        <input
+          defaultValue={cfg.projectId ?? ""}
+          key={`${props.node.id}-pid`}
+          placeholder="{{input.projectId}}"
+          onBlur={(e) => set({ projectId: e.target.value })}
+        />
+      </label>
+      <label className="ins-field">
+        <span>Check</span>
+        <select value={cfg.check ?? "test"} onChange={(e) => set({ check: e.target.value })}>
+          {VERIFY_CHECK_NAMES.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="ins-field">
+        <span>Retries before escalate (1–20)</span>
+        <input
+          type="number"
+          min={1}
+          max={20}
+          defaultValue={cfg.retriesBeforeEscalate ?? 8}
+          key={`${props.node.id}-retries`}
+          onBlur={(e) =>
+            set({ retriesBeforeEscalate: Math.max(1, Math.min(20, Math.round(Number(e.target.value) || 8))) })
+          }
+        />
+      </label>
+      <label className="ins-field">
+        <span>Fix agent ID (optional)</span>
+        <input
+          defaultValue={cfg.fixAgentId ?? ""}
+          key={`${props.node.id}-fix`}
+          placeholder="none — escalate on first failure"
+          onBlur={(e) => {
+            const v = e.target.value.trim();
+            const next = { ...cfg } as Record<string, unknown>;
+            if (v) next.fixAgentId = v;
+            else delete next.fixAgentId;
+            props.onPatch(next);
+          }}
+        />
+      </label>
+    </>
   );
 }

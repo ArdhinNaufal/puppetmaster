@@ -642,8 +642,10 @@ button { font-family: inherit; cursor: pointer; }
 .fnode.kind-code { box-shadow: inset 2px 0 0 #4ad08a; }
 .fnode.kind-approval { box-shadow: inset 2px 0 0 var(--warn); }
 .fnode.kind-agent { box-shadow: inset 2px 0 0 #d07a9d; }
+.fnode.kind-verify { box-shadow: inset 2px 0 0 var(--ok); }
 .fnode.sel.kind-trigger, .fnode.sel.kind-action, .fnode.sel.kind-logic,
-.fnode.sel.kind-code, .fnode.sel.kind-approval, .fnode.sel.kind-agent {
+.fnode.sel.kind-code, .fnode.sel.kind-approval, .fnode.sel.kind-agent,
+.fnode.sel.kind-verify {
   box-shadow: 0 0 0 1px var(--accent), var(--glow);
 }
 

@@ -9,6 +9,7 @@ export const NODE_META: Record<NodeKind, { glyph: string; tag: string }> = {
   code: { glyph: "{ }", tag: "CODE" },
   agent: { glyph: "◉", tag: "AGENT" },
   approval: { glyph: "⚑", tag: "APPROVAL" },
+  verify: { glyph: "✓", tag: "VERIFY" },
 };
 
 export interface FlowNodeData {

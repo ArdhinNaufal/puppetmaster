@@ -1,6 +1,18 @@
 /** Thin typed client for the Puppetmaster server REST API. */
 
-export type NodeKind = "trigger" | "action" | "logic" | "code" | "agent" | "approval";
+export type NodeKind = "trigger" | "action" | "logic" | "code" | "agent" | "approval" | "verify";
+
+/** Verify-check names (mirror of shared VerifyCheckName) — the verify-node
+ *  config inspector's check picker (WP7.4). */
+export const VERIFY_CHECK_NAMES = [
+  "test",
+  "arch",
+  "refactor-gate",
+  "todo-sync",
+  "spec-sections",
+  "load",
+  "custom",
+] as const;
 export type StepStatus =
   | "pending"
   | "running"
