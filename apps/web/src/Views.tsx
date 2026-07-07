@@ -29,6 +29,7 @@ import {
   type ProjectArtifact,
   type Role,
   type RouterProfile,
+  type SpecCoverage,
   type Template,
   type UsageReport,
   type VerifyCheckRow,
@@ -972,6 +973,7 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
   const [selected, setSelected] = useState<Project | null>(null);
   const [artifacts, setArtifacts] = useState<ProjectArtifact[]>([]);
   const [checks, setChecks] = useState<VerifyCheckRow[]>([]);
+  const [coverage, setCoverage] = useState<SpecCoverage | null>(null);
   const [reading, setReading] = useState<ProjectArtifact | null>(null);
   const [name, setName] = useState("");
   const [repoRef, setRepoRef] = useState("");
@@ -988,6 +990,7 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
     setReading(null);
     projectApi.artifacts(p.id).then(setArtifacts).catch(() => setArtifacts([]));
     projectApi.checks(p.id).then(setChecks).catch(() => setChecks([]));
+    projectApi.specCoverage(p.id).then(setCoverage).catch(() => setCoverage(null));
   };
 
   const create = async () => {
@@ -1072,6 +1075,33 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
                   </span>
                 ))}
               </div>
+              {coverage && coverage.required.length > 0 && (
+                <div>
+                  <span className="tag-lo">
+                    SPEC COVERAGE · {coverage.present.length}/{coverage.required.length} FILLED
+                    {coverage.spec ? ` · ${coverage.spec.title} v${coverage.spec.version}` : " · NO SPEC YET"}
+                  </span>
+                  <div
+                    className="cov-bar"
+                    title={`${coverage.present.length} filled · ${coverage.thin.length} thin · ${coverage.missing.length} missing`}
+                  >
+                    <span className="cov-seg cov-ok" style={{ width: `${(coverage.present.length / coverage.required.length) * 100}%` }} />
+                    <span className="cov-seg cov-thin" style={{ width: `${(coverage.thin.length / coverage.required.length) * 100}%` }} />
+                  </div>
+                  <ul className="tool-list">
+                    {coverage.required.map((s) => {
+                      const st = coverage.present.includes(s) ? "ok" : coverage.thin.includes(s) ? "thin" : "missing";
+                      return (
+                        <li key={s} className="cov-row">
+                          <span className={`cov-mark cov-${st}`}>{st === "ok" ? "✓" : st === "thin" ? "~" : "○"}</span>
+                          <span className="cov-name">{s}</span>
+                          <span className="tag-lo">{st === "ok" ? "FILLED" : st === "thin" ? "THIN" : "MISSING"}</span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
               {(["active", "backlog", "completed"] as const).map((st) => (
                 <div key={st}>
                   <span className="tag-lo">TODO · {st.toUpperCase()}</span>

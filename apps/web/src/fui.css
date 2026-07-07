@@ -786,6 +786,25 @@ button { font-family: inherit; cursor: pointer; }
 .trace-cost-row { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-size: 0.58rem; letter-spacing: 0.12em; color: var(--text-lo); }
 .trace-cost-row b { color: var(--text-hi); font-weight: 500; font-variant-numeric: tabular-nums; }
 
+/* Spec coverage meter (WP7.5): the forcing-section interview progress bar. */
+.cov-bar {
+  display: flex;
+  height: 6px;
+  margin: 4px 0;
+  border-radius: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--stroke) 70%, transparent);
+}
+.cov-seg { height: 100%; }
+.cov-seg.cov-ok { background: var(--ok); }
+.cov-seg.cov-thin { background: var(--warn); }
+.cov-row { display: flex; align-items: center; gap: 0.5rem; padding: 2px 0; }
+.cov-mark { width: 1em; text-align: center; }
+.cov-mark.cov-ok { color: var(--ok); }
+.cov-mark.cov-thin { color: var(--warn); }
+.cov-mark.cov-missing { color: var(--text-lo); }
+.cov-name { flex: 1; font-size: 0.7rem; }
+
 .mission-output { padding: 0.6rem 0.7rem; border-top: 1px solid var(--stroke); }
 .mission-output pre {
   margin-top: 0.3rem;

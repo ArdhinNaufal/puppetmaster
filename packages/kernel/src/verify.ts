@@ -316,18 +316,52 @@ const DEFAULT_SPEC_SECTIONS = [
 ];
 const MIN_SECTION_CHARS = 40;
 
-async function runSpecSections(db: Db, projectId: string, command: string | null): Promise<CheckRunResult> {
-  let required = DEFAULT_SPEC_SECTIONS;
+/** Resolve the required section list for a project's spec gate: the
+ *  spec-sections check's `command` override (a JSON string array) if present
+ *  and valid, else the default list. Shared by the gate and the coverage
+ *  read-path so the interview progress meter and the gate never disagree. */
+export function resolveRequiredSections(command: string | null): string[] {
   if (command) {
     try {
       const parsed = JSON.parse(command);
       if (Array.isArray(parsed) && parsed.every((s) => typeof s === "string") && parsed.length > 0) {
-        required = parsed;
+        return parsed;
       }
     } catch {
       /* not JSON — keep defaults */
     }
   }
+  return DEFAULT_SPEC_SECTIONS;
+}
+
+/** Section coverage of a spec body against a required list: which required
+ *  sections are present with concrete content, which are thin (found but under
+ *  the substance floor), which missing. Presence + substance only — the same
+ *  rule the spec-sections gate applies. The forcing-section progress meter
+ *  (WP7.5) reads this; the spec's unfilled sections are the interview's bar. */
+export function sectionCoverage(
+  body: string,
+  required: string[],
+): { present: string[]; thin: string[]; missing: string[] } {
+  const sections = new Map<string, string>();
+  const parts = body.split(/^#{1,6}\s+(.+)$/m);
+  for (let i = 1; i < parts.length; i += 2) {
+    sections.set(parts[i]!.trim().toLowerCase(), (parts[i + 1] ?? "").trim());
+  }
+  const present: string[] = [];
+  const thin: string[] = [];
+  const missing: string[] = [];
+  for (const name of required) {
+    const key = [...sections.keys()].find((h) => h.includes(name.toLowerCase()));
+    if (key === undefined) missing.push(name);
+    else if (sections.get(key)!.length < MIN_SECTION_CHARS) thin.push(name);
+    else present.push(name);
+  }
+  return { present, thin, missing };
+}
+
+async function runSpecSections(db: Db, projectId: string, command: string | null): Promise<CheckRunResult> {
+  const required = resolveRequiredSections(command);
 
   const specs = await listArtifacts(db, projectId, { kind: "spec" });
   if (specs.length === 0) {
@@ -341,20 +375,7 @@ async function runSpecSections(db: Db, projectId: string, command: string | null
   }
   const latest = specs.reduce((a, b) => (a.createdAt > b.createdAt ? a : b));
 
-  // Split the body into heading → content blocks (markdown #-headings).
-  const sections = new Map<string, string>();
-  const parts = latest.body.split(/^#{1,6}\s+(.+)$/m);
-  for (let i = 1; i < parts.length; i += 2) {
-    sections.set(parts[i]!.trim().toLowerCase(), (parts[i + 1] ?? "").trim());
-  }
-
-  const missing: string[] = [];
-  const thin: string[] = [];
-  for (const name of required) {
-    const key = [...sections.keys()].find((h) => h.includes(name.toLowerCase()));
-    if (key === undefined) missing.push(name);
-    else if (sections.get(key)!.length < MIN_SECTION_CHARS) thin.push(name);
-  }
+  const { thin, missing } = sectionCoverage(latest.body, required);
 
   const detail = {
     spec: { id: latest.id, title: latest.title, version: latest.version },

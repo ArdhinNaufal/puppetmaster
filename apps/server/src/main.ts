@@ -116,6 +116,8 @@ import {
   registerBridgeTools,
   registerKbTools,
   registerProjectTools,
+  resolveRequiredSections,
+  sectionCoverage,
   replayMission,
   startOtelExporter,
   resolveCredentialEnv,
@@ -683,6 +685,27 @@ app.get("/api/projects/:id/artifacts", async (req, reply) => {
   }
   const { kind, status } = req.query as { kind?: string; status?: string };
   return listArtifacts(db, id, { kind, status });
+});
+
+// Forcing-section progress meter (WP7.5): the spec's unfilled sections are the
+// interview's progress bar. Coverage is recomputed live from the newest spec
+// artifact against the same required list the spec-sections gate uses (its
+// `command` override if configured, else the default), so meter and gate agree.
+app.get("/api/projects/:id/spec-coverage", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const check = await getVerifyCheckByName(db, id, "spec-sections");
+  const required = resolveRequiredSections(check?.command ?? null);
+  const specs = await listArtifacts(db, id, { kind: "spec" });
+  if (specs.length === 0) {
+    return { spec: null, required, present: [], thin: [], missing: required };
+  }
+  const latest = specs.reduce((a, b) => (a.createdAt > b.createdAt ? a : b));
+  const cov = sectionCoverage(latest.body, required);
+  return { spec: { id: latest.id, title: latest.title, version: latest.version }, required, ...cov };
 });
 
 app.post("/api/projects/:id/artifacts", async (req, reply) => {

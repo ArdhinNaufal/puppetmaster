@@ -445,6 +445,15 @@ export interface VerifyCheckRow {
   createdAt: string;
 }
 
+export interface SpecCoverage {
+  /** The spec version the meter reflects, or null if no spec exists yet. */
+  spec: { id: string; title: string; version: number } | null;
+  required: string[];
+  present: string[];
+  thin: string[];
+  missing: string[];
+}
+
 export const projectApi = {
   list: () => fetch("/api/projects").then(json<Project[]>),
   create: (input: { name: string; repoRef?: string; mode?: string }) =>
@@ -465,6 +474,7 @@ export const projectApi = {
   },
   writeArtifact: (id: string, input: { kind: string; title: string; body?: string; status?: string }) =>
     post(`/api/projects/${id}/artifacts`, input).then(json<ProjectArtifact>),
+  specCoverage: (id: string) => fetch(`/api/projects/${id}/spec-coverage`).then(json<SpecCoverage>),
   checks: (id: string) => fetch(`/api/projects/${id}/checks`).then(json<VerifyCheckRow[]>),
   createCheck: (id: string, input: { name: string; command?: string; enabled?: boolean; earnedNote?: string }) =>
     post(`/api/projects/${id}/checks`, input).then(json<VerifyCheckRow>),

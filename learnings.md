@@ -87,6 +87,21 @@ convenient stand-in — a bind-mount shortcut tests a code path the design expli
 and manufactures a false negative. Fix: create the toy files inside the container as the
 workbench user.
 
+## 2026-07-07 — Screenshotting UI here: use the Chromium binary directly, not `playwright`
+
+The `playwright`/`playwright-core` npm package is NOT in this repo's `node_modules`, so
+`import { chromium } from "playwright-core"` fails (`ERR_MODULE_NOT_FOUND`). But Chromium IS
+pre-installed at `/opt/pw-browsers/chromium-1194/chrome-linux/chrome`. Drive it directly:
+`chrome --headless --disable-gpu --no-sandbox --force-device-scale-factor=2
+--window-size=W,H --hide-scrollbars --screenshot=out.png file://<abs>.html` (the dbus
+"Failed to connect to the bus" errors are harmless). Also: the server does NOT serve
+`apps/web/dist` statically and `/api` is session-gated, so a *live* app screenshot needs a
+Vite preview + `/api/auth/setup` bootstrap + proxy — heavy. For presentational UI, a static
+render of the real markup + `fui.css` tokens over the real data shape is faster honest
+evidence (label it as a static render, not a live capture). The FUI token values live in the
+built CSS, not a grep-able `:root` in src: `--ok:#4cd18e --warn:#e2ac3f --accent:#45d6e6
+--stroke:#1c2c34 --text-lo:#7d95a0 --text-hi:#d9e6ea --panel:#081014`.
+
 ## 2026-07-07 — Tool autonomy tiers are enforced in the agent runtime, not workflow nodes
 
 Workflow `action` nodes call `tools.callTool(...)` directly regardless of the tool's tier

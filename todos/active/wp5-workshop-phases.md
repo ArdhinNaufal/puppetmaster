@@ -22,7 +22,13 @@
 
 ## Remaining (needs WP3 workbench and/or real-model sessions)
 
-- [ ] Command-view interview UX (restate card, forcing-section progress meter — WP7.5)
+- [~] Command-view interview UX — **forcing-section progress meter landed** (WORKSHOP
+      dossier; live coverage from the newest spec vs the same required list the
+      spec-sections gate uses, via `sectionCoverage`/`resolveRequiredSections` shared
+      out of `runSpecSections` so meter and gate never disagree). **Restate card
+      deferred**: its home is the Command-view interview session, which needs the
+      project↔conversation link (WP7 phase-flow actions, blocked on EXECUTE) — a
+      name-matched card now would be speculative.
 - [ ] PLAN phase (read-only workbench explore → editable plan artifact; skip affordance)
 - [ ] EXECUTE supervised template (`/next` contract via `bench.delegate`)
 - [ ] EXECUTE gated template (`/loop` contract; mode chooser asks the pass@k/pass^k

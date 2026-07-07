@@ -25,8 +25,11 @@
 ## Remaining
 
 - [ ] Canvas verify-node skin + config inspector (check picker, retries)
-- [ ] Command-view interview UX (restate card, forcing-section progress meter)
-      — pairs with WP5's interview flow
+- [~] Interview UX — **forcing-section progress meter landed** in the WORKSHOP
+      dossier (`GET /api/projects/:id/spec-coverage` → present/thin/missing vs the
+      gate's required list; bar + per-section markers). **Restate card deferred** to
+      the Command-view interview session once it carries a project link (the
+      phase-flow-actions item below).
 - [ ] Phase-flow actions in the dossier (start interview / run next todo) —
       needs WP5's EXECUTE machinery (WP3)
 - [ ] UAT script in docs/uat/ incl. keyboard/reduced-motion checks — once the
