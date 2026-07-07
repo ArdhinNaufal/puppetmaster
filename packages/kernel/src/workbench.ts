@@ -34,6 +34,9 @@ export interface WorkbenchConfig {
   egressAllow?: string[];
   /** Egress-proxy image (docker/egress-proxy.Dockerfile). */
   egressProxyImage?: string;
+  /** The proxy's OWN outbound network — its primary, so it has a default route
+   *  and working DNS. Defaults to the standard docker `bridge`. */
+  egressOutboundNetwork?: string;
   /** Vault-resolved secrets injected into the workbench env at spawn only
    *  (ADR-005 — never written to the volume). e.g. a model API key for
    *  bench.delegate. Keys must be valid env names. */
@@ -54,6 +57,7 @@ const DEFAULTS: Required<WorkbenchConfig> = {
     .map((s) => s.trim())
     .filter(Boolean),
   egressProxyImage: process.env.WORKBENCH_EGRESS_PROXY_IMAGE ?? "puppetmaster-egress-proxy:spike",
+  egressOutboundNetwork: process.env.WORKBENCH_EGRESS_OUTBOUND_NET ?? "bridge",
   secrets: {},
 };
 
@@ -199,12 +203,16 @@ export class DockerCommandExecutor implements CommandExecutor {
       }
       return;
     }
+    // Primary network = the outbound one (default route + working external DNS);
+    // the internal net is attached second, only so the workbench can reach the
+    // proxy by name. Order matters: an --internal primary would leave the proxy
+    // with no route/DNS to resolve and reach the allowlisted upstream.
     const run = await dockerCli(this.cfg.dockerBin, [
       "run",
       "-d",
       "--name",
       proxy,
-      `--network=${net}`,
+      `--network=${this.cfg.egressOutboundNetwork}`,
       "-e",
       `EGRESS_ALLOW=${this.cfg.egressAllow.join(",")}`,
       this.cfg.egressProxyImage,
@@ -212,10 +220,10 @@ export class DockerCommandExecutor implements CommandExecutor {
     if (run.code !== 0) {
       throw new Error(`egress proxy create failed for ${projectId}: ${run.stderr.trim()}`);
     }
-    // Give the proxy its own outbound path (the internal net has none).
-    const connect = await dockerCli(this.cfg.dockerBin, ["network", "connect", "bridge", proxy]);
+    // Attach the internal net so the workbench resolves + reaches the proxy.
+    const connect = await dockerCli(this.cfg.dockerBin, ["network", "connect", net, proxy]);
     if (connect.code !== 0) {
-      throw new Error(`egress proxy outbound attach failed for ${projectId}: ${connect.stderr.trim()}`);
+      throw new Error(`egress proxy internal attach failed for ${projectId}: ${connect.stderr.trim()}`);
     }
   }
 
