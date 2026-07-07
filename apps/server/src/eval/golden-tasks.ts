@@ -1,4 +1,13 @@
-import { getMissionSteps, searchMemories, type Db } from "@puppetmaster/db";
+import {
+  completeTodo,
+  createProject,
+  getMissionSteps,
+  listArtifacts,
+  searchMemories,
+  updateArtifact,
+  writeArtifact,
+  type Db,
+} from "@puppetmaster/db";
 
 /**
  * Golden tasks (Stage 5, G7 — τ-bench style). Each task runs against a fresh
@@ -20,6 +29,9 @@ export interface GoldenTask {
   /** For workflow tasks: graph + run input. */
   graph?: unknown;
   input?: unknown;
+  /** Seed fixture rows before the run; the returned object is merged into the
+   *  workflow input so nodes can reference ids via {{input.*}} templating. */
+  setup?: (db: Db, ctx: { workspaceId: string }) => Promise<Record<string, unknown>>;
   expectOutput?: (output: unknown) => boolean;
   expectState?: (
     db: Db,
@@ -101,5 +113,109 @@ export const GOLDEN_TASKS: GoldenTask[] = [
     },
     input: { n: 1 },
     expectOutput: (o) => o === "SMALL",
+  },
+  {
+    id: "workshop-artifact-lifecycle",
+    description:
+      "Workshop WP2: a workflow writes a spec artifact and completes a todo with the mission link; repo-layer lifecycle rules hold (accepted ADRs immutable, no mission-less completion)",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, {
+        workspaceId: ctx.workspaceId,
+        name: "eval-workshop",
+        mode: "supervised",
+      });
+      const todo = await writeArtifact(db, {
+        projectId: project.id,
+        kind: "todo",
+        title: "build the first increment",
+        status: "active",
+      });
+      return { projectId: project.id, todoId: todo.id };
+    },
+    graph: {
+      // Node ids follow the agent-runtime convention (server__tool) so the
+      // harness's trajectory extraction sees real tool identities.
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "project__artifact.write",
+          kind: "action",
+          label: "write spec",
+          config: {
+            server: "project",
+            tool: "artifact.write",
+            args: { projectId: "{{input.projectId}}", kind: "spec", title: "Spec", body: "the declared shape" },
+          },
+        },
+        {
+          id: "project__todo.complete",
+          kind: "action",
+          label: "complete todo",
+          config: {
+            server: "project",
+            tool: "todo.complete",
+            args: { todoId: "{{input.todoId}}" },
+          },
+        },
+      ],
+      edges: [
+        { from: "t", to: "project__artifact.write" },
+        // Input resolution takes the first satisfied edge's upstream output —
+        // the trigger edge (declared first) hands the payload with {{input.todoId}}
+        // to the complete node; the second edge only enforces ordering.
+        { from: "t", to: "project__todo.complete" },
+        { from: "project__artifact.write", to: "project__todo.complete" },
+      ],
+    },
+    expectState: async (db, ctx) => {
+      // Recover the project via the fixture name — setup ran in this same DB.
+      const { listProjects } = await import("@puppetmaster/db");
+      const project = (await listProjects(db, ctx.workspaceId)).find((p) => p.name === "eval-workshop");
+      if (!project) return false;
+
+      // 1. The spec artifact exists at version 1.
+      const specs = await listArtifacts(db, project.id, { kind: "spec" });
+      if (specs.length !== 1 || specs[0]!.version !== 1) return false;
+
+      // 2. The todo is completed AND linked to the completing mission.
+      const todos = await listArtifacts(db, project.id, { kind: "todo" });
+      const todo = todos[0];
+      if (!todo || todo.status !== "completed" || todo.missionId !== ctx.missionId) return false;
+
+      // 3. Spec re-write is a NEW version superseding v1, not an edit.
+      const v2 = await writeArtifact(db, { projectId: project.id, kind: "spec", title: "Spec", body: "revised" });
+      if (v2.version !== 2 || v2.supersedesId !== specs[0]!.id) return false;
+
+      // 4. Negative: an accepted ADR refuses direct edits (immutable).
+      const adr = await writeArtifact(db, {
+        projectId: project.id,
+        kind: "adr",
+        title: "ADR-001: fixture",
+        status: "accepted",
+      });
+      const adrEditRejected = await updateArtifact(db, adr.id, { body: "tamper" }).then(
+        () => false,
+        () => true,
+      );
+      if (!adrEditRejected) return false;
+
+      // 5. Negative: completing a todo without a mission id refuses.
+      const orphan = await writeArtifact(db, {
+        projectId: project.id,
+        kind: "todo",
+        title: "orphan",
+        status: "active",
+      });
+      const orphanRejected = await completeTodo(db, orphan.id, "").then(
+        () => false,
+        () => true,
+      );
+      return orphanRejected;
+    },
+    trajectory: {
+      mustCall: ["project.artifact.write", "project.todo.complete"],
+      mayCallOnly: ["project.artifact.write", "project.todo.complete"],
+    },
   },
 ];

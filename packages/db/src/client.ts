@@ -328,6 +328,53 @@ const DDL: string[] = [
      created_at timestamptz NOT NULL DEFAULT now(),
      UNIQUE (workspace_id, name)
    )`,
+  // The Workshop (AI-SDLC plan WP2, ADR-003/004): projects + typed artifacts
+  // + earned verify checks + gate evidence.
+  `CREATE TABLE IF NOT EXISTS projects (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     name text NOT NULL,
+     repo_ref text NOT NULL DEFAULT '',
+     mode text NOT NULL DEFAULT 'supervised',
+     phase text NOT NULL DEFAULT 'idle',
+     status text NOT NULL DEFAULT 'active',
+     workbench_id text,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS project_artifacts (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     kind text NOT NULL,
+     status text,
+     title text NOT NULL,
+     body text NOT NULL DEFAULT '',
+     version integer NOT NULL DEFAULT 1,
+     supersedes_id uuid,
+     mission_id uuid,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS verify_checks (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     name text NOT NULL,
+     command text,
+     baseline integer,
+     enabled boolean NOT NULL DEFAULT false,
+     earned_note text NOT NULL DEFAULT '',
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS evidence (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     step_id uuid REFERENCES mission_steps(id) ON DELETE CASCADE,
+     approval_id uuid REFERENCES approvals(id) ON DELETE CASCADE,
+     kind text NOT NULL,
+     content jsonb,
+     ref text,
+     created_at timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS projects_workspace_idx ON projects(workspace_id)`,
+  `CREATE INDEX IF NOT EXISTS project_artifacts_project_idx ON project_artifacts(project_id, kind, status)`,
+  `CREATE INDEX IF NOT EXISTS verify_checks_project_idx ON verify_checks(project_id)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

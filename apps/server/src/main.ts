@@ -1,6 +1,12 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
-import { WorkflowGraph } from "@puppetmaster/shared";
+import {
+  ArtifactKind,
+  ProjectMode,
+  ProjectPhase,
+  ProjectStatus,
+  WorkflowGraph,
+} from "@puppetmaster/shared";
 import {
   appendAudit,
   budgetsForAgent,
@@ -18,8 +24,10 @@ import {
   listRouterProfiles,
   updateRouterProfile,
   deleteBudget,
+  completeTodo,
   createAgent,
   createDb,
+  createProject,
   createTemplate,
   createWorkflow,
   deleteAgent,
@@ -35,6 +43,7 @@ import {
   getMemory,
   getMission,
   getMissionSteps,
+  getProject,
   getTemplate,
   getWorkflow,
   getWorkflowVersionById,
@@ -42,11 +51,13 @@ import {
   getWorkspace,
   listAgents,
   listApprovals,
+  listArtifacts,
   listAudit,
   insertEvalRun,
   listBudgets,
   listDeadLetterMissions,
   listDocuments,
+  listProjects,
   listEvalRuns,
   listMemories,
   listMissions,
@@ -69,7 +80,9 @@ import {
   updateAgent,
   updateMemory,
   updateMission,
+  updateProject,
   updateWorkspace,
+  writeArtifact,
   type DbHandle,
 } from "@puppetmaster/db";
 import {
@@ -92,6 +105,7 @@ import {
   RedisEventBus,
   registerBridgeTools,
   registerKbTools,
+  registerProjectTools,
   replayMission,
   startOtelExporter,
   resolveCredentialEnv,
@@ -281,6 +295,10 @@ registerBridgeTools(tools, { db, workspaceId, executor, agentInvoker });
 // agents and workflow nodes retrieve cited chunks from workspace documents.
 const kbDeps = { db, workspaceId, embedder };
 registerKbTools(tools, kbDeps);
+
+// The Workshop (AI-SDLC plan WP2): project artifacts/todos join the shared
+// catalog — same surface for agents and workflow action nodes.
+registerProjectTools(tools, { db, workspaceId });
 
 // --- Tool layer: MCP servers (ARCHITECTURE.md §3.4) ---------------------------
 // Bundled utils connector by default; extend/override via MCP_SERVERS JSON.
@@ -562,6 +580,138 @@ app.delete("/api/templates/:id", async (req, reply) => {
   if (tpl.builtin) return reply.code(400).send({ error: "cannot delete a built-in template" });
   await deleteTemplate(db, id);
   return reply.code(204).send();
+});
+
+
+// --- The Workshop: projects + artifacts (AI-SDLC plan WP2, ADR-001/003/004) ---
+// Reads are member-tier; mutations are builder+ (auth.ts). Artifact lifecycle
+// rules are enforced in the repo layer; violations surface here as 400s.
+app.get("/api/projects", async () => listProjects(db, workspaceId));
+
+app.post("/api/projects", async (req, reply) => {
+  const body = req.body as { name?: string; repoRef?: string; mode?: string };
+  const name = body.name?.trim();
+  if (!name) return reply.code(400).send({ error: "name required" });
+  const mode = body.mode === "gated" ? "gated" : "supervised";
+  const row = await createProject(db, { workspaceId, name, repoRef: body.repoRef ?? "", mode });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "project.create",
+    target: row.id,
+    detail: { name, mode },
+  });
+  return reply.code(201).send(row);
+});
+
+app.get("/api/projects/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  return project;
+});
+
+app.put("/api/projects/:id", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const body = req.body as { phase?: string; status?: string; mode?: string };
+  const phase = body.phase === undefined ? undefined : ProjectPhase.safeParse(body.phase);
+  const status = body.status === undefined ? undefined : ProjectStatus.safeParse(body.status);
+  const mode = body.mode === undefined ? undefined : ProjectMode.safeParse(body.mode);
+  for (const [field, parsed] of [["phase", phase], ["status", status], ["mode", mode]] as const) {
+    if (parsed && !parsed.success) return reply.code(400).send({ error: `invalid ${field}` });
+  }
+  const row = await updateProject(db, id, {
+    ...(phase?.success ? { phase: phase.data } : {}),
+    ...(status?.success ? { status: status.data } : {}),
+    ...(mode?.success ? { mode: mode.data } : {}),
+  });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "project.update",
+    target: id,
+    detail: req.body as Record<string, unknown>,
+  });
+  return row;
+});
+
+app.get("/api/projects/:id/artifacts", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const { kind, status } = req.query as { kind?: string; status?: string };
+  return listArtifacts(db, id, { kind, status });
+});
+
+app.post("/api/projects/:id/artifacts", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const body = req.body as { kind?: string; title?: string; body?: string; status?: string };
+  const kind = ArtifactKind.safeParse(body.kind);
+  if (!kind.success) return reply.code(400).send({ error: "invalid artifact kind" });
+  if (!body.title?.trim()) return reply.code(400).send({ error: "title required" });
+  try {
+    const row = await writeArtifact(db, {
+      projectId: id,
+      kind: kind.data,
+      title: body.title.trim(),
+      body: body.body,
+      status: body.status,
+    });
+    await appendAudit(db, {
+      workspaceId,
+      actorKind: "user",
+      actorId: req.authUser?.id ?? null,
+      actorLabel: req.authUser?.email ?? "unknown",
+      action: "project.artifact.write",
+      target: row.id,
+      detail: { projectId: id, kind: row.kind, title: row.title, version: row.version },
+    });
+    return reply.code(201).send(row);
+  } catch (err) {
+    return reply.code(400).send({ error: err instanceof Error ? err.message : "invalid artifact" });
+  }
+});
+
+/** Complete a todo. The completing mission's id is mandatory — the lifecycle
+ *  rule that makes todos/completed an audit trail (corpus §4.7). */
+app.post("/api/projects/:id/artifacts/:artifactId/complete", async (req, reply) => {
+  const { id, artifactId } = req.params as { id: string; artifactId: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const body = req.body as { missionId?: string };
+  try {
+    const row = await completeTodo(db, artifactId, body.missionId ?? "");
+    await appendAudit(db, {
+      workspaceId,
+      actorKind: "user",
+      actorId: req.authUser?.id ?? null,
+      actorLabel: req.authUser?.email ?? "unknown",
+      action: "project.todo.complete",
+      target: artifactId,
+      detail: { projectId: id, missionId: body.missionId },
+    });
+    return row;
+  } catch (err) {
+    return reply.code(400).send({ error: err instanceof Error ? err.message : "cannot complete" });
+  }
 });
 
 // --- Audit log (ARCHITECTURE.md §3.6) -----------------------------------------

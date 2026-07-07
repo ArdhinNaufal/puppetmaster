@@ -11,3 +11,4 @@ export * from "./kb-repo.js";
 export * from "./ops-repo.js";
 export * from "./mcp-repo.js";
 export * from "./router-repo.js";
+export * from "./project-repo.js";

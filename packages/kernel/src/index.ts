@@ -24,3 +24,4 @@ export * from "./otel.js";
 export * from "./linter.js";
 export * from "./copilot.js";
 export * from "./compaction.js";
+export * from "./project-tools.js";

@@ -314,7 +314,9 @@ export class WorkflowExecutor {
         const committed = await findCommittedExecution(this.db, missionId, node.id);
         if (committed) return committed.output;
         const exec = await beginNodeExecution(this.db, { missionId, nodeId: node.id, attempt });
-        const result = await this.tools.callTool(cfg.server, cfg.tool, args, { input });
+        // missionId in the tool context: bridge tools nest child missions under
+        // this one, and project.todo.complete records it as the audit link.
+        const result = await this.tools.callTool(cfg.server, cfg.tool, args, { input, missionId });
         await commitNodeExecution(this.db, exec.id, result);
         return result;
       }

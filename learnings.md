@@ -32,3 +32,12 @@ missing, which breaks anything resolving `@puppetmaster/*` (dependency-cruiser i
 Run a full `pnpm install` after fresh clones before running tooling that resolves
 workspace imports. Also: `@puppetmaster/*` resolve to `dist/` (`main: dist/index.js`), so
 `pnpm build` must precede cross-package resolution checks on a fresh clone.
+
+## 2026-07-06 — Workflow node input = upstream OUTPUT, not the mission payload
+
+A non-trigger node's `{{input.*}}` templates resolve against the immediately upstream
+node's output — only entry nodes see the mission payload. A chain `trigger → A → B`
+gives B the output of A, so B's args can't reference payload fields. Idiom: add a direct
+`trigger → B` edge declared BEFORE the `A → B` edge — input resolution takes the first
+satisfied edge's upstream output (the payload), while the second edge still enforces
+ordering. Verifier: pinned by the `workshop-artifact-lifecycle` golden task.

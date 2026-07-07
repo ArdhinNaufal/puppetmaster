@@ -14,6 +14,7 @@ import {
   createEmbedder,
   InMemoryEventBus,
   ModelRouter,
+  registerProjectTools,
   startAgentTick,
   startWorkflow,
   WorkflowExecutor,
@@ -59,6 +60,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
     const db = handle.db;
     const workspaceId = await ensureDefaultWorkspace(db, "eval");
     const tools = new BuiltinToolRegistry();
+    registerProjectTools(tools, { db, workspaceId });
     const bus = new InMemoryEventBus();
     const router = new ModelRouter({});
     const embedder = createEmbedder({});
@@ -88,10 +90,11 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
       const graph = WorkflowGraph.parse(task.graph);
       const created = await createWorkflow(db, { workspaceId, name: `eval-${task.id}`, graph });
       subjectId = created.workflow.id;
+      const seeded = task.setup ? await task.setup(db, { workspaceId }) : {};
       const mission = await startWorkflow(db, {
         workflowId: created.workflow.id,
         trigger: { mode: "eval" },
-        payload: task.input ?? {},
+        payload: { ...(task.input as Record<string, unknown> | undefined), ...seeded },
       });
       missionId = mission.id;
       await executor.runMission(mission.id);

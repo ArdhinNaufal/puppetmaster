@@ -446,6 +446,68 @@ export const mcpServers = pgTable(
   (t) => ({ uniqName: unique().on(t.workspaceId, t.name) }),
 );
 
+/** Workshop projects (AI-SDLC plan WP2, ADR-003): a repo plus its artifact
+ *  set; phase executions are ordinary missions carrying the project id. */
+export const projects = pgTable("projects", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id")
+    .notNull()
+    .references(() => workspaces.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  repoRef: text("repo_ref").notNull().default(""),
+  mode: text("mode").notNull().default("supervised"),
+  phase: text("phase").notNull().default("idle"),
+  status: text("status").notNull().default("active"),
+  workbenchId: text("workbench_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Typed artifact store (ADR-004). Lifecycle rules live in project-repo.ts:
+ *  learnings append-only, accepted ADRs immutable (supersede only), todo
+ *  completion requires the completing mission id, spec/plan changes are new
+ *  versions chained via supersedes_id. */
+export const projectArtifacts = pgTable("project_artifacts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  projectId: uuid("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(), // spec | plan | todo | learning | adr
+  status: text("status"), // TodoStatus for todos, AdrStatus for ADRs, else null
+  title: text("title").notNull(),
+  body: text("body").notNull().default(""),
+  version: integer("version").notNull().default(1),
+  supersedesId: uuid("supersedes_id"),
+  missionId: uuid("mission_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Deterministic checks for a project's verify nodes (WP4). Earned policies:
+ *  disabled by default; `baseline` is the legacy-ratchet violation count. */
+export const verifyChecks = pgTable("verify_checks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  projectId: uuid("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  name: text("name").notNull(), // test | arch | refactor-gate | todo-sync | load | custom
+  command: text("command"),
+  baseline: integer("baseline"),
+  enabled: boolean("enabled").notNull().default(false),
+  earnedNote: text("earned_note").notNull().default(""),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Machine-checkable evidence attached to verify steps / approvals (org
+ *  layer §1: the gate reviews evidence, not assertions). Written by WP4. */
+export const evidence = pgTable("evidence", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  stepId: uuid("step_id").references(() => missionSteps.id, { onDelete: "cascade" }),
+  approvalId: uuid("approval_id").references(() => approvals.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(), // test-output | diff | screenshot | state-assert
+  content: jsonb("content"),
+  ref: text("ref"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const schema = {
   users,
   sessions,
@@ -473,4 +535,8 @@ export const schema = {
   budgets,
   mcpServers,
   routerProfiles,
+  projects,
+  projectArtifacts,
+  verifyChecks,
+  evidence,
 };

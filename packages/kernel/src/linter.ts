@@ -157,6 +157,17 @@ export function lintWorkflowGraph(
         nodeId: n.id,
       });
     }
+    // Workshop WP2: the verify node kind exists in the schema, but its
+    // execution machinery ships in WP4 — running it now would fail the
+    // mission with "unsupported node kind". Say so at lint time instead.
+    if (n.kind === "verify") {
+      issues.push({
+        severity: "error",
+        code: "verify-not-executable",
+        message: `verify node "${n.label}": deterministic gates land with the Workshop gate machinery (WP4); this node cannot execute yet`,
+        nodeId: n.id,
+      });
+    }
   }
 
   return issues;

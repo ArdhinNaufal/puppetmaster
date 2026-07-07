@@ -31,6 +31,10 @@ export const WorkflowNodeKind = z.enum([
   "code",
   "agent",
   "approval",
+  /** Deterministic gate (Workshop, ADR-002/WP4): runs a declared check; the
+   *  exit code gates the edge. Schema lands in WP2; execution lands in WP4 —
+   *  the linter flags verify nodes as not-yet-executable until then. */
+  "verify",
 ]);
 export type WorkflowNodeKind = z.infer<typeof WorkflowNodeKind>;
 
@@ -164,6 +168,98 @@ export const MissionStep = z.object({
   finishedAt: z.coerce.date().nullable().default(null),
 });
 export type MissionStep = z.infer<typeof MissionStep>;
+
+/* ————— The Workshop (docs/AI-SDLC-INTEGRATION-PLAN.md WP2; ADR-001/003/004) ————— */
+
+export const ProjectMode = z.enum(["supervised", "gated"]);
+export type ProjectMode = z.infer<typeof ProjectMode>;
+
+export const ProjectPhase = z.enum(["idle", "specify", "plan", "execute", "verify", "record"]);
+export type ProjectPhase = z.infer<typeof ProjectPhase>;
+
+export const ProjectStatus = z.enum(["active", "archived"]);
+export type ProjectStatus = z.infer<typeof ProjectStatus>;
+
+/** A Workshop project: a repo plus its spec/todos/learnings/ADR artifacts
+ *  (ADR-003 — first-class entity; missions stay single runs and carry
+ *  projectId when they execute a phase). */
+export const Project = z.object({
+  id: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+  name: z.string().min(1),
+  repoRef: z.string().default(""),
+  mode: ProjectMode.default("supervised"),
+  phase: ProjectPhase.default("idle"),
+  status: ProjectStatus.default("active"),
+  workbenchId: z.string().nullable().default(null),
+  createdAt: z.coerce.date(),
+});
+export type Project = z.infer<typeof Project>;
+
+/** Artifact kinds (ADR-004). Evidence lives in its own step/approval-scoped
+ *  table, not here — one home per concept. */
+export const ArtifactKind = z.enum(["spec", "plan", "todo", "learning", "adr"]);
+export type ArtifactKind = z.infer<typeof ArtifactKind>;
+
+export const TodoStatus = z.enum(["backlog", "active", "completed"]);
+export type TodoStatus = z.infer<typeof TodoStatus>;
+
+export const AdrStatus = z.enum(["proposed", "accepted", "superseded"]);
+export type AdrStatus = z.infer<typeof AdrStatus>;
+
+/** Lifecycle rules (enforced in the repo layer, not by convention):
+ *  learnings are append-only; accepted ADRs are immutable (supersede only);
+ *  todo completion requires the completing mission's id; spec/plan changes
+ *  are new versions chained via supersedesId. */
+export const ProjectArtifact = z.object({
+  id: z.string().uuid(),
+  projectId: z.string().uuid(),
+  kind: ArtifactKind,
+  /** TodoStatus for todos, AdrStatus for ADRs, null for the other kinds. */
+  status: z.string().nullable().default(null),
+  title: z.string().min(1),
+  body: z.string().default(""),
+  version: z.number().int().positive().default(1),
+  supersedesId: z.string().uuid().nullable().default(null),
+  missionId: z.string().uuid().nullable().default(null),
+  createdAt: z.coerce.date(),
+});
+export type ProjectArtifact = z.infer<typeof ProjectArtifact>;
+
+export const VerifyCheckName = z.enum(["test", "arch", "refactor-gate", "todo-sync", "load", "custom"]);
+export type VerifyCheckName = z.infer<typeof VerifyCheckName>;
+
+/** A deterministic check a project's verify nodes run (WP4). Checks are
+ *  earned policies: disabled by default, enabled per project with a note on
+ *  what failure earned them. `baseline` is the legacy ratchet count. */
+export const VerifyCheck = z.object({
+  id: z.string().uuid(),
+  projectId: z.string().uuid(),
+  name: VerifyCheckName,
+  command: z.string().nullable().default(null),
+  baseline: z.number().int().nonnegative().nullable().default(null),
+  enabled: z.boolean().default(false),
+  earnedNote: z.string().default(""),
+  createdAt: z.coerce.date(),
+});
+export type VerifyCheck = z.infer<typeof VerifyCheck>;
+
+export const EvidenceKind = z.enum(["test-output", "diff", "screenshot", "state-assert"]);
+export type EvidenceKind = z.infer<typeof EvidenceKind>;
+
+/** Machine-checkable evidence attached to a verify step or an approval, so
+ *  the gate's reviewer judges evidence instead of reconstructing trust
+ *  (org layer §1). Written by WP4's verify handler. */
+export const Evidence = z.object({
+  id: z.string().uuid(),
+  stepId: z.string().uuid().nullable().default(null),
+  approvalId: z.string().uuid().nullable().default(null),
+  kind: EvidenceKind,
+  content: z.unknown().nullable().default(null),
+  ref: z.string().nullable().default(null),
+  createdAt: z.coerce.date(),
+});
+export type Evidence = z.infer<typeof Evidence>;
 
 export const ApprovalStatus = z.enum(["pending", "approved", "rejected"]);
 export type ApprovalStatus = z.infer<typeof ApprovalStatus>;

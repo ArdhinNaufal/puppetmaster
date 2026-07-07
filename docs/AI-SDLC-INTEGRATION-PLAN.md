@@ -6,8 +6,11 @@ six open decisions are recorded in §8; the owner's start signal was given 2026-
 `.claude/commands/`, `scripts/verify-arch.sh` with acceptance verified). **WP1 is complete
 except one item:** the ADR-002 container spike half is blocked on a docker-capable host
 (the headless-CLI half PASSED — `docs/adr/spike-002-record.md`). ADRs 000–007 are written.
-Each subsequent work package (WP2+) runs only on explicit go-ahead, in order, following
-the same convention as `docs/RESEARCH-ROADMAP.md`.
+**WP2 is complete** (domain model + artifact store + tools + REST; golden eval
+`workshop-artifact-lifecycle` green at pass^3). Next in the dependency order is WP3
+(workbench connector), which is gated on the ADR-002 container spike passing on a
+docker-capable host; WP4 needs WP2+WP3. Each work package runs only on explicit
+go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
 **`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
@@ -584,12 +587,18 @@ started.)*
 - [x] ADR-005 workbench isolation (sibling container per project, default-closed egress)
 - [x] Role × mode matrix formalized in ADR-001 (v1 tracks ruled: B/C only)
 
-**WP2 — Domain model**
-- [ ] Shared zod schemas (Project, ProjectArtifact, VerifyCheck, Evidence, `verify` kind)
-- [ ] DB tables + repos + migration + lifecycle rules (ADR immutability, todo↔mission)
-- [ ] `project.artifact.*` / `project.todo.*` catalog tools (tiered)
-- [ ] `/api/projects` REST + audit
-- [ ] Golden eval: artifact lifecycle predicates
+**WP2 — Domain model** — ✅ complete 2026-07-06
+- [x] Shared zod schemas (Project, ProjectArtifact, VerifyCheck, Evidence, `verify` kind;
+      deviation: evidence is its own step/approval-scoped table only, not an artifact
+      kind — one home per concept)
+- [x] DB tables + repos + migration + lifecycle rules (ADR immutability, todo↔mission,
+      append-only learnings, spec/plan versioning via supersedesId)
+- [x] `project.artifact.*` / `project.todo.*` catalog tools (tiered, workspace-scoped;
+      executor ToolContext now carries missionId for the audit link)
+- [x] `/api/projects` REST (builder+ mutations) + audit entries
+- [x] Golden eval `workshop-artifact-lifecycle`: pass^3 green, trajectory-asserted,
+      incl. both lifecycle negatives (accepted-ADR edit refused, mission-less todo
+      completion refused)
 
 **WP3 — Workbench connector**
 - [ ] Workbench lifecycle (create/suspend/destroy) per ADR-005
