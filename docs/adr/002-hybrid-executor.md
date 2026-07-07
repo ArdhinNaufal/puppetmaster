@@ -40,10 +40,13 @@ Protocol committed as `scripts/spike-adr002.sh`. Two halves:
    semantics, and that the produced change passes the toy repo's test.
    **Status: PASSED 2026-07-06** in the dev environment (claude CLI 2.1.202) — evidence
    in `docs/adr/spike-002-record.md`.
-2. **Container half** — same run inside the candidate workbench image with egress
-   allowlist and resource caps. **Status: PENDING — the dev environment has no Docker
-   daemon.** Rerun `scripts/spike-adr002.sh --container` on a docker-capable host
-   (tracked in todos/active/wp1-workshop-adrs.md). WP3 must not start before this passes.
+2. **Container half** — validates the ADR-005 isolation substrate: the candidate image
+   (`docker/workbench.Dockerfile`) has the toolchain, runs non-root, executes a
+   deterministic check inside, refuses egress under `--network none`, and accepts CPU/
+   memory/pid caps. **Status: IMPLEMENTED, NOT YET RUN — the dev session has a Docker
+   client but no daemon.** Run `scripts/spike-adr002.sh --container` on a docker-capable
+   host and record the result in `docs/adr/spike-002-record.md` (tracked in
+   todos/active/wp1-workshop-adrs.md). WP3 must not start before this passes.
 
 ## Consequences
 

@@ -64,3 +64,12 @@ line and the spec-sections gate correctly refused a "complete" spec. The gate ca
 fixture bug, which is the system working; the lesson is about tooling: when a generator
 script writes string literals into source code, count escaping levels per layer
 (shell → python → TS), and prefer real newlines in the generator over escape sequences.
+
+## 2026-07-06 — This session has a Docker client but no daemon
+
+`docker` is on PATH but `/var/run/docker.sock` is absent, so `docker info`/`build`/`run`
+all fail here. Container-dependent work (the ADR-002 container-half spike, WP3's workbench)
+can be *authored* in this session but must be *run* on a Docker-capable host. The spike
+script distinguishes the two: exit 3/SKIP when no daemon, real assertions otherwise —
+so the same script does genuine work wherever a daemon exists. Don't confuse "the script
+printed its no-op branch" with "the mechanism was validated".

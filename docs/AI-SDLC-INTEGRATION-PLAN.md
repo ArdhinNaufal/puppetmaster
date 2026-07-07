@@ -18,8 +18,13 @@ booted server. **WP9.1 is complete**: the failure-mode mapping ledger
 (`docs/WORKSHOP-FAILURE-MODES.md`) dispositions all 37 unique corpus failure modes with
 zero unmapped. Everything remaining (WP3, WP5/WP7/WP9 rest, WP6, WP8) funnels through
 the workbench: WP3 is gated on the ADR-002 container spike passing on a docker-capable
-host — that spike is now the single blocking item. Each work package runs only on
-explicit go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
+host. **That spike's container half is now fully implemented** (`docker/workbench.Dockerfile`
++ the real `--container` branch validating toolchain / non-root / in-container check exec /
+`--network none` egress block / resource caps) — it just needs a run on a Docker daemon
+(this session has the client but no daemon). Running `./scripts/spike-adr002.sh --container`
+on a Docker host and recording PASS is the single unblocking action. Each work package runs
+only on explicit go-ahead, in order, following the same convention as
+`docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
 **`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
