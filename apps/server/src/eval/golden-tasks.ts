@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { localWorkbenchDir } from "@puppetmaster/kernel";
@@ -713,5 +714,157 @@ export const GOLDEN_TASKS: GoldenTask[] = [
       );
     },
     trajectory: { mayCallOnly: [] },
+  },
+  {
+    id: "refactor-gate-blocks-test-edit-local",
+    description:
+      "Workshop WP3b.6: the refactor-gate blocks a run that modifies an existing test file (editing test expectations to make refactored code pass — failure mode P14) — it escalates with the modified-test list as evidence; the gated action never runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-refactor-blocks" });
+      await createVerifyCheck(db, { projectId: project.id, name: "refactor-gate", enabled: true, earnedNote: "eval fixture" });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "src.mjs"), "export const f = () => 1;\n");
+      writeFileSync(join(dir, "src.test.mjs"), "import assert from 'node:assert';\nassert.ok(true);\n");
+      execSync(
+        "git init -q && git config user.email e@x.dev && git config user.name eval && git add -A && git commit -q -m baseline",
+        { cwd: dir },
+      );
+      // The refactor edits the TEST file — the smell the gate exists to catch.
+      writeFileSync(join(dir, "src.test.mjs"), "import assert from 'node:assert';\nassert.ok(true); // edited expectation\n");
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "refactor gate", config: { projectId: "{{input.projectId}}", check: "refactor-gate" } },
+        { id: "util__echo", kind: "action", label: "gated", config: { server: "util", tool: "echo", args: { value: "should-not-run" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      if (!approval || !approval.prompt.includes("refactor-gate")) return false;
+      const ev = await listEvidenceForApproval(db, approval.id);
+      const content = ev[0]?.content as { detail?: { modifiedTests?: string[] } } | null;
+      const mods = content?.detail?.modifiedTests;
+      if (!Array.isArray(mods) || !mods.includes("src.test.mjs")) return false;
+      const steps = await getMissionSteps(db, ctx.missionId);
+      return steps.find((s) => s.nodeId === "util__echo")?.status !== "succeeded";
+    },
+  },
+  {
+    id: "refactor-gate-passes-added-test-local",
+    description:
+      "Workshop WP3b.6: the refactor-gate passes a run that changes source and only ADDS a test file (behavior-preserving; additions are not modifications) — the gate opens and the gated action runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-refactor-pass" });
+      await createVerifyCheck(db, { projectId: project.id, name: "refactor-gate", enabled: true, earnedNote: "eval fixture" });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "src.mjs"), "export const f = () => 1;\n");
+      writeFileSync(join(dir, "src.test.mjs"), "import assert from 'node:assert';\nassert.ok(true);\n");
+      execSync(
+        "git init -q && git config user.email e@x.dev && git config user.name eval && git add -A && git commit -q -m baseline",
+        { cwd: dir },
+      );
+      // Behaviour-preserving: source changes, and a NEW test is added (not edited).
+      writeFileSync(join(dir, "src.mjs"), "export const f = () => 1; // refactored\n");
+      writeFileSync(join(dir, "new.test.mjs"), "import assert from 'node:assert';\nassert.ok(true);\n");
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "refactor gate", config: { projectId: "{{input.projectId}}", check: "refactor-gate" } },
+        { id: "util__echo", kind: "action", label: "gated", config: { server: "util", tool: "echo", args: { value: "gated-ok" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectOutput: (o) => o === "gated-ok",
+    expectState: async (db, ctx) => {
+      const steps = await getMissionSteps(db, ctx.missionId);
+      const gate = steps.find((s) => s.kind === "verify");
+      if (!gate || gate.status !== "succeeded") return false;
+      const out = gate.output as { passed?: boolean; check?: string } | null;
+      return out?.passed === true && out?.check === "refactor-gate";
+    },
+    trajectory: { mustCall: ["util.echo"], mayCallOnly: ["util.echo"] },
+  },
+  {
+    id: "load-refuses-without-slos-local",
+    description:
+      "Workshop WP3b.6: the load check fails the mission loudly when no SLO thresholds are declared (failure mode S2 — an invented threshold is the smell; never pass by absence)",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-load-no-slo" });
+      await createVerifyCheck(db, { projectId: project.id, name: "load", enabled: true, earnedNote: "eval fixture" });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "load gate", config: { projectId: "{{input.projectId}}", check: "load" } },
+      ],
+      edges: [{ from: "t", to: "gate" }],
+    },
+    expectStatus: "failed",
+    expectState: async (db, ctx) => {
+      const mission = await getMission(db, ctx.missionId);
+      return Boolean(mission?.error?.includes("SLO"));
+    },
+  },
+  {
+    id: "load-passes-with-slos-local",
+    description:
+      "Workshop WP3b.6: the load check with declared SLOs runs its configured command in the workbench; exit 0 = the SLOs held → the gate opens and the gated action runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-load-pass" });
+      await createVerifyCheck(db, {
+        projectId: project.id,
+        name: "load",
+        command: JSON.stringify({ slos: [{ name: "p95_ms", max: 200 }], run: "true" }),
+        enabled: true,
+        earnedNote: "eval fixture",
+      });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "load gate", config: { projectId: "{{input.projectId}}", check: "load" } },
+        { id: "util__echo", kind: "action", label: "gated", config: { server: "util", tool: "echo", args: { value: "gated-ok" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectOutput: (o) => o === "gated-ok",
+    expectState: async (db, ctx) => {
+      const steps = await getMissionSteps(db, ctx.missionId);
+      const gate = steps.find((s) => s.kind === "verify");
+      if (!gate || gate.status !== "succeeded") return false;
+      const ev = await listEvidenceForStep(db, gate.id);
+      return ev.length === 1 && ev[0]!.kind === "test-output";
+    },
+    trajectory: { mustCall: ["util.echo"], mayCallOnly: ["util.echo"] },
   },
 ];

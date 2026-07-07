@@ -42,8 +42,15 @@ Docker socket proxy.
       `bench.exec` command allowlist here** (WP3b.3 left exec gated only by its
       write_approved tier; a command-string allowlist is a policy layer that belongs
       with the rest of the security surface, not bolted onto the tool).
-- [ ] **WP3b.6** `refactor-gate` (git `--diff-filter=M` on test paths) and `load`
-      (k6/locust, skip-without-SLOs) checks
+- [x] **WP3b.6** `refactor-gate` + `load` checks (`packages/kernel/src/verify.ts`):
+      refactor-gate runs `git diff --diff-filter=M --name-only HEAD` and blocks when a
+      *modified* (not added) file matches the test-path patterns (default set,
+      overridable via the check's `command` as a JSON regex array) — closes P14.
+      `load` config is `{slos:[…],run:"…"}`: no declared SLOs ⇒ refuse (throw,
+      fail-closed) — closes S2; with SLOs it runs the declared command in the
+      workbench and gates on exit 0. Both refuse by name without an executor.
+      4 golden tasks (refactor-gate blocks-edit / passes-added-test; load
+      refuses-without-SLOs / passes-with-SLOs) → suite 18→22 at pass^3.
 - [ ] **WP3b.7** Golden evals **(Docker host)**: clone a fixture repo → `bench.exec` runs
       its suite, exit-code propagation; injection→`bench.git.push` gated; egress refusal
       audited

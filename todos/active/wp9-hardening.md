@@ -13,9 +13,11 @@
 
 ## Remaining
 
-- [ ] Priority evals that need WP3/WP5 machinery: verifier-edit flag, wholesale-rewrite
-      detection, invented load thresholds, refactor-gate M-vs-A; interview-anchoring
-      needs real-model sessions
+- [x] Priority evals landed with WP3b.6: **refactor-gate M-vs-A** (modified test file
+      blocks, added-only passes — P14) and **invented load thresholds** (load refuses
+      without declared SLOs — S2). Golden tasks at pass^3.
+- [ ] Remaining priority evals that need WP3/WP5 machinery: verifier-edit flag,
+      wholesale-rewrite detection; interview-anchoring needs real-model sessions
 - [ ] `docs/WORKSHOP.md` operator guide + ARCHITECTURE.md §3.11 + PRD/NEXUS updates —
       once the full phase flows exist
 - [ ] Self-hosting smoke test (run this repo's workflow through the product) + learnings

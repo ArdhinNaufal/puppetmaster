@@ -38,7 +38,7 @@ it with a disposition or an honest OPEN mark.
 | P11 | Agent edits fitness config/baseline to make red turn green | DEFERRED(WP3) — the config lives in the workbench. Interim: Foreman/Reviewer personas name it ("never edit verify checks, baselines, or test expectations to make a gate pass"); check mutations are admin-only REST, audited (`project.check.update`); repo-level `/review` command flags verifier edits (WP0) |
 | P12 | Day-one arch gate failure on legacy code → gate deleted | **DESIGN** (mechanism) + DEFERRED(WP3) (usage) — `verify_checks.baseline` is the ratchet column; this repo's own `scripts/verify-arch.sh` implements tolerate-count/block-increase (WP0, acceptance-tested) |
 | P13 | Agent "refactors" code with no test coverage → success by absence | DEFERRED(WP3+WP5 refactor variant — coverage precondition needs the workbench's coverage tool). Interim: repo-level `/refactor` command enforces the contract for our own development (WP0) |
-| P14 | Agent edits test expectations to make refactored code pass | DEFERRED(WP3 refactor-gate check — `--diff-filter=M` on test paths needs the workbench git). Interim: personas name it (P11); repo-level `/refactor` step 5 + `/review` class (WP0) |
+| P14 | Agent edits test expectations to make refactored code pass | **EVAL** (WP3b.6) — `refactor-gate` check runs `git diff --diff-filter=M --name-only HEAD`, blocks when a *modified* file matches the test-path patterns; added tests pass. Golden tasks `refactor-gate-blocks-test-edit-local` / `-passes-added-test-local` at pass^3 |
 | P15 | Agent rewrites instead of refactoring (delete + recreate) | **REVIEW** — "wholesale rewrite" is a named Reviewer attack class; the corpus marks it [judgment]. WP3 adds the partially-deterministic deleted-and-recreated diff signal |
 | P16 | Agent scope-creeps ("while I'm in here…") | **REVIEW** — "scope expansion beyond the named target" is a named Reviewer class; WP3's refactor variant adds the diff-paths-vs-target check |
 | P17 | Coverage passes but the area is under-tested (coverage theater) | **REVIEW** — necessary-not-sufficient per the corpus; the deterministic check catches zero-coverage (WP3), quality stays with the review gate |
@@ -84,7 +84,7 @@ it with a disposition or an honest OPEN mark.
 | # | Failure mode | Disposition |
 |---|---|---|
 | S1 | Scalability guidance triggers on projects that merely mention "performance" | DEFERRED(WP6) — negative triggers in the scalability pack require concrete Scale & operations numbers; the spec-sections gate already forces that section to exist concretely (**EVAL** coverage via `workshop-spec-gate-theater-refusal`) |
-| S2 | Load-test thresholds invented rather than traced to declared SLOs | DEFERRED(WP3 load check) — the check refuses without declared numbers; the refusal semantics are already pinned in kind by `workshop-verify-disabled-fails-closed` (fail-closed, never pass-by-absence) |
+| S2 | Load-test thresholds invented rather than traced to declared SLOs | **EVAL** (WP3b.6) — the `load` check refuses (throws, fail-closed) without declared `slos`; never passes by absence. Golden task `load-refuses-without-slos-local` at pass^3 (the pass path `load-passes-with-slos-local` runs the declared command) |
 | S3 | Premature scaling infrastructure (cache/queue/replicas before measured failure) | **REVIEW** — "premature scaling" is a named Reviewer class, informed by presence/absence of load-test evidence (corpus marks it [judgment]) |
 | S4 | Stateful process replicated without externalizing state | **REVIEW** — named Reviewer class; partially checkable once the workbench can inspect session/state code (WP3+) |
 | S5 | Ceiling ADR without a populated "Reconsider when" | DEFERRED(WP6 record phase) — the record-phase check refuses an accepted scaling ADR without the trigger field. Interim: ADR-000 convention requires it for this repo's own ADRs (all eight comply) |
@@ -97,11 +97,12 @@ it with a disposition or an honest OPEN mark.
 documentation §7: 7, scalability §6: 7) → **37 unique failure modes** after cross-table
 subsumption. Primary dispositions across the 37:
 
-**4 EVAL** (P2, P5, P7, P10 — pinned by six golden tasks) · **1 LINTER** (P6's
-deterministic half) · **6 DESIGN** (P4, P9, P12, A3, D3, D7) · **11 REVIEW** (P15–P17,
-A2, R6, D1, D4, D6, S3, S4, S6 — all rows the corpus itself marks [judgment]) ·
-**3 EARNED** (R7, D2, D5) · **12 DEFERRED** (P1, P3, P8, P11, P13, P14, A6, A7, R5,
-S1, S2, S5 — mostly WP3-bound, each with a named interim mitigation).
+**6 EVAL** (P2, P5, P7, P10, P14, S2 — P14/S2 upgraded from DEFERRED by WP3b.6's
+refactor-gate + load checks) · **1 LINTER** (P6's deterministic half) · **6 DESIGN**
+(P4, P9, P12, A3, D3, D7) · **11 REVIEW** (P15–P17, A2, R6, D1, D4, D6, S3, S4, S6 —
+all rows the corpus itself marks [judgment]) · **3 EARNED** (R7, D2, D5) ·
+**10 DEFERRED** (P1, P3, P8, P11, P13, A6, A7, R5, S1, S5 — mostly WP3-bound, each
+with a named interim mitigation).
 
 Zero unmapped. Upgrading DEFERRED dispositions is part of each future WP's acceptance
 from here on.
