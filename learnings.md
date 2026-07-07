@@ -87,6 +87,20 @@ convenient stand-in — a bind-mount shortcut tests a code path the design expli
 and manufactures a false negative. Fix: create the toy files inside the container as the
 workbench user.
 
+## 2026-07-07 — Don't use example.com as a reachability probe; DNS may sinkhole it
+
+The WP3b.5 egress acceptance used `example.com` as the allowlisted host and failed on a real
+Docker host with proxy 502 / curl 56 — but the proxy was fine. A diagnostic (TCP to 1.1.1.1
+by IP = ok; `dns.lookup example.com` = `ok 5.6.7.8`) showed the host's network **sinkholes
+example.com to a placeholder IP (5.6.7.8)**, so the proxy allowlisted it, resolved it to
+garbage, and `connect()` failed. Lesson: a reachability probe host must be one the target
+network resolves *truthfully* — example.com/example.org are commonly filtered or placeholder'd.
+Use `one.one.one.one` (→ 1.1.1.1, cert matches) and make it env-overridable. Separately: the
+deny-path test needs no working DNS (the proxy 403s the CONNECT by hostname before resolving),
+which is why it passed throughout. Also, on Git Bash for Windows, `docker exec … cat
+/etc/resolv.conf` gets its path mangled to `C:/Program Files/Git/etc/resolv.conf` — prefix
+with `MSYS_NO_PATHCONV=1` (a diagnostic artifact, not a real error).
+
 ## 2026-07-07 — Default-closed egress needs a network wall, not just HTTP_PROXY env
 
 WP3b.5's egress proxy is enforced at TWO layers, and the network layer is the one that

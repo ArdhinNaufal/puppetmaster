@@ -22,8 +22,11 @@
 import { spawnSync } from "node:child_process";
 import { DockerCommandExecutor } from "../packages/kernel/dist/workbench.js";
 
-const ALLOW = "example.com"; // stable HTTPS host for the allowlist
-const DENY_URL = "https://api.github.com"; // a real host deliberately OFF the allowlist
+// Allowlisted host must be one your host's DNS resolves *truthfully* (some
+// networks sinkhole example.com to a placeholder IP). one.one.one.one → 1.1.1.1
+// with a matching cert is a safe default; override for your network if needed.
+const ALLOW = process.env.EGRESS_ALLOW_HOST ?? "one.one.one.one";
+const DENY_URL = process.env.EGRESS_DENY_URL ?? "https://api.github.com"; // OFF the allowlist
 const SECRET = "s3cr3t-egress-42";
 
 const projectId = `egress-${Date.now()}`;
