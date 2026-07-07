@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // WP3b.1 verification — drives the built DockerCommandExecutor against a real
 // Docker daemon. The eval harness can't exercise containers, so this is the
-// acceptance check for the workbench executor. Run on a Docker-capable host:
+// acceptance check for the workbench executor. Run on a Docker-capable host.
 //
-//   pnpm build && node scripts/verify-workbench.mjs
+// This script imports ONLY the kernel (no web app), so build just the kernel —
+// avoids the apps/web build entirely (its @fontsource imports need a synced
+// `pnpm install`, unrelated to the workbench):
+//
+//   pnpm --filter "@puppetmaster/kernel..." build && node scripts/verify-workbench.mjs
 //
 // Proves, end-to-end through the executor CODE (not raw docker): ensure()
 // creates a capped, non-root, --network none container; run() execs a command

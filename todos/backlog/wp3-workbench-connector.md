@@ -40,12 +40,22 @@ Docker socket proxy.
 **The single next action is yours, on a Docker-capable host:**
 
 ```
-pnpm build && node scripts/verify-workbench.mjs
+pnpm --filter "@puppetmaster/kernel..." build && node scripts/verify-workbench.mjs
 ```
+
+Build **kernel only** — the script imports just `packages/kernel/dist/workbench.js`, so it
+does not need the web app. (`pnpm build` also works but drags in the apps/web build, which
+needs a synced `pnpm install` for its `@fontsource` imports — unrelated to the workbench.)
 
 Expect `WORKBENCH EXECUTOR PASS: ensure/idempotent/non-root/exit-codes/in-container
 check/destroy` (exit 3 = no daemon). This is WP3b.1's acceptance — it drives the built
 `DockerCommandExecutor` against a real daemon.
+
+**Aside — the apps/web build failure (`@fontsource/rajdhani/500.css` unresolved):** not a
+repo bug — the lockfile pins it and it builds clean in CI/this repo. It's a stale local
+install on the host. Fix separately with `pnpm install` (syncs node_modules to the
+committed lockfile, incl. the WP0 dependency-cruiser addition). Does not block the
+workbench verification above.
 
 - **If PASS:** record it in `docs/adr/spike-002-record.md` (a WP3b.1 row), then WP3b.3
   (`bench.*` tools) is cleared to start — the executor foundation is proven.
