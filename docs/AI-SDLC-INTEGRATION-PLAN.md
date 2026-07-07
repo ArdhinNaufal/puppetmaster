@@ -14,10 +14,12 @@ WP3. **WP5a (workbench-free WP5 increment) is complete**: the spec-sections thea
 the ADR-004 KB mirror, and the three builtin Workshop agents (suite 12/12 at pass^3).
 **WP7a (Workshop UI read/manage surface) is complete**: WORKSHOP view + NEXUS chip +
 projectApi, gated-mode lint wired through the endpoint, all smoke-tested live against a
-booted server. Everything remaining (WP3, WP5/WP7 rest, WP6, WP8, WP9) funnels through
+booted server. **WP9.1 is complete**: the failure-mode mapping ledger
+(`docs/WORKSHOP-FAILURE-MODES.md`) dispositions all 37 unique corpus failure modes with
+zero unmapped. Everything remaining (WP3, WP5/WP7/WP9 rest, WP6, WP8) funnels through
 the workbench: WP3 is gated on the ADR-002 container spike passing on a docker-capable
-host. Each work package runs only on explicit go-ahead, in order, following the same
-convention as `docs/RESEARCH-ROADMAP.md`.
+host — that spike is now the single blocking item. Each work package runs only on
+explicit go-ahead, in order, following the same convention as `docs/RESEARCH-ROADMAP.md`.
 
 **v1.1 changelog:** records the §8 rulings; names the feature (**the Workshop**; entity
 **`project`**; per-project dev container **`workbench`**, tools `bench.*`); fixes ADR-002 as
@@ -673,10 +675,14 @@ started.)*
 - [ ] Memory promotion-by-traction + prune surfacing
 - [ ] Ownership statement at project creation
 
-**WP9 — Hardening**
-- [ ] Failure-mode mapping doc (corpus tables → eval/linter/accepted-risk; zero unmapped)
-- [ ] Priority evals (anchoring, verifier-edit, rewrite, drift, invented thresholds, premature scaling, stateful-replica)
-- [ ] `docs/WORKSHOP.md` + ARCHITECTURE/PRD/NEXUS updates
+**WP9 — Hardening** — 🟡 WP9.1 (mapping ledger) complete 2026-07-06
+- [x] Failure-mode mapping ledger (`docs/WORKSHOP-FAILURE-MODES.md`): 50 corpus rows →
+      37 unique modes, every one dispositioned (EVAL/LINTER/DESIGN/REVIEW/EARNED/
+      DEFERRED-with-mitigation); zero unmapped; DEFERRED upgrades fold into future WP
+      acceptance
+- [ ] Priority evals needing WP3/WP5 machinery (verifier-edit, rewrite detection,
+      invented thresholds, refactor-gate M-vs-A) + interview-anchoring (real-model)
+- [ ] `docs/WORKSHOP.md` + ARCHITECTURE/PRD/NEXUS updates — once full flows exist
 - [ ] Self-hosting smoke test + learnings
 
 ---
@@ -706,6 +712,7 @@ started.)*
 | Verification theater (gates exist, checks weak) | Medium | Checks ship with honest refusal semantics (skip ≠ pass, loudly); reviewer class "compliance without gaming"; WP9 evals |
 | Token cost of gated projects | Medium | Stage 5 budgets gate ticks already; per-project budget field; router profiles floor risky work |
 | Scope creep into a CI system | Low | ADR-001 scope boundary: v1 has no CI-provider integration; verify runs in *our* workbench only |
+| Deferred corpus failure modes (workbench-dependent) | Medium | `docs/WORKSHOP-FAILURE-MODES.md` is the ledger: 12 DEFERRED modes, each with a named interim mitigation; upgrading them is part of WP3/WP5/WP6 acceptance |
 
 ## 10. Out of scope (v1)
 
