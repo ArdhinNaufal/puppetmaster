@@ -1,5 +1,6 @@
 import { getVerifyCheckByName, listArtifacts, type Db } from "@puppetmaster/db";
 import type { EvidenceKind, VerifyCheckName } from "@puppetmaster/shared";
+import type { CommandExecutor } from "./command-runner.js";
 
 /**
  * Deterministic verification gates (Workshop WP4, docs/AI-SDLC-INTEGRATION-PLAN.md).
@@ -36,12 +37,13 @@ export interface CheckRunner {
 }
 
 /**
- * The workbench-independent runner: executes checks that are pure DB
- * assertions. Shell-backed checks (test, arch, refactor-gate, load, custom)
- * need a project workbench (WP3) and are refused here by name — an honest
- * refusal, not a silent pass.
+ * The builtin runner. DB-assertion checks (todo-sync, spec-sections) always
+ * run. Shell-backed checks (test, arch, custom) run only when a CommandExecutor
+ * is wired (WP3) — otherwise they are refused by name (an honest refusal, not a
+ * silent pass). refactor-gate and load remain WP3b (git-diff / running-system
+ * specifics).
  */
-export function createBuiltinCheckRunner(deps: { db: Db }): CheckRunner {
+export function createBuiltinCheckRunner(deps: { db: Db; executor?: CommandExecutor }): CheckRunner {
   return {
     async run(ctx: CheckRunContext): Promise<CheckRunResult> {
       const check = await getVerifyCheckByName(deps.db, ctx.projectId, ctx.check);
@@ -59,10 +61,63 @@ export function createBuiltinCheckRunner(deps: { db: Db }): CheckRunner {
       if (ctx.check === "todo-sync") return runTodoSync(deps.db, ctx.projectId);
       if (ctx.check === "spec-sections") return runSpecSections(deps.db, ctx.projectId, check.command);
 
+      if (ctx.check === "test" || ctx.check === "arch" || ctx.check === "custom") {
+        if (!deps.executor) {
+          throw new Error(
+            `verify check "${ctx.check}" needs a workbench command executor — none is wired in this deployment (WP3b: the container executor)`,
+          );
+        }
+        return runShellCheck(deps.executor, ctx, check.command);
+      }
+
       throw new Error(
-        `verify check "${ctx.check}" requires a project workbench (WP3) — no shell-capable check runner is wired in this deployment`,
+        `verify check "${ctx.check}" requires a project workbench (WP3b) — refactor-gate/load are not wired in this deployment`,
       );
     },
+  };
+}
+
+/** Generic shell check (WP3a): run the check's declared command in the
+ *  project's workspace; exit 0 = pass, anything else gates. The command's own
+ *  output is the evidence — the deterministic gate the corpus's Invariant 2
+ *  demands (a build/test/inspection, not the model's word). */
+async function runShellCheck(
+  executor: CommandExecutor,
+  ctx: CheckRunContext,
+  command: string | null,
+): Promise<CheckRunResult> {
+  if (!command || !command.trim()) {
+    throw new Error(
+      `verify check "${ctx.check}" has no command configured — a shell check must declare what to run`,
+    );
+  }
+  const res = await executor.run({ projectId: ctx.projectId, command });
+  const tail = (s: string) => s.split("\n").slice(-20).join("\n").trim();
+  const detail = {
+    command,
+    code: res.code,
+    timedOut: res.timedOut,
+    stdout: tail(res.stdout),
+    stderr: tail(res.stderr),
+  };
+  if (res.code === 0 && !res.timedOut) {
+    return {
+      ok: true,
+      summary: `${ctx.check}: \`${command}\` passed (exit 0)`,
+      evidenceKind: "test-output",
+      detail,
+    };
+  }
+  const why = res.timedOut ? "timed out" : `exited ${res.code}`;
+  const output = tail(res.stderr) || tail(res.stdout) || "(no output)";
+  return {
+    ok: false,
+    summary: `${ctx.check}: \`${command}\` ${why}`,
+    instruction:
+      `The ${ctx.check} check \`${command}\` ${why}. Output:\n${output}\n` +
+      `Fix the cause so the command exits 0, then finish.`,
+    evidenceKind: "test-output",
+    detail,
   };
 }
 

@@ -1,3 +1,6 @@
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { localWorkbenchDir } from "@puppetmaster/kernel";
 import {
   completeTodo,
   createAgent,
@@ -478,6 +481,103 @@ export const GOLDEN_TASKS: GoldenTask[] = [
       const source = `project:${project.id}:spec:Spec`;
       const mirrors = (await listDocuments(db, ctx.workspaceId)).filter((d) => d.source === source);
       return mirrors.length === 1 && mirrors[0]!.title.includes("(v2)") && mirrors[0]!.chunkCount > 0;
+    },
+  },
+  {
+    id: "workshop-test-check-pass-local",
+    description:
+      "Workshop WP3a: a project's `test` check runs `node --test` in the local workbench; passing → the gate opens, evidence is captured, the gated action runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-test-pass" });
+      await createVerifyCheck(db, {
+        projectId: project.id,
+        name: "test",
+        command: "node --test",
+        enabled: true,
+        earnedNote: "eval fixture",
+      });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "add.mjs"), "export function add(a, b) { return a + b; }\n");
+      writeFileSync(
+        join(dir, "add.test.mjs"),
+        'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./add.mjs";\ntest("add", () => assert.strictEqual(add(2, 3), 5));\n',
+      );
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "test gate", config: { projectId: "{{input.projectId}}", check: "test" } },
+        { id: "util__echo", kind: "action", label: "gated", config: { server: "util", tool: "echo", args: { value: "gated-ok" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectOutput: (o) => o === "gated-ok",
+    expectState: async (db, ctx) => {
+      const steps = await getMissionSteps(db, ctx.missionId);
+      const gate = steps.find((s) => s.kind === "verify");
+      if (!gate || gate.status !== "succeeded") return false;
+      const out = gate.output as { passed?: boolean; check?: string } | null;
+      if (out?.passed !== true || out?.check !== "test") return false;
+      const ev = await listEvidenceForStep(db, gate.id);
+      return ev.length === 1 && ev[0]!.kind === "test-output";
+    },
+    trajectory: { mustCall: ["util.echo"], mayCallOnly: ["util.echo"] },
+  },
+  {
+    id: "workshop-test-check-blocks-local",
+    description:
+      "Workshop WP3a: a failing `node --test` in the local workbench gates the mission — it escalates with the command output as evidence; the gated action never runs",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-test-blocks" });
+      await createVerifyCheck(db, {
+        projectId: project.id,
+        name: "test",
+        command: "node --test",
+        enabled: true,
+        earnedNote: "eval fixture",
+      });
+      const dir = localWorkbenchDir(project.id);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "add.mjs"), "export function add(a, b) { return a - b; }\n"); // BUG
+      writeFileSync(
+        join(dir, "add.test.mjs"),
+        'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./add.mjs";\ntest("add", () => assert.strictEqual(add(2, 3), 5));\n',
+      );
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        { id: "gate", kind: "verify", label: "test gate", config: { projectId: "{{input.projectId}}", check: "test" } },
+        { id: "util__echo", kind: "action", label: "gated", config: { server: "util", tool: "echo", args: { value: "should-not-run" } } },
+      ],
+      edges: [
+        { from: "t", to: "gate" },
+        { from: "gate", to: "util__echo" },
+      ],
+    },
+    expectStatus: "awaiting_approval",
+    expectState: async (db, ctx) => {
+      const approval = (await listApprovals(db, "pending")).find(
+        (a: { missionId: string }) => a.missionId === ctx.missionId,
+      );
+      if (!approval || !approval.prompt.includes("test")) return false;
+      const ev = await listEvidenceForApproval(db, approval.id);
+      const detail = (ev[0]?.content as { runs?: { summary: string }[]; detail?: { code?: number } } | null);
+      // The escalation evidence carries the failing run; the gated echo never ran.
+      const steps = await getMissionSteps(db, ctx.missionId);
+      const echo = steps.find((s) => s.nodeId === "util__echo");
+      const ranEcho = echo?.status === "succeeded";
+      return Array.isArray(detail?.runs) && detail!.runs!.length >= 1 && !ranEcho;
     },
   },
 ];

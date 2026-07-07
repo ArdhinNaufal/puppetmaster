@@ -17,13 +17,14 @@ the ADR-004 KB mirror, and the three builtin Workshop agents (suite 12/12 at pas
 projectApi, gated-mode lint wired through the endpoint, all smoke-tested live against a
 booted server. **WP9.1 is complete**: the failure-mode mapping ledger
 (`docs/WORKSHOP-FAILURE-MODES.md`) dispositions all 37 unique corpus failure modes with
-zero unmapped. Everything remaining (WP3, WP5/WP7/WP9 rest, WP6, WP8) funnels through
-the workbench: WP3 is gated on the ADR-002 container spike passing on a docker-capable
-host. **That spike's container half is now fully implemented** (`docker/workbench.Dockerfile`
-+ the real `--container` branch validating toolchain / non-root / in-container check exec /
-`--network none` egress block / resource caps) — it just needs a run on a Docker daemon
-(this session has the client but no daemon). Running `./scripts/spike-adr002.sh --container`
-on a Docker host and recording PASS is the single unblocking action. Each work package runs
+zero unmapped. **The ADR-002 spike PASSED both halves** (host + container 5/5 on the
+owner's Docker host) — WP1 is closed and WP3 unblocked. **WP3a is complete**: the
+shell-backed `CheckRunner` (`test`/`arch`/`custom` run real commands via a `CommandExecutor`
+seam + `LocalCommandExecutor`) with two golden evals at pass^3 — suite now 14/14. What
+remains is **WP3b** (the containerized connector: `DockerCommandExecutor`, `bench.*` tools,
+`bench.delegate`, lifecycle) plus WP5/WP6/WP7/WP9 remainders — the container-executing parts
+need a Docker host for their golden evals, though the substrate is spike-validated and the
+shell-check logic they reuse is already proven. Each work package runs
 only on explicit go-ahead, in order, following the same convention as
 `docs/RESEARCH-ROADMAP.md`.
 
@@ -613,12 +614,18 @@ started.)*
       incl. both lifecycle negatives (accepted-ADR edit refused, mission-less todo
       completion refused)
 
-**WP3 — Workbench connector**
-- [ ] Workbench lifecycle (create/suspend/destroy) per ADR-005
-- [ ] `bench.git.*`, `bench.exec`, `bench.read/write` with tiers + envelopes + compaction
-- [ ] Egress allowlist, resource caps, vault-only secrets
-- [ ] `bench.delegate` with hard budgets (per ADR-002 ruling)
-- [ ] Golden evals: exit-code propagation; injection→push gated; egress refusal audited
+**WP3 — Workbench connector** — 🟡 WP3a (shell CheckRunner) complete 2026-07-06
+- [x] `CommandExecutor` seam + `LocalCommandExecutor` (host subprocess) — the *where a
+      check runs* boundary (`packages/kernel/src/command-runner.ts`)
+- [x] Shell checks `test`/`arch`/`custom` in the builtin runner (run `check.command`, exit
+      gates, output = evidence); two golden evals at pass^3 with real `node --test`
+- [ ] `DockerCommandExecutor` (`docker exec` into the workbench; same interface) — WP3b
+- [ ] Workbench lifecycle (create/suspend/destroy) per ADR-005 — WP3b, Docker host
+- [ ] `bench.git.*`, `bench.exec`, `bench.read/write` with tiers + envelopes + compaction — WP3b
+- [ ] Egress allowlist, resource caps, vault-only secrets — WP3b (ADR-005 spike-confirmed)
+- [ ] `bench.delegate` with hard budgets (per ADR-002 ruling) — WP3b
+- [ ] `refactor-gate` + `load` checks (git-diff / running system) — WP3b
+- [ ] Golden evals **on a Docker host**: exit-code propagation; injection→push gated; egress refusal audited
 
 **WP4 — Verification gates** — ✅ workbench-independent core complete 2026-07-06
 - [x] `verify` node handler + Evidence persistence (fail-closed on missing/disabled
