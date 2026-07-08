@@ -107,6 +107,9 @@ button { font-family: inherit; cursor: pointer; }
   min-height: 0;
 }
 .grid.no-trace { grid-template-columns: 248px 1fr 150px; }
+/* NEXUS solo: the theater takes the whole grid; side/operation content
+   lives on as docked task panes (docs/NEXUS.md §3). */
+.grid.nx-solo { grid-template-columns: 1fr; }
 
 /* ---- View switcher ------------------------------------------------------ */
 .view-switch { display: flex; gap: 0.15rem; flex-wrap: wrap; }
@@ -1077,18 +1080,43 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
   white-space: nowrap;
 }
 
-/* task panes: vague transparent containers floating over the Construct */
-.nx-pane {
+/* dock flanks: task panes stack on the stage's left/right edges so the
+   Construct's center stays unobstructed (docs/NEXUS.md §4.1) */
+.nx-dock {
   position: absolute;
+  top: 0;
+  bottom: 0;
+  width: min(31%, 400px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  overflow-y: auto;
+  pointer-events: none; /* the gaps stay click-through to the Construct */
+  z-index: 20;
+}
+.nx-dock.left { left: 0; }
+.nx-dock.right { right: 0; }
+
+/* task panes: vague transparent containers docked over the Construct's flanks */
+.nx-pane {
+  position: relative;
+  pointer-events: auto;
+  flex: none;
   border: 1px solid var(--stroke-hi);
   border-radius: var(--radius);
-  background: color-mix(in srgb, var(--panel) 72%, transparent);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
+  background: color-mix(in srgb, var(--panel) 45%, transparent);
+  backdrop-filter: blur(9px);
+  -webkit-backdrop-filter: blur(9px);
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
   display: flex;
   flex-direction: column;
   max-height: calc(100% - 24px);
+}
+.nx-pane.dragging {
+  opacity: 0.85;
+  z-index: 90;
+  box-shadow: 0 18px 56px rgba(0, 0, 0, 0.6);
 }
 .nx-pane .fui-bracket { border-color: var(--stroke-hi); }
 .nx-pane.focused { border-color: var(--accent-dim); }
@@ -1099,7 +1127,7 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
   gap: 0.5rem;
   padding: 0.35rem 0.55rem;
   border-bottom: 1px solid var(--stroke);
-  background: color-mix(in srgb, var(--panel-hi) 80%, transparent);
+  background: color-mix(in srgb, var(--panel-hi) 55%, transparent);
   cursor: grab;
   user-select: none;
   touch-action: none;
@@ -1160,6 +1188,43 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
 .nx-snap-row b.ok { color: var(--ok); }
 .nx-snap-row b.err { color: var(--danger); }
 .nx-snap-row b.warn { color: var(--warn); }
+
+/* DISCOVERY: the kernel's search + stratum navigator */
+.nx-disco-list { list-style: none; display: flex; flex-direction: column; }
+.nx-disco-hit {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.32rem 0.45rem;
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid #0d151b;
+  color: var(--text-hi);
+  text-align: left;
+}
+.nx-disco-hit.sel {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-left-color: var(--accent);
+}
+.nx-disco-glyph { color: var(--accent); font-size: 0.7rem; }
+.nx-disco-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nx-disco-sub {
+  grid-column: 2;
+  font-family: var(--font-data);
+  font-size: 0.56rem;
+  letter-spacing: 0.1em;
+  color: var(--text-lo);
+}
+.nx-disco-nav { display: flex; gap: 0.3rem; align-items: center; flex-wrap: wrap; }
 
 /* task tray: the guaranteed path to every task */
 .nx-tray {

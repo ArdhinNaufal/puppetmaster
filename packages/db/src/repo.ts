@@ -2,7 +2,9 @@ import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { WorkflowGraph } from "@puppetmaster/shared";
 import type { Db } from "./client.js";
 import {
+  agents,
   approvals,
+  documents,
   missions,
   missionSteps,
   workflows,
@@ -270,4 +272,29 @@ export async function findApprovalForNode(db: Db, missionId: string, nodeId: str
     .orderBy(desc(approvals.createdAt))
     .limit(1);
   return row ?? null;
+}
+
+/** Seed/demo support: rewrite an entity's creation instant so seeded data can
+ *  span multiple years — the NEXUS Construct stacks its strata by creation
+ *  year (docs/NEXUS.md §2). Never called by the runtime. */
+export async function backdateEntity(
+  db: Db,
+  kind: "agent" | "workflow" | "document" | "mission",
+  id: string,
+  createdAt: Date,
+): Promise<void> {
+  switch (kind) {
+    case "agent":
+      await db.update(agents).set({ createdAt }).where(eq(agents.id, id));
+      break;
+    case "workflow":
+      await db.update(workflows).set({ createdAt }).where(eq(workflows.id, id));
+      break;
+    case "document":
+      await db.update(documents).set({ createdAt }).where(eq(documents.id, id));
+      break;
+    case "mission":
+      await db.update(missions).set({ createdAt }).where(eq(missions.id, id));
+      break;
+  }
 }

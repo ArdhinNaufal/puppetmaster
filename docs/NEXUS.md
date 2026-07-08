@@ -54,15 +54,17 @@ existing REST + WebSocket APIs (`apps/web/src/api.ts`); nothing is invented.
 
 | Stratum | Radius | Geometry | Data source | Live behavior |
 |---|---|---|---|---|
-| **Kernel core** | 0 – 0.14R | 3 nested rotating polygons (triangle/hexagon/nonagon), vertex dots, inner "iris" | bus `connected`; every `BusEvent` | Iris vector tracks cursor (the Construct "watches" the operator). Each bus event = one flash-settle pulse ripple. Disconnected → iris hollow, polygons stop. |
-| **Schema graticule** | 0.14 – 1.0R | Faint concentric arcs + radial degree ticks + coordinate microtype | static geometry, labels are real counts | The "paper" of the instrument. Parallax-tilts with cursor. |
-| **Agent orbit** | 0.42R | One node per agent: ring glyph ◉ + autonomy tick (1/2/3 ticks = read/write/destructive), short name label on focus | `agentApi.list()` | Node angle = stable hash(agent.id). Agent active in last 20s (bus `agent.message`/mission events with its id) → node glows + orbit dot spins. Click → **AGENT CHANNEL** task. |
-| **Workflow lattice** | 0.60R | One node per workflow: square rotated 45°, inner n-gon with n = node count of its graph, `v{n}` tag on focus | `api.listWorkflows()` (+ graph node counts lazily) | Click → **RUN WORKFLOW** task pre-selected. Running workflow mission → thread + node pulse. |
-| **Knowledge shell** | 0.74R | Particle band: dots = chunks (capped 240), clustered per document; document majors as brighter motes | `kbApi.list()` (chunkCount per doc) | Click → **KNOWLEDGE SEARCH** task. Density is the readout: an empty shell is visibly sparse. |
-| **Tool spokes** | 0.86R | One spoke per MCP server/namespace, tick marks along the spoke = tools in it, spoke label = server name | `api.tools()` grouped by server | Click spoke → **TOOL CATALOG** task filtered to that server. Offline workspace server → dashed spoke. |
-| **Mission threads** | core → node | Quadratic bézier "strings" from kernel to the acting agent/workflow node; animated dash flow while running; **amber, taut (straight), vibrating** when `awaiting_approval` | `api.listMissions()` recent + bus `mission.*`, `approval.*` | The signature motion. Thread click → **MISSION DOSSIER** task for that mission. Approval-gated thread click → **AUTHORIZATIONS** task. |
-| **Memory halo** | 1.0R rim | Rim ticks: pending authorizations (amber), failed missions last 24h (red), RX counter microtype | approvals list, missions list, signal RX | The rim is the instrument's warning bezel. |
-| **Count readouts** | corners of stage | Micro stat lines: `AGENTS n · WORKFLOWS n · DOCS n/CHUNKS n · TOOLS n · MISSIONS 24H n` | same fetches | Tertiary type stratum, per density rules. |
+| **Kernel core** | 0 – 0.15R | A lattice of pixels animated as a **constant radial wave** (ripples run outward forever; speed rises with running missions, capped 3×), bounding ring | bus `connected`; every `BusEvent`; running count | The system's heartbeat. Click → **DISCOVERY** task (§2.4). Hold ≥700ms → SYSTEM SNAPSHOT ceremony. Gated → outer pixel band + ring blink amber. Disconnected → grey static lattice, "LINK DOWN". |
+| **Schema graticule** | 0.15 – 1.0R | Faint concentric arcs + radial degree ticks + orbit guides on populated rings | static geometry, labels are real counts | The "paper" of the instrument. Parallax-tilts with cursor. |
+| **Agent orbit** | 0.42R | One node per agent: ring glyph ◉ + autonomy tick (1/2/3 ticks = read/write/destructive), short name label on focus | `agentApi.list()` | Nodes **evenly spread** on the orbit (neat arrangement — v2). Agent active in last 20s → node glows + orbit dot spins. Click → **AGENT CHANNEL** task. |
+| **Mission ring** | 0.52R | One bead (rotated square) per mission of the active stratum, live-first, cap 14 | `api.listMissions()` + bus `mission.*`, `approval.*` | Live missions grow threads (below); settled beads stay as history (red = failed). Click → **MISSION DOSSIER** / **AUTHORIZATIONS** if gated. |
+| **Workflow lattice** | 0.63R | One node per workflow: square rotated 45°, inner n-gon with n = node count of its graph, `v{n}` tag on focus | `api.listWorkflows()` (+ graph node counts lazily) | Evenly spread. Click → **RUN WORKFLOW** task pre-selected. |
+| **Knowledge shell** | 0.76R | One node **per document** (evenly spread) with its chunk particles clustered around it (capped 240 total) | `kbApi.list()` | Density is the readout. Click → **KNOWLEDGE SEARCH** task. |
+| **Tool spokes** | 0.88R | One spoke per MCP server/namespace, tick marks along the spoke = tools in it | `api.tools()` grouped by server | Tool namespaces live on the **newest stratum** (they have no birthday). Click spoke → **TOOL CATALOG** filtered to that server. |
+| **Mission threads** | core → rim | Strings from kernel to the bead's bearing; animated dash flow while running; **amber, taut (straight), vibrating** when `awaiting_approval` | live missions of the stratum | The signature motion. |
+| **Memory halo** | 1.0R rim | Rim ticks (neatly sequenced): pending authorizations (amber), failed missions last 24h (red) | approvals list, missions list | Global — consequences transcend strata. |
+| **Depth gauge** | bottom center | One chip per stratum (year + unit-count bar), active chip bracketed | `buildLayers()` | Click/Enter a chip → stratum shift (§2.3). Walkable by keyboard like any node. |
+| **Count readouts** | corners of stage | Micro stat lines: `STRATUM y — AGENTS n · WORKFLOWS n · OPS n`, `DOCS n/CHUNKS n`, `TOOLS n · NS n`, `RX n · LIVE OPS n · GATED n` | same fetches | Tertiary type stratum, per density rules. |
 
 **Complexity budget:** the figure is *intricate by strata*, not by noise — each layer is
 individually legible; combined they read as one organism. Hard cap ~600 drawn primitives
@@ -72,12 +74,55 @@ per frame (see §8 performance).
 
 | State | Trigger | Presentation |
 |---|---|---|
-| **DORMANT** | bus disconnected | Greyed strata, no motion, iris hollow, "LINK DOWN" microtype. |
-| **PATIENT** (idle) | connected, no running mission, no cursor in stage | Slow breathing: ring drift ≤ 0.02 rad/s, kernel rotation ≤ 0.05 rad/s. Nearly still. |
-| **ATTENTIVE** | cursor inside stage | Figure tilts toward cursor (§5.1), iris tracks, nearest-node reticle engages. |
-| **WORKING** | ≥1 running mission | Threads drawn + flowing; the acting nodes pulse; kernel rotation quickens with running count (cap 3×). |
-| **GATED** | ≥1 pending authorization | Amber taut thread(s) + rim ticks; kernel iris blinks amber every 3s. Takes visual priority over WORKING. |
+| **DORMANT** | bus disconnected | Greyed strata, no motion, static grey kernel lattice, "LINK DOWN" microtype. |
+| **PATIENT** (idle) | connected, no running mission, no cursor in stage | The pixel wave rolls at base speed; frame rate halves. Nearly still. |
+| **ATTENTIVE** | cursor inside stage | Figure tilts toward cursor (§5.1), nearest-node reticle engages. |
+| **WORKING** | ≥1 running mission | Threads drawn + flowing; the acting nodes pulse; the kernel wave quickens with running count (cap 3×). |
+| **GATED** | ≥1 pending authorization | Amber taut thread(s) + rim ticks; the kernel's outer pixel band and ring blink amber every 3s. Takes visual priority over WORKING. |
 | **ALARM** | a mission failed in last 60s | One red ripple from kernel to rim (once per failure event, not looping). |
+
+### 2.3 Strata — the Construct stacked in time (v2)
+
+The instrument grows forever, so it is **stacked in layers grouped by creation
+year** (`buildLayers` in `Construct.tsx`): every agent, workflow, document and
+mission lives on the stratum of its `createdAt` year; tool namespaces (no
+birthday) live on the newest stratum, which always exists. One stratum is
+active at a time — its rings are interactive and neatly arranged (nodes evenly
+spread per orbit). Adjacent strata are visible as faint ghost rings: the older
+one small at the center (deeper in the tunnel), the newer one large beyond the
+rim.
+
+**Stratum shift** is a zoom ceremony (~480ms, cubic ease): diving to an older
+year scales the active rings up and out (the camera passes through them) while
+the older stratum grows from the center into place; surfacing plays the
+reverse. Under reduced motion the swap is instant. Navigation paths:
+
+- **wheel** over the stage (down = deeper/older, up = newer),
+- **`[` / `]`** or **PageDown / PageUp** on the focused canvas,
+- the **depth gauge** chips (click / keyboard walk + Enter),
+- **DISCOVERY** (§2.4): next/prev, a year jump field, or selecting a hit that
+  lives on another stratum.
+
+During a shift only the chrome (kernel, depth gauge, auth rim) is interactive.
+
+### 2.4 DISCOVERY — the kernel's gateway (v2)
+
+Clicking the kernel opens the **DISCOVERY** pane: a search over **every unit
+on the active stratum** (agents, workflows, documents, tool namespaces,
+missions) **plus every task pane** the operator's role can reach. If nothing
+matches on the active stratum the search silently widens to all strata (hits
+carry a `⇢ year` tag). Selecting a hit closes the pane and:
+
+- **task pane hit** → opens that pane;
+- **construct unit hit** → shifts to its stratum if needed, then plays the
+  **homing beacon**: a crosshair sweep from the stage edges plus a converging
+  reticle shaped like the target's own geometry (agent → arcs, workflow →
+  rotated square, knowledge → particle ring, tool → dashed spoke trace,
+  mission → thread flash + diamond), settling into the magnet reticle with the
+  label decoded.
+
+DISCOVERY also lists the strata (deeper/newer steppers + one chip per year)
+and a jump field accepting a year or stratum id.
 
 ## 3. Page layout
 
@@ -85,54 +130,56 @@ per frame (see §8 performance).
 ┌────────────────────────────────────────────────────────────────────┐
 │ stage-head: 01 // NEXUS                     ⌘K COMMAND · 1–9 VIEWS │
 ├────────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│   [floating pane]                              [floating pane]     │
-│                                                                    │
-│                        THE CONSTRUCT                               │
-│                     (full-stage canvas)                            │
-│                                                                    │
-│              [floating pane, overlapping another]                  │
-│                                                                    │
+│ ╔═ left dock ═╗                              ╔═ right dock ══╗     │
+│ ║ [pane]      ║        THE CONSTRUCT         ║ [pane]        ║     │
+│ ║ [pane]      ║     (full-stage canvas)      ║ [pane]        ║     │
+│ ╚═════════════╝                              ╚═══════════════╝     │
+│                    STRATA // 2024 2025 [2026]                      │
 ├────────────────────────────────────────────────────────────────────┤
 │ task tray: ◉ CHANNEL ▤ RUN ⚑ AUTH ≡ DOSSIER ⌕ KB … (registry)      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-- The **Construct canvas fills the stage**; panes float *above* it (the translucency is
-  what keeps the figure present under the work).
+- The **Construct canvas fills the stage**. Panes **dock to the left/right
+  flanks** (v2) — never over the figure's center; a new pane lands on the
+  emptier flank. The dock gaps stay click-through to the Construct.
 - The **task tray** (bottom strip of the stage) lists every registry task as a chip —
   the guaranteed path to any task even if its stratum is empty (e.g. no agents yet).
   Chips show role-locked state for insufficient roles.
-- NEXUS is **view 01 for every role**; the shell (rail, ⌘K palette, signal ticker,
-  operation dossier aside) stays. Palette gains `TASK //` entries for every registry task.
+- NEXUS is **view 01 for every role** and runs **solo** (v2): the shell's left
+  side panel and right OPERATION panel are hidden on this view — their content
+  lives on as task panes (AUTHORIZATIONS, SIGNAL FEED, OPERATION LOG). The
+  rail, ⌘K palette, WATCH strip and signal ticker stay. Palette gains
+  `TASK //` entries for every registry task.
 
 ## 4. Task pane system
 
-### 4.1 Pane anatomy
+### 4.1 Pane anatomy (v2: docked flanks)
 
 ```
 ╭──────────────────────────────────────╮  ← 1px stroke, corner brackets
-│ ⣿ ◉ AGENT CHANNEL          ⇱  −  ✕  │  ← title rail = drag handle
-│                                      │     ⇱ jump-to-full-page
-│   (task body, compact module)        │     − minimize to tray chip badge
+│ ⣿ ◉ AGENT CHANNEL          ⇥  ⇱  ✕  │  ← title rail = drag handle
+│                                      │     ⇥/⇤ dock to the other flank
+│   (task body, compact module)        │     ⇱ jump-to-full-page
 │                                      │     ✕ close
 ╰──────────────────────────────────────╯
 ```
 
-- **Vague transparent background**: `background: color-mix(in srgb, var(--panel) 72%,
-  transparent)` + `backdrop-filter: blur(6px)` + 1px stroke + brackets. The Construct
-  stays visible through every pane.
-- **Move**: pointer-drag on the title rail (pointer capture; `touch-action: none`);
-  position clamped to the stage; no grid snap (free stacking is the point).
-- **Stack**: panes may overlap arbitrarily. `pointerdown` anywhere on a pane raises it
-  (z = monotonic counter). Focused pane gets accent brackets.
+- **Vague transparent background**: `background: color-mix(in srgb, var(--panel) 45%,
+  transparent)` + `backdrop-filter: blur(9px)` + 1px stroke + brackets — deliberately
+  *more* translucent than v1; the Construct stays present under every pane.
+- **Docked, not free-floating**: panes stack vertically inside a left or a right dock
+  column (`.nx-dock`, width `min(31%, 400px)`); the figure's center is never covered.
+  A new pane opens on the flank with fewer panes (explicit `ctx.side` overrides).
+- **Move**: pointer-drag on the title rail — release past the stage midline re-docks to
+  the other flank; release height picks the slot within the flank. The ⇥/⇤ rail button
+  re-docks in one click.
+- **Raise**: `pointerdown` anywhere marks the pane focused (accent brackets).
 - **Jump** (⇱): navigates the shell to the task's dedicated view and carries context
-  (e.g. selected agent → Command view; mission → tracked dossier; workflow → Canvas).
-  The pane closes on jump (the full page supersedes it).
-- **Spawn placement**: cascade from stage center-right (+24px x/y per open pane), so new
-  panes never bury the kernel.
-- **Keyboard**: panes are focusable; arrow keys nudge (±16px, ±1px with Shift) when the
-  rail has focus; Escape closes the focused pane. Every control is tabbable.
+  (e.g. selected agent → Command view; mission → tracked dossier). The pane closes on
+  jump (the full page supersedes it).
+- **Keyboard** (rail focused): ↑/↓ reorder within the flank, ←/→ switch flank, Escape
+  closes. Every control is tabbable.
 
 ### 4.2 Task registry (the "all tasks" contract)
 
@@ -153,6 +200,8 @@ Construct hit-targets all derive from it.
 | `tools.catalog` | ⚙ | Tool catalog | grouped list w/ tier badges (server filter) | tools | member |
 | `template.use` | ▤ | Templates | list + USE THIS | templates | member (use: builder) |
 | `signal.feed` | ⊚ | Signal feed | radar + recent entries list | (none — live) | member |
+| `operation.log` | ⌖ | Operation log (v2) | tracked mission's live dossier + cancel/retry/explain | missions | member (act: builder) |
+| `construct.discovery` | ◈ | Discovery (v2, §2.4) | stratum search + strata navigation | (none — live) | member |
 | `evals.run` | ✓ | Eval suite | run + last result summary | evals | admin |
 | `budgets` | ¤ | Budgets & usage | jumpOnly v0 | evals | admin |
 | `router` | ⇌ | Router profiles/health | jumpOnly v0 | evals | admin |
@@ -164,13 +213,21 @@ Construct hit-targets all derive from it.
 *jumpOnly v0* rows are still on the page (tray + palette + rim affordances) — they open
 their full view; converting them to in-pane bodies is Phase P6 work, one row at a time.
 
-### 4.3 Auto-hail (the system opens panes at you)
+### 4.3 Auto-hail (the system opens panes at you — v2 cadence)
 
-- `approval.requested` bus event → if no AUTHORIZATIONS pane is open, one **materializes**
-  (flash-settle) — consequence demands presence. Never duplicated, never re-raised while
-  the operator is actively dragging.
-- A mission started *from this page* opens/raises its MISSION DOSSIER pane.
-- Auto-hail is capped: at most 1 auto-opened pane per event type at a time.
+Attention items surface **one at a time on a fixed cadence** (2.8s apart), each
+docked to the emptier flank, so the operator is hailed, not buried:
+
+- **Urgent**: pending authorizations → the AUTHORIZATIONS pane.
+- **Need follow-up**: each mission failed in the last 24h (cap 5) → its MISSION
+  DOSSIER pane.
+- Each item hails **once per session**; closing a hailed pane is a decision the
+  system respects (no re-hail until the trigger clears and fires again).
+- **Operation log on action**: tracking a mission from this page (launching a
+  workflow, hailing an agent) opens/raises the OPERATION LOG pane on the
+  emptier flank.
+- The cadence timer is render-independent (refs), so shell re-renders never
+  reset it.
 
 ### 4.4 Persistence
 
@@ -179,14 +236,15 @@ their full view; converting them to in-pane bodies is Phase P6 work, one row at 
 ```jsonc
 {
   "nexus": {
-    "panes": [ { "task": "agent.channel", "x": 820, "y": 120, "w": 380,
-                 "ctx": { "agentId": "…" }, "z": 3, "min": false } ],
-    "zSeq": 7
+    "panes": [ { "task": "agent.channel", "side": "right",
+                 "ctx": { "agentId": "…" }, "z": 3 } ]
   }
 }
 ```
 
-Debounced 500ms; restored on entry; panes for since-deleted subjects drop silently.
+Debounced 500ms; restored on entry; panes for since-deleted subjects drop
+silently. Legacy v1 layouts (free `x`/`y`) migrate on restore: `x > 460` →
+right flank, else left.
 
 ## 5. Interaction model — the cursor and the Construct
 
@@ -197,8 +255,10 @@ Debounced 500ms; restored on entry; panes for since-deleted subjects drop silent
   gentle counter-rotation that reads as depth. Eased with critically-damped spring
   (stiffness 120, damping 20); max excursion 14px. No 3D matrices — 2D offsets per
   stratum (cheap, deterministic).
-- **Iris gaze**: kernel iris (a short chord) points along `atan2(dy, dx)` with 150ms lag.
-  The Construct *watches*; this is the single most "alive" cue and costs one line.
+- **Kernel pixel wave** (v2, replaces the iris): the kernel is a lattice of pixels whose
+  brightness follows a radial sine wave — a constant, calm heartbeat that quickens with
+  running missions and shifts amber at the rim when gated. The lattice is precomputed on
+  resize; the wave costs one `sin` per pixel per frame.
 - **Magnet reticle**: nearest interactive node within 48px of the cursor snaps a
   corner-bracket reticle onto itself; its label **decodes in** (≤160ms); its thread(s)
   brighten. One node at a time; leaving radius releases with a 90ms fade. Cursor becomes
@@ -212,32 +272,37 @@ Debounced 500ms; restored on entry; panes for since-deleted subjects drop silent
 |---|---|---|
 | click | agent node | open AGENT CHANNEL pane (agent pre-selected) |
 | click | workflow node | open RUN WORKFLOW pane (workflow pre-selected) |
-| click | knowledge shell | open KNOWLEDGE SEARCH pane |
+| click | knowledge doc node | open KNOWLEDGE SEARCH pane |
 | click | tool spoke | open TOOL CATALOG pane (server filter) |
-| click | mission thread | open MISSION DOSSIER pane (mission tracked) |
-| click | amber (gated) thread / rim tick | open AUTHORIZATIONS pane |
-| click | kernel core | open SIGNAL FEED pane (the system's own voice) |
+| click | mission bead/thread | open MISSION DOSSIER pane (mission tracked) |
+| click | amber (gated) bead / auth rim node | open AUTHORIZATIONS pane |
+| click | kernel core | open **DISCOVERY** pane (§2.4) |
 | hold ≥700ms | kernel core | **ceremony**: SYSTEM SNAPSHOT — one pane with the full count readout + link state + month tokens (an "all-clear sweep") |
-| click | empty stage | nothing (no accidental spawns); double-click empty stage → open task tray focus |
-| `T` | page | focus the task tray (then ←/→/Enter) |
-| Tab | page | canvas is one tab stop; then **↑/↓/←/→ walk strata/nodes** with the same reticle + labels; Enter = click. Full keyboard parity with cursor targeting. |
+| wheel | stage | **stratum shift**: down = deeper (older year), up = newer (§2.3) |
+| click / Enter | depth-gauge chip | shift to that stratum |
+| `[` `]` / PageDown PageUp | focused canvas | shift stratum deeper / newer |
+| click | empty stage | nothing (no accidental spawns) |
+| Tab | page | canvas is one tab stop; then **↑/↓/←/→ walk strata/nodes** (kernel → rings → auth rim → depth gauge) with the same reticle + labels; Enter = click. Full keyboard parity with cursor targeting. |
 
 ### 5.3 Reduced motion (`prefers-reduced-motion: reduce`)
 
 No RAF loop. The Construct renders **once per data/cursor change**: static diagram, no
-drift/pulse/flow; threads drawn solid; reticle/labels appear instantly; panes appear
-without entrance animation. Everything remains clickable and keyboard-walkable. (Gated
-threads still differ by *color + straightness*, never by motion alone.)
+drift/pulse/flow; the kernel lattice is a still pattern; threads drawn solid; stratum
+shifts are instant (no zoom ceremony); DISCOVERY's locate focuses the target directly
+(no homing animation); reticle/labels appear instantly; panes appear without entrance
+animation. Everything remains clickable and keyboard-walkable. (Gated threads still
+differ by *color + straightness*, never by motion alone.)
 
 ## 6. Architecture
 
 ```
 apps/web/src/nexus/
-  Nexus.tsx        page: stage, panes state, tray, auto-hail, persistence
-  Construct.tsx    canvas figure: layout pass, RAF painter, cursor, hit-test
-  TaskWindow.tsx   draggable translucent pane frame (rail, ⇱ − ✕, z-raise)
-  registry.tsx     task registry (table §4.2) + compact task bodies
-  useConstructData.ts  one hook: fetch + bus-refresh the figure's data snapshot
+  Nexus.tsx        page: stage, dock/pane state, strata state, discovery index,
+                   auto-hail cadence, tray, persistence
+  Construct.tsx    canvas figure: buildLayers, layout pass, RAF painter, stratum
+                   shift, pixel-wave kernel, homing beacon, cursor, hit-test
+  TaskWindow.tsx   docked translucent pane frame (rail, ⇥ ⇱ ✕, drag re-dock)
+  registry.tsx     task registry (table §4.2) + compact task bodies + NX contract
 ```
 
 - **Rendering**: Canvas 2D, single `<canvas>`, DPR-aware. Geometry computed each frame
@@ -277,8 +342,8 @@ apps/web/src/nexus/
 1. Pane resize handles? **Default: fixed widths per task (360–460px), body scrolls.**
 2. Should NEXUS become `ROLE_HOME` (landing view) for some roles? **Default: yes for
    member, others keep current homes.** Revisit after use.
-3. Construct zoom strata (wheel to dive into a ring as a full sub-instrument)? **Deferred
-   to P7 — the flat instrument must earn its keep first.**
+3. Construct zoom strata? **Shipped in v2 (§2.3)** — as time strata (one layer per
+   creation year) with a wheel/keys/gauge/DISCOVERY zoom ceremony, not per-ring dives.
 4. Multi-select threads (marquee) to open several dossiers? **Deferred.**
 5. Sound (event ticks)? **Out of scope — silent instrument.**
 
@@ -311,8 +376,10 @@ apps/web/src/nexus/
 - [ ] **P6 — Body completion.** Convert `jumpOnly` rows to live pane bodies (budgets,
   router, mcp.add, members, branding, audit, knowledge.ingest UI affordances beyond v0).
   One row per commit; registry row flips `jumpOnly: false`.
-- [ ] **P7 — Depth (optional).** Wheel-zoom strata dive; pane resize; marquee threads;
-  Construct-driven layout suggestions ("arrange panes around the working stratum").
+- [x] **P7 — v2 overhaul (this pass).** Time strata + zoom ceremony (§2.3); docked pane
+  flanks replacing free-floating panes (§4.1); auto-hail cadence for urgent/follow-up
+  + OPERATION LOG on action (§4.3); pixel-wave kernel + DISCOVERY (§2.4); shell runs
+  NEXUS solo (§3). Remaining P7 ideas (pane resize, marquee threads) stay open.
 
 **Resume protocol:** find the first unchecked phase above; its acceptance criteria are
 the definition of done; `apps/web/src/nexus/` + this doc are the only places state
@@ -320,6 +387,19 @@ lives. If code and doc disagree, the doc is intent, code is fact — reconcile a
 here.
 
 **Build log:**
+- 2026-07-08 · **v2 overhaul (P7)**: NEXUS runs solo (shell side/OPERATION panels hidden
+  on view 01 — their content became task panes); Construct stacked into year strata with
+  a zoom-shift ceremony, ghost rings, depth gauge, wheel/`[` `]`/PageUp/Down navigation,
+  neat evenly-spread ring arrangement, per-document knowledge nodes, mission bead ring;
+  kernel core replaced by a constant pixel-wave lattice whose click opens the new
+  DISCOVERY pane (stratum search with all-strata fallback, task-pane hits, homing-beacon
+  locate with kind-shaped reticles, strata steppers + year jump); panes dock to
+  left/right flanks (drag re-dock, ⇥/⇤, keyboard reorder, emptier-flank placement,
+  45%-panel translucency) with legacy x/y layouts migrated; auto-hail cadence (2.8s,
+  render-independent) hails pending authorizations then failed-mission dossiers once per
+  session; OPERATION LOG pane (tracked mission dossier + cancel/retry/explain)
+  auto-opens on launch/track; demo seeder backdates a slice of agents/workflows/docs/
+  missions across two prior years so the strata read; Playwright-verified end to end.
 - 2026-07-06 · P0–P5 landed in one pass (this commit): full spec; NEXUS view for all
   roles (palette + `1` shortcut + tray); 16-task registry (8 live bodies, 8 jumpOnly);
   draggable translucent panes with stack/raise/jump/minimize-free chrome, cascade

@@ -16,7 +16,7 @@ import {
 } from "../api.js";
 import { Command } from "../Command.js";
 import { SignalRadar, type SignalEntry } from "../Signal.js";
-import { TraceDossier } from "../Trace.js";
+import { TraceDossier, type StepTiming } from "../Trace.js";
 
 /**
  * NEXUS task registry (docs/NEXUS.md §4.2): the single source of truth for
@@ -26,6 +26,36 @@ import { TraceDossier } from "../Trace.js";
  */
 
 export const ROLE_RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
+
+/** The tracked operation, mirrored from the shell (formerly the OPERATION panel). */
+export interface OperationState {
+  mission: Mission | null;
+  steps: MissionStep[];
+  timing: Record<string, StepTiming>;
+  diagnosis: { summary: string; diagnosis: string } | null;
+}
+
+export type DiscoveryKind = "agent" | "workflow" | "doc" | "tool" | "mission" | "task";
+
+/** One searchable unit of the Construct (or a task pane) for DISCOVERY. */
+export interface DiscoveryItem {
+  kind: DiscoveryKind;
+  id: string;
+  label: string;
+  sub: string;
+  /** Stratum the unit lives on; absent for task panes (they are stratum-free). */
+  layerId?: string;
+}
+
+/** Controls the DISCOVERY pane exerts over the Construct, wired by Nexus. */
+export interface ConstructCtl {
+  layers: { id: string; year: number; count: number }[];
+  active: string;
+  setLayer: (id: string) => void;
+  step: (dir: 1 | -1) => void;
+  locate: (kind: Exclude<DiscoveryKind, "task">, id: string) => void;
+  items: DiscoveryItem[];
+}
 
 /** Everything a task body may need from the shell, injected by Nexus. */
 export interface NX {
@@ -38,10 +68,13 @@ export interface NX {
   signals: SignalEntry[];
   connected: boolean;
   rxTotal: number;
+  operation: OperationState;
   navigate: (view: string) => void;
   track: (missionId: string) => void;
   decide: (id: string, approved: boolean) => Promise<void>;
   openPane: (task: string, ctx?: Record<string, unknown>) => void;
+  closeTask: (task: string) => void;
+  construct: ConstructCtl;
   refreshAgents: () => void;
   refreshWorkflows: () => void;
 }
@@ -362,6 +395,153 @@ function SnapshotBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
   );
 }
 
+const LIVE_MISSION = new Set(["queued", "running", "awaiting_approval"]);
+
+/** The OPERATION panel reborn as a docked pane: the tracked mission's live dossier. */
+function OperationLogBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
+  const op = nx.operation;
+  const [diag, setDiag] = useState<{ summary: string; diagnosis: string } | null>(null);
+  useEffect(() => setDiag(null), [op.mission?.id]);
+  if (!op.mission) {
+    return <p className="dim pad">No operation tracked — launch a workflow or hail an agent and its log opens here.</p>;
+  }
+  const m = op.mission;
+  const live = LIVE_MISSION.has(m.status);
+  return (
+    <div className="nx-task-stack">
+      <div className="nx-task-row">
+        <span className={`mstatus st-${m.status}`}>{m.status.replace(/_/g, " ").toUpperCase()}</span>
+        {nx.canBuild && live && (
+          <Chip tiny tone="danger" onClick={() => api.cancelMission(m.id).then(() => nx.track(m.id)).catch(() => {})}>
+            ✕ CANCEL
+          </Chip>
+        )}
+        {nx.canBuild && ["failed", "cancelled"].includes(m.status) && (
+          <Chip tiny onClick={() => api.retryMission(m.id).then(() => nx.track(m.id)).catch(() => {})}>↻ RETRY</Chip>
+        )}
+        {nx.canBuild && m.status === "failed" && (
+          <Chip tiny onClick={() => api.explainMission(m.id).then(setDiag).catch(() => {})}>? EXPLAIN</Chip>
+        )}
+      </div>
+      {m.parentMissionId && (
+        <Chip tiny onClick={() => nx.track(m.parentMissionId!)}>↑ NESTED · VIEW PARENT</Chip>
+      )}
+      <div className="nx-dossier-well">
+        <TraceDossier mission={m} steps={op.steps} timing={op.timing} diagnosis={diag ?? op.diagnosis} />
+      </div>
+    </div>
+  );
+}
+
+const DISCO_GLYPH: Record<DiscoveryKind, string> = {
+  agent: "◉", workflow: "▤", doc: "⌕", tool: "⚙", mission: "≡", task: "❐",
+};
+
+/** The kernel's gateway: search every unit on the strata, jump between layers. */
+function DiscoveryBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
+  const c = nx.construct;
+  const [q, setQ] = useState("");
+  const [scope, setScope] = useState<"layer" | "all">("layer");
+  const [sel, setSel] = useState(0);
+  const [jump, setJump] = useState("");
+
+  const pool = useMemo(
+    () => (scope === "layer" ? c.items.filter((i) => !i.layerId || i.layerId === c.active) : c.items),
+    [c.items, c.active, scope],
+  );
+  const needle = q.trim().toLowerCase();
+  const hits = useMemo(() => {
+    const match = (arr: DiscoveryItem[]) =>
+      needle ? arr.filter((i) => `${i.label} ${i.sub} ${i.kind}`.toLowerCase().includes(needle)) : arr;
+    let found = match(pool);
+    // nothing on the active stratum → widen to every stratum (hits carry a ⇢ year tag)
+    if (needle && found.length === 0 && scope === "layer") found = match(c.items);
+    return found.slice(0, 24);
+  }, [pool, needle, scope, c.items]);
+  useEffect(() => setSel(0), [needle, scope, c.active]);
+
+  const choose = (h: DiscoveryItem) => {
+    nx.closeTask("construct.discovery");
+    if (h.kind === "task") {
+      nx.openPane(h.id);
+      return;
+    }
+    if (h.layerId && h.layerId !== c.active) c.setLayer(h.layerId);
+    c.locate(h.kind, h.id);
+  };
+
+  const goJump = () => {
+    const id = jump.trim();
+    if (!id) return;
+    const hit = c.layers.find((l) => l.id === id || String(l.year) === id);
+    if (hit) {
+      c.setLayer(hit.id);
+      setJump("");
+    }
+  };
+
+  return (
+    <div className="nx-task-stack">
+      <div className="nx-task-row">
+        <input
+          className="text-input grow-input"
+          placeholder="Search the construct…"
+          value={q}
+          autoFocus
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") setSel((s) => Math.min(s + 1, hits.length - 1));
+            else if (e.key === "ArrowUp") setSel((s) => Math.max(s - 1, 0));
+            else if (e.key === "Enter" && hits[sel]) choose(hits[sel]!);
+            else return;
+            e.preventDefault();
+          }}
+          aria-label="Search the construct"
+        />
+        <Chip tiny tone={scope === "layer" ? "accent" : undefined} onClick={() => setScope((s) => (s === "layer" ? "all" : "layer"))}>
+          {scope === "layer" ? `STRATUM ${c.active}` : "ALL STRATA"}
+        </Chip>
+      </div>
+      <ul className="nx-disco-list nx-scroll" role="listbox" aria-label="Discovery results">
+        {hits.map((h, i) => (
+          <li key={`${h.kind}:${h.id}`} role="option" aria-selected={i === sel}>
+            <button className={`nx-disco-hit ${i === sel ? "sel" : ""}`} onClick={() => choose(h)} onPointerEnter={() => setSel(i)}>
+              <span className="nx-disco-glyph">{DISCO_GLYPH[h.kind]}</span>
+              <span className="nx-disco-label">{h.label}</span>
+              <span className="nx-disco-sub">
+                {h.sub}
+                {h.layerId && h.layerId !== c.active ? ` · ⇢ ${h.layerId}` : ""}
+              </span>
+            </button>
+          </li>
+        ))}
+        {hits.length === 0 && <li className="dim pad">Nothing matches on {scope === "layer" ? `stratum ${c.active}` : "any stratum"}.</li>}
+      </ul>
+      <div className="nx-disco-nav">
+        <span className="tag-lo">STRATA //</span>
+        <Chip tiny onClick={() => c.step(-1)} disabled={c.layers[0]?.id === c.active}>‹ DEEPER</Chip>
+        {c.layers.map((l) => (
+          <Chip key={l.id} tiny tone={l.id === c.active ? "accent" : undefined} onClick={() => c.setLayer(l.id)}>
+            {l.id}
+          </Chip>
+        ))}
+        <Chip tiny onClick={() => c.step(1)} disabled={c.layers[c.layers.length - 1]?.id === c.active}>NEWER ›</Chip>
+      </div>
+      <div className="nx-task-row">
+        <input
+          className="text-input grow-input"
+          placeholder="Jump to stratum (year or id)…"
+          value={jump}
+          onChange={(e) => setJump(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && goJump()}
+          aria-label="Jump to stratum"
+        />
+        <Chip tiny onClick={goJump}>GO</Chip>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------- registry */
 
 export const TASKS: TaskDef[] = [
@@ -373,6 +553,8 @@ export const TASKS: TaskDef[] = [
   { id: "tools.catalog", glyph: "⚙", title: "TOOL CATALOG", category: "OBSERVE", minRole: "member", jumpView: "tools", width: 400, body: ToolCatalogBody },
   { id: "template.use", glyph: "▤", title: "TEMPLATES", category: "BUILD", minRole: "member", jumpView: "templates", width: 400, body: TemplatesBody },
   { id: "signal.feed", glyph: "⊚", title: "SIGNAL FEED", category: "OBSERVE", minRole: "member", jumpView: null, width: 360, body: SignalFeedBody },
+  { id: "operation.log", glyph: "⌖", title: "OPERATION LOG", category: "OBSERVE", minRole: "member", jumpView: "missions", width: 396, body: OperationLogBody },
+  { id: "construct.discovery", glyph: "◈", title: "DISCOVERY", category: "OPERATE", minRole: "member", jumpView: null, width: 396, body: DiscoveryBody },
   { id: "system.snapshot", glyph: "⏣", title: "SYSTEM SNAPSHOT", category: "OBSERVE", minRole: "member", jumpView: null, width: 340, hidden: true, body: SnapshotBody },
   // P6: convert these to live pane bodies, one row per commit (docs/NEXUS.md §10).
   { id: "workshop", glyph: "⚒", title: "WORKSHOP", category: "BUILD", minRole: "member", jumpView: "workshop", jumpOnly: true },

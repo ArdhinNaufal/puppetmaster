@@ -332,9 +332,10 @@ export interface PanelLayout {
   collapsed?: Record<string, boolean>;
 }
 
-/** NEXUS pane arrangement (docs/NEXUS.md §4.4). */
+/** NEXUS pane arrangement (docs/NEXUS.md §4.4). Panes dock to a flank;
+ *  `x`/`y` survive only to migrate pre-dock layouts on restore. */
 export interface NexusLayout {
-  panes?: { task: string; x: number; y: number; ctx?: Record<string, unknown>; z?: number }[];
+  panes?: { task: string; side?: "left" | "right"; x?: number; y?: number; ctx?: Record<string, unknown>; z?: number }[];
 }
 
 /** PROCESS WATCH strip state (docs/PROCESS-WATCH.md). */

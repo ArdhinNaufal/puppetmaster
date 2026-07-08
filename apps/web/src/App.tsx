@@ -594,6 +594,9 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   };
 
   const missionLive = mission !== null && ["queued", "running", "awaiting_approval"].includes(mission.status);
+  // NEXUS is the whole theater: the shell's side/operation panels give way to
+  // the stage — their content lives on as docked task panes (docs/NEXUS.md §3).
+  const nexusSolo = view === "nexus";
 
   return (
     <div className="app">
@@ -619,10 +622,12 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </span>
       </header>
 
-      <div className={`grid ${collapsed.trace ? "no-trace" : ""}`}>
-        <aside className="panel side">
-          {panelOrder.map((id) => sections[id]?.() ?? null)}
-        </aside>
+      <div className={`grid ${nexusSolo ? "nx-solo" : collapsed.trace ? "no-trace" : ""}`}>
+        {!nexusSolo && (
+          <aside className="panel side">
+            {panelOrder.map((id) => sections[id]?.() ?? null)}
+          </aside>
+        )}
 
         <main className="panel canvas-panel">
           <div className="stage-head">
@@ -647,6 +652,12 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                   signals,
                   connected,
                   rxTotal,
+                  operation: {
+                    mission,
+                    steps,
+                    timing: mission ? timingRef.current[mission.id] ?? {} : {},
+                    diagnosis,
+                  },
                   navigate: (v) => setView(v as View),
                   track,
                   decide,
@@ -707,6 +718,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           </div>
         </main>
 
+        {!nexusSolo && (
         <aside className="panel trace">
           <div className="panel-head">
             <span><span className="ph-idx">OP</span>{collapsed.trace ? "TRACE" : "OPERATION"}</span>
@@ -768,6 +780,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             </>
           )}
         </aside>
+        )}
       </div>
 
       <Watch view={view} vitals={vitals} rows={procRows} open={watchOpen} onToggle={() => setWatchOpen((o) => !o)} />

@@ -3,11 +3,15 @@ import type { Agent, Approval, Mission } from "../api.js";
 import type { SignalEntry } from "../Signal.js";
 
 /**
- * The Construct (docs/NEXUS.md §2): Puppetmaster's avatar — an armillary
- * instrument whose every stratum is a real readout. Canvas 2D, one layout
- * pass per frame shared by the painter, the hit-tester and the keyboard
- * walker. All motion is state — idle is calm; reduced motion renders a
- * static, fully interactive diagram.
+ * The Construct v2 (docs/NEXUS.md §2): Puppetmaster's avatar — an armillary
+ * instrument stacked in time. Everything the system has grown is grouped into
+ * strata (one layer per creation year); each stratum is a neatly-arranged
+ * radial diagram, and the operator dives between strata with a zoom ceremony
+ * (wheel, [ ] keys, the depth gauge, or DISCOVERY). The kernel core is a
+ * constant pixel wave; clicking it opens the DISCOVERY pane. Canvas 2D, one
+ * layout pass per frame shared by the painter, the hit-tester and the
+ * keyboard walker. Reduced motion renders a static, fully interactive
+ * diagram with instant stratum shifts.
  */
 
 export interface ConstructWorkflow {
@@ -16,12 +20,20 @@ export interface ConstructWorkflow {
   currentVersion: number;
   /** True node count from the stored graph; null until fetched. */
   nodeCount: number | null;
+  createdAt: string;
+}
+
+export interface ConstructDoc {
+  id: string;
+  title: string;
+  chunkCount: number;
+  createdAt: string;
 }
 
 export interface ConstructData {
   agents: Agent[];
   workflows: ConstructWorkflow[];
-  docs: { id: string; chunkCount: number }[];
+  docs: ConstructDoc[];
   toolServers: { server: string; tools: number }[];
   missions: Mission[];
   approvals: Approval[];
@@ -30,16 +42,68 @@ export interface ConstructData {
   rxTotal: number;
 }
 
+/** One stratum of the instrument: everything created in one year. */
+export interface ConstructLayer {
+  id: string;
+  year: number;
+  agents: Agent[];
+  workflows: ConstructWorkflow[];
+  docs: ConstructDoc[];
+  toolServers: { server: string; tools: number }[];
+  missions: Mission[];
+  count: number;
+}
+
+export type LocateKind = "agent" | "workflow" | "doc" | "tool" | "mission";
+
+/** Imperative surface the DISCOVERY pane drives (via Nexus). */
+export interface ConstructApi {
+  locate: (kind: LocateKind, id: string) => void;
+}
+
+/** Group the whole data snapshot into year strata (oldest → newest). */
+export function buildLayers(d: ConstructData): ConstructLayer[] {
+  const thisYear = new Date().getFullYear();
+  const yearOf = (iso: string | null | undefined): number => {
+    const y = iso ? new Date(iso).getFullYear() : NaN;
+    return Number.isFinite(y) && y > 1990 && y <= thisYear + 1 ? y : thisYear;
+  };
+  const map = new Map<number, ConstructLayer>();
+  const at = (y: number): ConstructLayer => {
+    let l = map.get(y);
+    if (!l) {
+      l = { id: String(y), year: y, agents: [], workflows: [], docs: [], toolServers: [], missions: [], count: 0 };
+      map.set(y, l);
+    }
+    return l;
+  };
+  d.agents.forEach((a) => at(yearOf(a.createdAt)).agents.push(a));
+  d.workflows.forEach((w) => at(yearOf(w.createdAt)).workflows.push(w));
+  d.docs.forEach((doc) => at(yearOf(doc.createdAt)).docs.push(doc));
+  d.missions.forEach((m) => at(yearOf(m.createdAt)).missions.push(m));
+  at(thisYear); // the present stratum always exists…
+  const newest = Math.max(...map.keys());
+  at(newest).toolServers = d.toolServers; // …tool namespaces have no birthday; they live on the newest stratum
+  const layers = [...map.values()].sort((a, b) => a.year - b.year);
+  for (const l of layers) {
+    l.count = l.agents.length + l.workflows.length + l.docs.length + l.toolServers.length + l.missions.length;
+  }
+  return layers;
+}
+
 interface CNode {
-  kind: "kernel" | "agent" | "workflow" | "knowledge" | "spoke" | "thread" | "authrim";
+  kind: "kernel" | "agent" | "workflow" | "knowledge" | "spoke" | "thread" | "authrim" | "layer";
   id: string;
   x: number;
   y: number;
+  /** Bearing (rad) for ring nodes; 0 for kernel / depth-gauge chips. */
+  a: number;
   hit: number; // hit radius
   label: string;
   sub: string;
   active?: boolean;
   gated?: boolean;
+  failed?: boolean;
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -49,7 +113,6 @@ function hash(s: string): number {
   for (let i = 0; i < s.length; i++) h = ((h ^ s.charCodeAt(i)) * 16777619) >>> 0;
   return h;
 }
-const bearing = (id: string, phase = 0) => ((hash(id) % 3600) / 3600) * Math.PI * 2 + phase;
 
 /** Deterministic PRNG for knowledge particles (seeded by doc id). */
 function mulberry(seed: number) {
@@ -77,24 +140,55 @@ function poly(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, n:
 
 const AUTONOMY_TICKS: Record<string, number> = { read_auto: 1, write_approved: 2, destructive_confirmed: 3 };
 const LIVE_STATUS = new Set(["running", "awaiting_approval", "queued"]);
+/** Display caps per stratum ring (search sees everything; the figure stays legible). */
+const CAP = { agents: 24, workflows: 20, docs: 22, tools: 14, missions: 14 };
+const NODE_KIND_FOR: Record<LocateKind, CNode["kind"]> = {
+  agent: "agent",
+  workflow: "workflow",
+  doc: "knowledge",
+  tool: "spoke",
+  mission: "thread",
+};
+
+interface Palette {
+  accent: string;
+  stroke: string;
+  strokeHi: string;
+  warn: string;
+  danger: string;
+  ok: string;
+  hi: string;
+  lo: string;
+}
 
 /* ---------------------------------------------------------------- component */
 
 export function Construct(props: {
   data: ConstructData;
+  layers: ConstructLayer[];
+  active: string;
+  onLayerChange: (id: string) => void;
   onOpen: (task: string, ctx?: Record<string, unknown>) => void;
+  apiRef?: { current: ConstructApi | null };
   reducedMotion: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const dataRef = useRef(props.data);
   dataRef.current = props.data;
+  const layersRef = useRef(props.layers);
+  layersRef.current = props.layers;
+  const activeRef = useRef(props.active);
+  activeRef.current = props.active;
   const onOpenRef = useRef(props.onOpen);
   onOpenRef.current = props.onOpen;
+  const onLayerRef = useRef(props.onLayerChange);
+  onLayerRef.current = props.onLayerChange;
+  const reducedRef = useRef(props.reducedMotion);
+  reducedRef.current = props.reducedMotion;
 
   const cursor = useRef({ x: 0, y: 0, inside: false });
   const tilt = useRef({ x: 0, y: 0, vx: 0, vy: 0 });
-  const gaze = useRef(0);
   const nodesRef = useRef<CNode[]>([]);
   const focusRef = useRef<{ node: CNode; since: number; keyboard: boolean } | null>(null);
   const pulses = useRef<{ t0: number; tone: string; alarm: boolean }[]>([]);
@@ -103,6 +197,12 @@ export function Construct(props: {
   const pressed = useRef<{ node: CNode | null; t0: number; fired: boolean } | null>(null);
   const size = useRef({ w: 0, h: 0, dpr: 1 });
   const renderRequested = useRef(false);
+  /** Stratum shift in flight: dir 1 = diving deeper (older year), -1 = surfacing. */
+  const trans = useRef<{ from: string; to: string; t0: number; dir: 1 | -1 } | null>(null);
+  /** Homing beacon from DISCOVERY: waits out any stratum shift, then converges. */
+  const locate = useRef<{ kind: CNode["kind"]; id: string; t0: number; until: number } | null>(null);
+  const pixels = useRef<{ dx: number; dy: number; d: number }[]>([]);
+  const wheelAcc = useRef(0);
   const [announce, setAnnounce] = useState("");
 
   // Bus events → kernel pulses (flash-settle; alarms on failures).
@@ -118,21 +218,85 @@ export function Construct(props: {
     }
   }, [props.data.signals]);
 
+  /* ---- targeting ------------------------------------------------------------ */
+  const findNode = useCallback((x: number, y: number): CNode | null => {
+    let best: CNode | null = null;
+    let bd = 48;
+    for (const n of nodesRef.current) {
+      const dist = Math.hypot(n.x - x, n.y - y) - (n.kind === "kernel" ? n.hit : 0);
+      if (dist < bd) {
+        bd = dist;
+        best = n;
+      }
+    }
+    return best;
+  }, []);
+
+  const setFocus = useCallback((node: CNode | null, keyboard: boolean) => {
+    const cur = focusRef.current;
+    if (node === null) {
+      focusRef.current = null;
+      if (cur) setAnnounce("");
+    } else if (!cur || cur.node.id !== node.id || cur.node.kind !== node.kind) {
+      focusRef.current = { node, since: performance.now(), keyboard };
+      setAnnounce(`${node.label} — ${node.sub}`);
+    }
+    const canvas = canvasRef.current;
+    if (canvas) canvas.style.cursor = node ? "pointer" : "default";
+  }, []);
+
+  const stepLayer = useCallback((dir: 1 | -1) => {
+    const ls = layersRef.current;
+    const i = ls.findIndex((l) => l.id === activeRef.current);
+    const next = ls[i + dir];
+    if (next) onLayerRef.current(next.id);
+  }, []);
+
+  const activate = useCallback((n: CNode) => {
+    switch (n.kind) {
+      case "kernel":
+        onOpenRef.current("construct.discovery");
+        break;
+      case "agent":
+        onOpenRef.current("agent.channel", { agentId: n.id });
+        break;
+      case "workflow":
+        onOpenRef.current("workflow.run", { workflowId: n.id });
+        break;
+      case "knowledge":
+        onOpenRef.current("knowledge.search", { docId: n.id });
+        break;
+      case "spoke":
+        onOpenRef.current("tools.catalog", { server: n.id });
+        break;
+      case "thread":
+        onOpenRef.current(n.gated ? "authorizations" : "mission.dossier", { missionId: n.id });
+        break;
+      case "authrim":
+        onOpenRef.current("authorizations");
+        break;
+      case "layer":
+        onLayerRef.current(n.id);
+        break;
+    }
+  }, []);
+
   /* ---- layout pass: one node table shared by painter/hits/keyboard ------- */
-  const layout = useCallback((): CNode[] => {
-    const d = dataRef.current;
+  const baseR = () => Math.max(120, Math.min(size.current.w, size.current.h) / 2 - 36);
+
+  /** Ring nodes for one stratum, neatly spread on their orbits. */
+  const layoutLayer = useCallback((layer: ConstructLayer, scale: number, interactive: boolean): CNode[] => {
     const { w, h } = size.current;
     const cx = w / 2;
     const cy = h / 2;
-    const R = Math.max(120, Math.min(w, h) / 2 - 36);
-    const tx = tilt.current.x;
-    const ty = tilt.current.y;
-    const strata = (r: number) => 0.012 * (r / R) * 14; // px offset factor per stratum
+    const R = baseR() * scale;
+    const tx = interactive ? tilt.current.x : 0;
+    const ty = interactive ? tilt.current.y : 0;
     const place = (r: number, a: number): { x: number; y: number } => {
-      let x = cx + r * Math.cos(a) - tx * strata(r) * 14;
-      let y = cy + r * Math.sin(a) - ty * strata(r) * 14;
+      let x = cx + r * Math.cos(a) - tx * (r / R) * 2.35;
+      let y = cy + r * Math.sin(a) - ty * (r / R) * 2.35;
       // proximity ripple: strata bow away from the operator's hand
-      if (cursor.current.inside) {
+      if (interactive && cursor.current.inside) {
         const dx = x - cursor.current.x;
         const dy = y - cursor.current.y;
         const dist = Math.hypot(dx, dy);
@@ -144,63 +308,328 @@ export function Construct(props: {
       }
       return { x, y };
     };
+    const spread = (i: number, n: number, offset = 0) => -Math.PI / 2 + ((i + offset) / Math.max(n, 1)) * Math.PI * 2;
 
+    const d = dataRef.current;
+    const activeSubjects = new Set(d.signals.filter((s) => Date.now() - s.at < 20_000).map((s) => s.subject));
     const nodes: CNode[] = [];
-    nodes.push({ kind: "kernel", id: "kernel", x: cx, y: cy, hit: R * 0.15, label: "KERNEL", sub: "CLICK · SIGNAL FEED — HOLD · SNAPSHOT" });
 
-    const activeSubjects = new Set(
-      d.signals.filter((s) => Date.now() - s.at < 20_000).map((s) => s.subject),
-    );
-    d.agents.forEach((a) => {
-      const p = place(R * 0.42, bearing(a.id, 0.35));
+    const ags = layer.agents.slice(0, CAP.agents);
+    ags.forEach((ag, i) => {
+      const a = spread(i, ags.length);
+      const p = place(R * 0.42, a);
       nodes.push({
-        kind: "agent", id: a.id, x: p.x, y: p.y, hit: 16,
-        label: a.name.toUpperCase(), sub: `${a.model.toUpperCase()} · OPEN CHANNEL`,
-        active: activeSubjects.has(a.id),
+        kind: "agent", id: ag.id, x: p.x, y: p.y, a, hit: 16,
+        label: ag.name.toUpperCase(), sub: `${ag.model.toUpperCase()} · OPEN CHANNEL`,
+        active: activeSubjects.has(ag.id),
       });
     });
-    d.workflows.forEach((wf) => {
-      const p = place(R * 0.6, bearing(wf.id, 1.15));
+
+    const live = layer.missions.filter((m) => LIVE_STATUS.has(m.status));
+    const rest = layer.missions.filter((m) => !LIVE_STATUS.has(m.status));
+    const ms = [...live, ...rest].slice(0, CAP.missions);
+    ms.forEach((m, i) => {
+      const a = spread(i, ms.length, 0.5);
+      const p = place(R * 0.52, a);
       nodes.push({
-        kind: "workflow", id: wf.id, x: p.x, y: p.y, hit: 15,
-        label: wf.name.toUpperCase(), sub: `v${wf.currentVersion}${wf.nodeCount ? ` · ${wf.nodeCount} NODES` : ""} · RUN`,
+        kind: "thread", id: m.id, x: p.x, y: p.y, a, hit: 14,
+        label: `OP ${m.id.slice(0, 8)}`,
+        sub: `${m.status.replace(/_/g, " ").toUpperCase()} · DOSSIER`,
+        active: LIVE_STATUS.has(m.status),
+        gated: m.status === "awaiting_approval",
+        failed: m.status === "failed",
       });
     });
-    {
-      const p = place(R * 0.74, -Math.PI / 2);
-      const chunks = d.docs.reduce((n, doc) => n + doc.chunkCount, 0);
+
+    const wfs = layer.workflows.slice(0, CAP.workflows);
+    wfs.forEach((wf, i) => {
+      const a = spread(i, wfs.length);
+      const p = place(R * 0.63, a);
       nodes.push({
-        kind: "knowledge", id: "kb", x: p.x, y: p.y, hit: 18,
-        label: "KNOWLEDGE SHELL", sub: `${d.docs.length} DOCS · ${chunks} CHUNKS · SEARCH`,
+        kind: "workflow", id: wf.id, x: p.x, y: p.y, a, hit: 15,
+        label: wf.name.toUpperCase(),
+        sub: `v${wf.currentVersion}${wf.nodeCount ? ` · ${wf.nodeCount} NODES` : ""} · RUN`,
       });
-    }
-    d.toolServers.forEach((srv) => {
-      const p = place(R * 0.86, bearing(srv.server, 2.1));
+    });
+
+    const docs = layer.docs.slice(0, CAP.docs);
+    docs.forEach((doc, i) => {
+      const a = spread(i, docs.length, 0.5);
+      const p = place(R * 0.76, a);
       nodes.push({
-        kind: "spoke", id: srv.server, x: p.x, y: p.y, hit: 15,
+        kind: "knowledge", id: doc.id, x: p.x, y: p.y, a, hit: 13,
+        label: doc.title.toUpperCase().slice(0, 26),
+        sub: `${doc.chunkCount} CHUNKS · SEARCH`,
+      });
+    });
+
+    const srvs = layer.toolServers.slice(0, CAP.tools);
+    srvs.forEach((srv, i) => {
+      const a = spread(i, srvs.length);
+      const p = place(R * 0.88, a);
+      nodes.push({
+        kind: "spoke", id: srv.server, x: p.x, y: p.y, a, hit: 15,
         label: srv.server.toUpperCase(), sub: `${srv.tools} TOOLS · CATALOG`,
       });
     });
-    d.missions.filter((m) => LIVE_STATUS.has(m.status)).slice(0, 12).forEach((m) => {
-      const a = bearing(m.id, 4.2);
-      const mid = place(R * 0.5, a);
-      nodes.push({
-        kind: "thread", id: m.id, x: mid.x, y: mid.y, hit: 14,
-        label: `OP ${m.id.slice(0, 8)}`, sub: `${m.status.replace(/_/g, " ").toUpperCase()} · DOSSIER`,
-        gated: m.status === "awaiting_approval",
-      });
-    });
-    if (d.approvals.length > 0) {
-      const p = place(R * 0.98, bearing(d.approvals[0]!.id, 0));
-      nodes.push({
-        kind: "authrim", id: "auth", x: p.x, y: p.y, hit: 16,
-        label: "AUTHORIZATIONS", sub: `${d.approvals.length} PENDING · DECIDE`, gated: true,
-      });
-    }
+
     return nodes;
   }, []);
 
+  /** Kernel, authorization rim node and the depth gauge — stratum-independent. */
+  const layoutChrome = useCallback((): { kernel: CNode; rest: CNode[] } => {
+    const { w, h } = size.current;
+    const cx = w / 2;
+    const cy = h / 2;
+    const R = baseR();
+    const d = dataRef.current;
+    const kernel: CNode = {
+      kind: "kernel", id: "kernel", x: cx, y: cy, a: 0, hit: R * 0.15,
+      label: "KERNEL", sub: "CLICK · DISCOVERY — HOLD · SNAPSHOT",
+    };
+    const rest: CNode[] = [];
+    if (d.approvals.length > 0) {
+      const a = -Math.PI / 3;
+      rest.push({
+        kind: "authrim", id: "auth", x: cx + R * 0.98 * Math.cos(a), y: cy + R * 0.98 * Math.sin(a), a, hit: 16,
+        label: "AUTHORIZATIONS", sub: `${d.approvals.length} PENDING · DECIDE`, gated: true,
+      });
+    }
+    const ls = layersRef.current;
+    const chipW = 62;
+    const x0 = cx - ((ls.length - 1) * chipW) / 2;
+    ls.forEach((l, i) => {
+      rest.push({
+        kind: "layer", id: l.id, x: x0 + i * chipW, y: h - 26, a: 0, hit: 15,
+        label: l.id, sub: `STRATUM · ${l.count} UNITS · ENTER TO SHIFT`,
+        active: l.id === activeRef.current,
+      });
+    });
+    return { kernel, rest };
+  }, []);
+
   /* ---- painter ------------------------------------------------------------ */
+
+  /** Faint concentric echo of an adjacent stratum (above or below the active one). */
+  const paintGhost = (ctx: CanvasRenderingContext2D, scale: number, alpha: number, C: Palette) => {
+    const { w, h } = size.current;
+    const cx = w / 2;
+    const cy = h / 2;
+    const R = baseR() * scale;
+    ctx.strokeStyle = C.stroke;
+    ctx.globalAlpha = alpha;
+    for (const r of [0.3, 0.52, 0.8]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, R * r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  };
+
+  /** Paint one stratum at a zoom scale; returns its node table (for hits). */
+  const paintLayer = useCallback((
+    ctx: CanvasRenderingContext2D,
+    layer: ConstructLayer,
+    scale: number,
+    A: number,
+    interactive: boolean,
+    time: number,
+    C: Palette,
+    motion: boolean,
+  ): CNode[] => {
+    const { w, h } = size.current;
+    const cx = w / 2;
+    const cy = h / 2;
+    const R = baseR() * scale;
+    const nodes = layoutLayer(layer, scale, interactive);
+    const focus = interactive ? focusRef.current : null;
+    const al = (v: number) => {
+      ctx.globalAlpha = Math.max(0, Math.min(1, v * A));
+    };
+
+    // --- schema graticule ---------------------------------------------------
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = C.stroke;
+    al(1);
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.3, 0.4, Math.PI * 2 - 0.6);
+    ctx.stroke();
+    al(0.7);
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.52, 0, Math.PI * 2);
+    ctx.stroke();
+    al(1);
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.8, 0, Math.PI * 2);
+    ctx.stroke();
+    for (let deg = 0; deg < 360; deg += 15) {
+      const a = (deg * Math.PI) / 180;
+      const len = deg % 45 === 0 ? 7 : 4;
+      ctx.beginPath();
+      ctx.moveTo(cx + (R * 0.8 - len) * Math.cos(a), cy + (R * 0.8 - len) * Math.sin(a));
+      ctx.lineTo(cx + R * 0.8 * Math.cos(a), cy + R * 0.8 * Math.sin(a));
+      ctx.stroke();
+    }
+    // orbit guides only where the stratum has content
+    const guides: [number, boolean][] = [
+      [0.42, layer.agents.length > 0],
+      [0.63, layer.workflows.length > 0],
+      [0.76, layer.docs.length > 0],
+      [0.88, layer.toolServers.length > 0],
+    ];
+    for (const [r, on] of guides) {
+      if (!on) continue;
+      al(0.55);
+      ctx.beginPath();
+      ctx.arc(cx, cy, R * r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // --- knowledge particles (density is the readout; clustered per doc) -----
+    let particles = 0;
+    for (const n of nodes) {
+      if (n.kind !== "knowledge" || particles >= 240) continue;
+      const doc = layer.docs.find((x) => x.id === n.id);
+      if (!doc) continue;
+      const rng = mulberry(hash(doc.id));
+      const count = Math.min(doc.chunkCount, 26, 240 - particles);
+      for (let i = 0; i < count; i++) {
+        const a = n.a + (rng() - 0.5) * 0.5;
+        const r = R * (0.73 + rng() * 0.06);
+        ctx.fillStyle = C.accent;
+        al(0.16 + rng() * 0.3);
+        ctx.fillRect(cx + r * Math.cos(a), cy + r * Math.sin(a), 1.4, 1.4);
+        particles++;
+      }
+      al(0.8);
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 1.9, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- mission threads (the puppet strings; beads for the settled ones) ----
+    for (const n of nodes) {
+      if (n.kind !== "thread") continue;
+      const focused = focus?.node.id === n.id;
+      if (n.active) {
+        const x1 = cx + R * 0.16 * Math.cos(n.a);
+        const y1 = cy + R * 0.16 * Math.sin(n.a);
+        const x2 = cx + R * 0.93 * Math.cos(n.a);
+        const y2 = cy + R * 0.93 * Math.sin(n.a);
+        ctx.strokeStyle = n.gated ? C.warn : C.accent;
+        al(focused ? 1 : 0.75);
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        if (n.gated) {
+          const vib = motion ? Math.sin(time * 30 + n.a) * 1.2 : 0;
+          const px = -Math.sin(n.a) * vib;
+          const py = Math.cos(n.a) * vib;
+          ctx.moveTo(x1 + px, y1 + py);
+          ctx.lineTo(x2 + px, y2 + py);
+        } else {
+          const slack = R * 0.1;
+          const mx = (x1 + x2) / 2 - Math.sin(n.a) * slack;
+          const my = (y1 + y2) / 2 + Math.cos(n.a) * slack;
+          ctx.setLineDash([5, 4]);
+          ctx.lineDashOffset = motion ? -((time * 22) % 9) : 0;
+          ctx.moveTo(x1, y1);
+          ctx.quadraticCurveTo(mx, my, x2, y2);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.lineWidth = 1;
+      }
+      // grip bead: the clickable handle for the dossier
+      ctx.fillStyle = n.gated ? C.warn : n.failed ? C.danger : n.active ? C.accent : C.lo;
+      al(n.active ? 1 : 0.65);
+      ctx.save();
+      ctx.translate(n.x, n.y);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillRect(-2.5, -2.5, 5, 5);
+      ctx.restore();
+    }
+
+    // --- tool spokes -----------------------------------------------------------
+    for (const n of nodes) {
+      if (n.kind !== "spoke") continue;
+      const srv = layer.toolServers.find((s) => s.server === n.id);
+      ctx.strokeStyle = C.strokeHi;
+      al(1);
+      ctx.beginPath();
+      ctx.moveTo(cx + R * 0.84 * Math.cos(n.a), cy + R * 0.84 * Math.sin(n.a));
+      ctx.lineTo(cx + R * 0.92 * Math.cos(n.a), cy + R * 0.92 * Math.sin(n.a));
+      ctx.stroke();
+      const ticks = Math.min(srv?.tools ?? 0, 12);
+      for (let i = 0; i < ticks; i++) {
+        const r = R * (0.84 + (0.08 * (i + 0.5)) / ticks);
+        const px = cx + r * Math.cos(n.a);
+        const py = cy + r * Math.sin(n.a);
+        ctx.beginPath();
+        ctx.moveTo(px - Math.sin(n.a) * 3, py + Math.cos(n.a) * 3);
+        ctx.lineTo(px + Math.sin(n.a) * 3, py - Math.cos(n.a) * 3);
+        ctx.stroke();
+      }
+    }
+
+    // --- workflow lattice -------------------------------------------------------
+    for (const n of nodes) {
+      if (n.kind !== "workflow") continue;
+      const wf = layer.workflows.find((x) => x.id === n.id);
+      ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
+      al(1);
+      ctx.save();
+      ctx.translate(n.x, n.y);
+      ctx.rotate(Math.PI / 4);
+      ctx.strokeRect(-5, -5, 10, 10);
+      ctx.restore();
+      if (wf?.nodeCount && wf.nodeCount >= 3) {
+        ctx.strokeStyle = C.accent;
+        al(0.8);
+        poly(ctx, n.x, n.y, 3.2, Math.min(wf.nodeCount, 12), motion ? time * 0.2 : 0);
+      }
+    }
+
+    // --- agent orbit ----------------------------------------------------------
+    for (const n of nodes) {
+      if (n.kind !== "agent") continue;
+      const ag = layer.agents.find((a) => a.id === n.id);
+      const hot = n.active && motion;
+      ctx.strokeStyle = n.active || focus?.node.id === n.id ? C.accent : C.strokeHi;
+      al(1);
+      if (hot && interactive) {
+        ctx.shadowColor = C.accent;
+        ctx.shadowBlur = 8;
+      }
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 4.5, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = n.active ? C.accent : C.lo;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      const ticks = AUTONOMY_TICKS[ag?.autonomy ?? ""] ?? 1;
+      ctx.strokeStyle = C.lo;
+      for (let i = 0; i < ticks; i++) {
+        const off = (i - (ticks - 1) / 2) * 4;
+        ctx.beginPath();
+        ctx.moveTo(n.x + off, n.y - 8);
+        ctx.lineTo(n.x + off, n.y - 11);
+        ctx.stroke();
+      }
+      if (hot) {
+        const oa = time * 2.4 + (hash(n.id) % 7);
+        ctx.fillStyle = C.accent;
+        ctx.beginPath();
+        ctx.arc(n.x + 8 * Math.cos(oa), n.y + 8 * Math.sin(oa), 1.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    ctx.globalAlpha = 1;
+    return nodes;
+  }, [layoutLayer]);
+
   const paint = useCallback((t: number) => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
@@ -209,7 +638,7 @@ export function Construct(props: {
     const { w, h, dpr } = size.current;
     if (w === 0 || h === 0) return;
     const css = getComputedStyle(canvas);
-    const C = {
+    const C: Palette = {
       accent: css.getPropertyValue("--accent").trim() || "#45d6e6",
       stroke: css.getPropertyValue("--stroke").trim() || "#1c2c34",
       strokeHi: css.getPropertyValue("--stroke-hi").trim() || "#2c424d",
@@ -222,233 +651,72 @@ export function Construct(props: {
     const dormant = !d.connected;
     const running = d.missions.filter((m) => m.status === "running").length;
     const gated = d.approvals.length > 0;
-    const motion = !props.reducedMotion && !dormant;
+    const motion = !reducedRef.current && !dormant;
     const time = motion ? t / 1000 : 0;
+    const now = performance.now();
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     ctx.lineWidth = 1;
     const cx = w / 2;
     const cy = h / 2;
-    const R = Math.max(120, Math.min(w, h) / 2 - 36);
+    const R = baseR();
     const mono = '9px "IBM Plex Mono", monospace';
-    if (dormant) ctx.globalAlpha = 0.45;
+    const dim = dormant ? 0.45 : 1;
 
-    // --- schema graticule ---------------------------------------------------
-    ctx.strokeStyle = C.stroke;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R * 0.3, 0.4, Math.PI * 2 - 0.6);
-    ctx.stroke();
-    ctx.globalAlpha *= 0.7;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R * 0.52, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.globalAlpha = dormant ? 0.45 : 1;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R * 0.8, 0, Math.PI * 2);
-    ctx.stroke();
-    for (let deg = 0; deg < 360; deg += 15) {
-      const a = (deg * Math.PI) / 180;
-      const len = deg % 45 === 0 ? 7 : 4;
-      ctx.beginPath();
-      ctx.moveTo(cx + (R * 0.8 - len) * Math.cos(a), cy + (R * 0.8 - len) * Math.sin(a));
-      ctx.lineTo(cx + R * 0.8 * Math.cos(a), cy + R * 0.8 * Math.sin(a));
-      ctx.stroke();
-    }
+    const layers = layersRef.current;
+    const activeLayer = layers.find((l) => l.id === activeRef.current) ?? layers[layers.length - 1];
+    if (!activeLayer) return;
 
-    // --- knowledge shell (particles; density is the readout) ----------------
-    let particles = 0;
-    for (const doc of d.docs) {
-      if (particles >= 240) break;
-      const rng = mulberry(hash(doc.id));
-      const base = bearing(doc.id, -0.4);
-      const count = Math.min(doc.chunkCount, 40, 240 - particles);
-      for (let i = 0; i < count; i++) {
-        const a = base + (rng() - 0.5) * 1.1;
-        const r = R * (0.72 + rng() * 0.05);
-        const x = cx + r * Math.cos(a) - tilt.current.x * 0.11;
-        const y = cy + r * Math.sin(a) - tilt.current.y * 0.11;
-        ctx.fillStyle = C.accent;
-        ctx.globalAlpha = (dormant ? 0.45 : 1) * (0.16 + rng() * 0.3);
-        ctx.fillRect(x, y, 1.4, 1.4);
-        particles++;
+    // --- stratum shift (zoom ceremony) ---------------------------------------
+    let tr = trans.current;
+    let ringNodes: CNode[] = [];
+    if (tr) {
+      const p = Math.min((now - tr.t0) / 480, 1);
+      if (p >= 1) {
+        trans.current = null;
+        tr = null;
+      } else {
+        const e = 1 - Math.pow(1 - p, 3);
+        const zoomIn = tr.dir === 1; // deeper = older: camera dives through the active rings
+        const fromScale = zoomIn ? 1 + e * 1.2 : 1 - e * 0.55;
+        const toScale = zoomIn ? 0.45 + e * 0.55 : 2.2 - e * 1.2;
+        const fromLayer = layers.find((l) => l.id === tr!.from);
+        if (fromLayer) paintLayer(ctx, fromLayer, fromScale, (1 - e) * dim, false, time, C, motion);
+        paintLayer(ctx, activeLayer, toScale, e * dim, false, time, C, motion);
       }
-      // document major mote
-      ctx.globalAlpha = dormant ? 0.45 : 0.75;
-      ctx.beginPath();
-      ctx.arc(cx + R * 0.74 * Math.cos(base), cy + R * 0.74 * Math.sin(base), 1.8, 0, Math.PI * 2);
-      ctx.fill();
     }
-    ctx.globalAlpha = dormant ? 0.45 : 1;
+    if (!tr) {
+      // faint echo of adjacent strata: the stack is visible even at rest
+      const li = layers.indexOf(activeLayer);
+      if (layers[li - 1]) paintGhost(ctx, 0.45, 0.12 * dim, C);
+      if (layers[li + 1]) paintGhost(ctx, 1.9, 0.07 * dim, C);
+      ringNodes = paintLayer(ctx, activeLayer, 1, dim, true, time, C, motion);
+    }
 
-    // --- shared node table ----------------------------------------------------
-    const nodes = layout();
-    nodesRef.current = nodes;
+    // --- shared node table (kernel first, then rings, then chrome) -----------
+    const chrome = layoutChrome();
+    nodesRef.current = [chrome.kernel, ...ringNodes, ...chrome.rest];
     const focus = focusRef.current;
 
-    // --- mission threads (the puppet strings) --------------------------------
-    for (const n of nodes) {
-      if (n.kind !== "thread") continue;
-      const m = d.missions.find((mm) => mm.id === n.id);
-      const a = bearing(n.id, 4.2);
-      const x1 = cx + R * 0.16 * Math.cos(a);
-      const y1 = cy + R * 0.16 * Math.sin(a);
-      const x2 = cx + R * 0.93 * Math.cos(a);
-      const y2 = cy + R * 0.93 * Math.sin(a);
-      const gatedT = m?.status === "awaiting_approval";
-      ctx.strokeStyle = gatedT ? C.warn : C.accent;
-      ctx.globalAlpha = (dormant ? 0.45 : 1) * (focus?.node.id === n.id ? 1 : 0.75);
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      if (gatedT) {
-        // taut string, vibrating
-        const vib = motion ? Math.sin(time * 30 + a) * 1.2 : 0;
-        const px = -Math.sin(a) * vib;
-        const py = Math.cos(a) * vib;
-        ctx.moveTo(x1 + px, y1 + py);
-        ctx.lineTo(x2 + px, y2 + py);
-      } else {
-        // slack string with flow
-        const slack = R * 0.1;
-        const mx = (x1 + x2) / 2 - Math.sin(a) * slack;
-        const my = (y1 + y2) / 2 + Math.cos(a) * slack;
-        ctx.setLineDash([5, 4]);
-        ctx.lineDashOffset = motion ? -((time * 22) % 9) : 0;
-        ctx.moveTo(x1, y1);
-        ctx.quadraticCurveTo(mx, my, x2, y2);
-      }
-      ctx.stroke();
-      ctx.setLineDash([]);
-      // grip bead (the clickable handle for the dossier)
-      ctx.fillStyle = gatedT ? C.warn : C.accent;
-      ctx.save();
-      ctx.translate(n.x, n.y);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillRect(-2.5, -2.5, 5, 5);
-      ctx.restore();
-    }
-    ctx.globalAlpha = dormant ? 0.45 : 1;
-    ctx.lineWidth = 1;
-
-    // --- tool spokes -----------------------------------------------------------
-    for (const n of nodes) {
-      if (n.kind !== "spoke") continue;
-      const srv = d.toolServers.find((s) => s.server === n.id);
-      const a = bearing(n.id, 2.1);
-      ctx.strokeStyle = C.strokeHi;
-      ctx.beginPath();
-      ctx.moveTo(cx + R * 0.82 * Math.cos(a), cy + R * 0.82 * Math.sin(a));
-      ctx.lineTo(cx + R * 0.9 * Math.cos(a), cy + R * 0.9 * Math.sin(a));
-      ctx.stroke();
-      const ticks = Math.min(srv?.tools ?? 0, 12);
-      for (let i = 0; i < ticks; i++) {
-        const r = R * (0.82 + (0.08 * (i + 0.5)) / ticks);
-        const px = cx + r * Math.cos(a);
-        const py = cy + r * Math.sin(a);
-        ctx.beginPath();
-        ctx.moveTo(px - Math.sin(a) * 3, py + Math.cos(a) * 3);
-        ctx.lineTo(px + Math.sin(a) * 3, py - Math.cos(a) * 3);
-        ctx.stroke();
-      }
-    }
-
-    // --- workflow lattice -------------------------------------------------------
-    for (const n of nodes) {
-      if (n.kind !== "workflow") continue;
-      const wf = d.workflows.find((x) => x.id === n.id);
-      ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
-      ctx.save();
-      ctx.translate(n.x, n.y);
-      ctx.rotate(Math.PI / 4);
-      ctx.strokeRect(-5, -5, 10, 10);
-      ctx.restore();
-      if (wf?.nodeCount && wf.nodeCount >= 3) {
-        ctx.strokeStyle = C.accent;
-        ctx.globalAlpha = (dormant ? 0.45 : 1) * 0.8;
-        poly(ctx, n.x, n.y, 3.2, Math.min(wf.nodeCount, 12), motion ? time * 0.2 : 0);
-        ctx.globalAlpha = dormant ? 0.45 : 1;
-      }
-    }
-
-    // --- agent orbit ----------------------------------------------------------
-    ctx.strokeStyle = C.stroke;
-    ctx.globalAlpha *= 0.8;
-    ctx.beginPath();
-    ctx.arc(cx - tilt.current.x * 0.06, cy - tilt.current.y * 0.06, R * 0.42, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.globalAlpha = dormant ? 0.45 : 1;
-    for (const n of nodes) {
-      if (n.kind !== "agent") continue;
-      const ag = d.agents.find((a) => a.id === n.id);
-      const hot = n.active && motion;
-      ctx.strokeStyle = n.active ? C.accent : focus?.node.id === n.id ? C.accent : C.strokeHi;
-      if (hot) {
-        ctx.shadowColor = C.accent;
-        ctx.shadowBlur = 8;
-      }
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, 4.5, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = n.active ? C.accent : C.lo;
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, 1.6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.shadowBlur = 0;
-      // autonomy ticks
-      const ticks = AUTONOMY_TICKS[ag?.autonomy ?? ""] ?? 1;
-      ctx.strokeStyle = C.lo;
-      for (let i = 0; i < ticks; i++) {
-        const off = (i - (ticks - 1) / 2) * 4;
-        ctx.beginPath();
-        ctx.moveTo(n.x + off, n.y - 8);
-        ctx.lineTo(n.x + off, n.y - 11);
-        ctx.stroke();
-      }
-      // orbiting activity mote
-      if (hot) {
-        const oa = time * 2.4 + bearing(n.id);
-        ctx.fillStyle = C.accent;
-        ctx.beginPath();
-        ctx.arc(n.x + 8 * Math.cos(oa), n.y + 8 * Math.sin(oa), 1.2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-
-    // --- kernel core ------------------------------------------------------------
-    const speed = 1 + Math.min(running, 3) * 0.7;
+    // --- kernel core: the constant pixel wave --------------------------------
     const kcx = cx + tilt.current.x * 0.08;
     const kcy = cy + tilt.current.y * 0.08;
-    ctx.strokeStyle = C.accent;
-    if (!dormant) {
-      poly(ctx, kcx, kcy, R * 0.13, 9, time * 0.05 * speed);
-      ctx.strokeStyle = C.strokeHi;
-      poly(ctx, kcx, kcy, R * 0.09, 6, -time * 0.09 * speed);
-      ctx.strokeStyle = C.accent;
-      poly(ctx, kcx, kcy, R * 0.05, 3, time * 0.16 * speed);
-      // vertex dots on the outer nonagon
-      for (let i = 0; i < 9; i++) {
-        const a = time * 0.05 * speed + (i / 9) * Math.PI * 2;
-        ctx.fillStyle = C.accent;
-        ctx.globalAlpha = 0.85;
-        ctx.beginPath();
-        ctx.arc(kcx + R * 0.13 * Math.cos(a), kcy + R * 0.13 * Math.sin(a), 1.1, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-      // iris — the Construct watches the operator
-      const g = gaze.current;
-      ctx.strokeStyle = gated && motion && Math.sin(time * 2.1) > 0.55 ? C.warn : C.accent;
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.moveTo(kcx + R * 0.012 * Math.cos(g), kcy + R * 0.012 * Math.sin(g));
-      ctx.lineTo(kcx + R * 0.042 * Math.cos(g), kcy + R * 0.042 * Math.sin(g));
-      ctx.stroke();
-      ctx.lineWidth = 1;
-    } else {
-      ctx.strokeStyle = C.lo;
-      ctx.beginPath();
-      ctx.arc(kcx, kcy, R * 0.09, 0, Math.PI * 2);
-      ctx.stroke();
+    const speed = 1 + Math.min(running, 3) * 0.5;
+    const blink = motion && Math.sin(time * 2.1) > 0.55;
+    for (const px of pixels.current) {
+      const wave = 0.5 + 0.5 * Math.sin(px.d * 7 - time * 2.6 * speed);
+      const a = (0.08 + 0.72 * wave * wave) * (1 - px.d * 0.35);
+      ctx.fillStyle = dormant ? C.lo : gated && blink && px.d > 0.72 ? C.warn : C.accent;
+      ctx.globalAlpha = a * (dormant ? 0.35 : 1);
+      ctx.fillRect(kcx + px.dx - 1.2, kcy + px.dy - 1.2, 2.4, 2.4);
+    }
+    ctx.globalAlpha = dim;
+    ctx.strokeStyle = dormant ? C.lo : gated && blink ? C.warn : C.strokeHi;
+    ctx.beginPath();
+    ctx.arc(kcx, kcy, R * 0.15, 0, Math.PI * 2);
+    ctx.stroke();
+    if (dormant) {
       ctx.fillStyle = C.lo;
       ctx.font = mono;
       ctx.textAlign = "center";
@@ -461,14 +729,13 @@ export function Construct(props: {
       ctx.strokeStyle = C.accent;
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(kcx, kcy, R * 0.16, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+      ctx.arc(kcx, kcy, R * 0.17, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
       ctx.stroke();
       ctx.lineWidth = 1;
     }
 
     // --- event pulses (flash-settle ripples) -------------------------------------
     if (motion) {
-      const now = performance.now();
       pulses.current = pulses.current.filter((p) => now - p.t0 < (p.alarm ? 1200 : 700));
       for (const p of pulses.current) {
         const frac = (now - p.t0) / (p.alarm ? 1200 : 700);
@@ -479,42 +746,172 @@ export function Construct(props: {
         ctx.arc(cx, cy, R * (0.16 + frac * (p.alarm ? 0.84 : 0.55)), 0, Math.PI * 2);
         ctx.stroke();
       }
-      ctx.globalAlpha = dormant ? 0.45 : 1;
+      ctx.globalAlpha = dim;
     }
 
-    // --- rim: warning bezel --------------------------------------------------------
+    // --- rim: warning bezel (global — consequences transcend strata) -------------
     const dayAgo = Date.now() - 86_400_000;
     const failed = d.missions.filter((m) => m.status === "failed" && Date.parse(m.createdAt) > dayAgo);
-    for (const ap of d.approvals.slice(0, 24)) {
-      const a = bearing(ap.id);
+    d.approvals.slice(0, 24).forEach((_, i) => {
+      const a = -Math.PI / 2 + i * 0.07;
       ctx.strokeStyle = C.warn;
       ctx.lineWidth = 1.6;
       ctx.beginPath();
-      ctx.moveTo(cx + (R * 0.96) * Math.cos(a), cy + (R * 0.96) * Math.sin(a));
-      ctx.lineTo(cx + (R * 1.0) * Math.cos(a), cy + (R * 1.0) * Math.sin(a));
+      ctx.moveTo(cx + R * 0.96 * Math.cos(a), cy + R * 0.96 * Math.sin(a));
+      ctx.lineTo(cx + R * 1.0 * Math.cos(a), cy + R * 1.0 * Math.sin(a));
       ctx.stroke();
-    }
-    for (const m of failed.slice(0, 24)) {
-      const a = bearing(m.id, 0.8);
+    });
+    failed.slice(0, 24).forEach((_, i) => {
+      const a = Math.PI / 2 + i * 0.07;
       ctx.strokeStyle = C.danger;
       ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(cx + (R * 0.97) * Math.cos(a), cy + (R * 0.97) * Math.sin(a));
-      ctx.lineTo(cx + (R * 1.0) * Math.cos(a), cy + (R * 1.0) * Math.sin(a));
+      ctx.moveTo(cx + R * 0.97 * Math.cos(a), cy + R * 0.97 * Math.sin(a));
+      ctx.lineTo(cx + R * 1.0 * Math.cos(a), cy + R * 1.0 * Math.sin(a));
       ctx.stroke();
-    }
+    });
     ctx.lineWidth = 1;
+
+    // --- authrim node --------------------------------------------------------------
+    for (const n of chrome.rest) {
+      if (n.kind !== "authrim") continue;
+      ctx.strokeStyle = C.warn;
+      ctx.save();
+      ctx.translate(n.x, n.y);
+      ctx.rotate(Math.PI / 4);
+      ctx.strokeRect(-4, -4, 8, 8);
+      ctx.restore();
+    }
+
+    // --- depth gauge (stratum chips, bottom center) ---------------------------------
+    {
+      const chips = chrome.rest.filter((n) => n.kind === "layer");
+      if (chips.length > 0) {
+        ctx.font = mono;
+        ctx.textAlign = "right";
+        ctx.fillStyle = C.lo;
+        ctx.globalAlpha = dim * 0.9;
+        ctx.fillText("STRATA //", chips[0]!.x - 40, chips[0]!.y + 3);
+        ctx.textAlign = "center";
+        for (const n of chips) {
+          const isActive = n.active === true;
+          const isFocus = focus?.node.kind === "layer" && focus.node.id === n.id;
+          ctx.fillStyle = isActive ? C.accent : isFocus ? C.hi : C.lo;
+          ctx.globalAlpha = dim * (isActive ? 1 : 0.75);
+          ctx.fillText(n.label, n.x, n.y + 3);
+          const layer = layers.find((l) => l.id === n.id);
+          const bar = Math.min((layer?.count ?? 0) / 2, 22);
+          ctx.fillRect(n.x - bar / 2, n.y + 8, bar, 1.5);
+          if (isActive) {
+            ctx.strokeStyle = C.accent;
+            ctx.strokeRect(n.x - 24, n.y - 9, 48, 22);
+          }
+        }
+        ctx.globalAlpha = dim;
+      }
+    }
+
+    // --- DISCOVERY homing beacon ------------------------------------------------
+    if (locate.current) {
+      const lc = locate.current;
+      if (trans.current) {
+        lc.t0 = 0; // wait out the stratum shift
+        lc.until = now + 4000;
+      } else {
+        const n = nodesRef.current.find((x) => x.kind === lc.kind && x.id === lc.id);
+        if (!n) {
+          if (now > lc.until) locate.current = null;
+          else requestAnimationFrame(() => requestPaintRef.current());
+        } else if (reducedRef.current) {
+          setFocus(n, false);
+          locate.current = null;
+        } else {
+          if (lc.t0 === 0) lc.t0 = now;
+          const p = Math.min((now - lc.t0) / 900, 1);
+          const e = 1 - Math.pow(1 - p, 3);
+          const tone = n.gated ? C.warn : n.failed ? C.danger : C.accent;
+          ctx.strokeStyle = tone;
+          // crosshair sweep from the stage edges
+          const gap = n.hit + 12 + (1 - e) * 60;
+          ctx.globalAlpha = 0.2 + 0.4 * e;
+          for (const [x1, y1, x2, y2] of [
+            [n.x, 0, n.x, n.y - gap],
+            [n.x, h, n.x, n.y + gap],
+            [0, n.y, n.x - gap, n.y],
+            [w, n.y, n.x + gap, n.y],
+          ] as const) {
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+          // kind-shaped converger: the reticle takes the target's own geometry
+          const rr = n.hit + 6 + (1 - e) * 140;
+          const rot = (1 - e) * 2.4;
+          ctx.globalAlpha = 0.35 + 0.6 * e;
+          switch (n.kind) {
+            case "agent":
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, rr, rot, rot + Math.PI * 1.5);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, rr * 0.7, -rot, -rot + Math.PI * 1.5);
+              ctx.stroke();
+              break;
+            case "workflow":
+              poly(ctx, n.x, n.y, rr, 4, rot + Math.PI / 4);
+              break;
+            case "knowledge":
+              for (let i = 0; i < 12; i++) {
+                const a = rot + (i / 12) * Math.PI * 2;
+                ctx.fillStyle = tone;
+                ctx.fillRect(n.x + rr * Math.cos(a) - 1, n.y + rr * Math.sin(a) - 1, 2, 2);
+              }
+              break;
+            case "spoke":
+              ctx.setLineDash([4, 3]);
+              ctx.beginPath();
+              ctx.moveTo(cx + R * 0.2 * Math.cos(n.a), cy + R * 0.2 * Math.sin(n.a));
+              ctx.lineTo(n.x, n.y);
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, rr, 0, Math.PI * 2);
+              ctx.stroke();
+              break;
+            default:
+              // mission thread: brighten the string and converge a diamond
+              ctx.beginPath();
+              ctx.moveTo(cx + R * 0.16 * Math.cos(n.a), cy + R * 0.16 * Math.sin(n.a));
+              ctx.lineTo(n.x, n.y);
+              ctx.stroke();
+              poly(ctx, n.x, n.y, rr * 0.8, 4, rot);
+          }
+          ctx.globalAlpha = dim;
+          if (p >= 1) {
+            setFocus(n, false);
+            locate.current = null;
+            pulses.current.push({ t0: now, tone: n.gated ? "warn" : "accent", alarm: false });
+          }
+        }
+      }
+    }
 
     // --- corner readouts (tertiary type stratum) -----------------------------------
     ctx.fillStyle = C.lo;
+    ctx.globalAlpha = dim;
     ctx.font = mono;
     ctx.textAlign = "left";
-    const chunks = d.docs.reduce((n, doc) => n + doc.chunkCount, 0);
-    const toolCount = d.toolServers.reduce((n, s) => n + s.tools, 0);
-    ctx.fillText(`AGENTS ${d.agents.length} · WORKFLOWS ${d.workflows.length}`, 10, 16);
-    ctx.fillText(`TOOLS ${toolCount} · NS ${d.toolServers.length}`, 10, h - 10);
+    const chunks = activeLayer.docs.reduce((n, doc) => n + doc.chunkCount, 0);
+    const toolCount = activeLayer.toolServers.reduce((n, s) => n + s.tools, 0);
+    ctx.fillText(
+      `STRATUM ${activeLayer.id} — AGENTS ${activeLayer.agents.length} · WORKFLOWS ${activeLayer.workflows.length} · OPS ${activeLayer.missions.length}`,
+      10,
+      16,
+    );
+    ctx.fillText(`TOOLS ${toolCount} · NS ${activeLayer.toolServers.length}`, 10, h - 10);
     ctx.textAlign = "right";
-    ctx.fillText(`DOCS ${d.docs.length} / CHUNKS ${chunks}`, w - 10, 16);
+    ctx.fillText(`DOCS ${activeLayer.docs.length} / CHUNKS ${chunks}`, w - 10, 16);
     ctx.fillText(
       `RX ${d.rxTotal} · LIVE OPS ${d.missions.filter((m) => LIVE_STATUS.has(m.status)).length} · GATED ${d.approvals.length}`,
       w - 10,
@@ -522,7 +919,7 @@ export function Construct(props: {
     );
 
     // --- magnet reticle + decode label ------------------------------------------------
-    if (focus) {
+    if (focus && !tr) {
       const n = focus.node;
       const rr = n.hit + 5;
       ctx.strokeStyle = n.gated ? C.warn : C.accent;
@@ -534,12 +931,12 @@ export function Construct(props: {
         ctx.stroke();
       }
       const dt = performance.now() - focus.since;
-      const frac = props.reducedMotion ? 1 : Math.min(dt / 160, 1);
+      const frac = reducedRef.current ? 1 : Math.min(dt / 160, 1);
       const chars = Math.ceil(n.label.length * frac);
       ctx.font = '600 11px "Rajdhani", sans-serif';
-      ctx.textAlign = "left";
+      ctx.textAlign = n.x > w - 180 ? "right" : "left";
       ctx.fillStyle = C.hi;
-      const lx = n.x + rr + 8;
+      const lx = n.x > w - 180 ? n.x - rr - 8 : n.x + rr + 8;
       const ly = n.y - 2;
       ctx.fillText(n.label.slice(0, chars), lx, ly);
       ctx.font = mono;
@@ -547,7 +944,7 @@ export function Construct(props: {
       ctx.fillText(n.sub, lx, ly + 12);
     }
     ctx.globalAlpha = 1;
-  }, [layout, props.reducedMotion]);
+  }, [layoutLayer, layoutChrome, paintLayer, setFocus]);
 
   const requestPaint = useCallback(() => {
     if (renderRequested.current) return;
@@ -557,6 +954,38 @@ export function Construct(props: {
       paint(t);
     });
   }, [paint]);
+  const requestPaintRef = useRef(requestPaint);
+  requestPaintRef.current = requestPaint;
+
+  // Locate API for the DISCOVERY pane (via Nexus).
+  useEffect(() => {
+    const ref = props.apiRef;
+    if (!ref) return;
+    ref.current = {
+      locate: (kind, id) => {
+        locate.current = { kind: NODE_KIND_FOR[kind], id, t0: 0, until: performance.now() + 4000 };
+        requestPaintRef.current();
+      },
+    };
+    return () => {
+      ref.current = null;
+    };
+  }, [props.apiRef]);
+
+  // Stratum shift ceremony on active-layer change.
+  const prevActive = useRef(props.active);
+  useEffect(() => {
+    if (prevActive.current === props.active) return;
+    const from = prevActive.current;
+    prevActive.current = props.active;
+    const yearNum = (id: string) => Number(id) || 0;
+    if (!props.reducedMotion && layersRef.current.some((l) => l.id === from)) {
+      trans.current = { from, to: props.active, t0: performance.now(), dir: yearNum(props.active) < yearNum(from) ? 1 : -1 };
+    }
+    focusRef.current = null;
+    setAnnounce(`Stratum ${props.active} active`);
+    requestPaint();
+  }, [props.active, props.reducedMotion, requestPaint]);
 
   /* ---- RAF loop (skipped under reduced motion) ----------------------------- */
   useEffect(() => {
@@ -573,6 +1002,18 @@ export function Construct(props: {
       canvas.height = Math.round(h * dpr);
       canvas.style.width = `${w}px`;
       canvas.style.height = `${h}px`;
+      // rebuild the kernel pixel lattice for the new radius
+      const R = Math.max(120, Math.min(w, h) / 2 - 36);
+      const kR = R * 0.135;
+      const step = Math.max(4, Math.round(kR / 8));
+      const px: { dx: number; dy: number; d: number }[] = [];
+      for (let gy = -kR; gy <= kR; gy += step) {
+        for (let gx = -kR; gx <= kR; gx += step) {
+          const dist = Math.hypot(gx, gy);
+          if (dist <= kR) px.push({ dx: gx, dy: gy, d: dist / kR });
+        }
+      }
+      pixels.current = px;
       requestPaint();
     };
     resize();
@@ -595,7 +1036,9 @@ export function Construct(props: {
         !cursor.current.inside &&
         pulses.current.length === 0 &&
         !d.missions.some((m) => m.status === "running") &&
-        !hold.current;
+        !hold.current &&
+        !trans.current &&
+        !locate.current;
       if (patient && frame % 2 === 1) return; // 30fps when idle — calm and cheap
 
       // tilt spring toward cursor offset (critically damped-ish)
@@ -609,14 +1052,6 @@ export function Construct(props: {
       st.vy = (st.vy + (targY - st.y) * k) * dmp;
       st.x += st.vx;
       st.y += st.vy;
-      // iris gaze with lag
-      if (cursor.current.inside) {
-        const want = Math.atan2(cursor.current.y - h / 2, cursor.current.x - w / 2);
-        let delta = want - gaze.current;
-        while (delta > Math.PI) delta -= Math.PI * 2;
-        while (delta < -Math.PI) delta += Math.PI * 2;
-        gaze.current += delta * 0.12;
-      }
       // hold ceremony completion (the release is then consumed, not a click)
       if (hold.current && performance.now() - hold.current.t0 >= 700) {
         hold.current = null;
@@ -635,63 +1070,16 @@ export function Construct(props: {
   // Repaint on data changes (only path to fresh pixels under reduced motion).
   useEffect(() => {
     requestPaint();
-  }, [props.data, requestPaint]);
-
-  /* ---- pointer + keyboard targeting ---------------------------------------- */
-  const findNode = (x: number, y: number): CNode | null => {
-    let best: CNode | null = null;
-    let bd = 48;
-    for (const n of nodesRef.current) {
-      const dist = Math.hypot(n.x - x, n.y - y) - (n.kind === "kernel" ? n.hit : 0);
-      if (dist < bd) {
-        bd = dist;
-        best = n;
-      }
-    }
-    return best;
-  };
-
-  const setFocus = (node: CNode | null, keyboard: boolean) => {
-    const cur = focusRef.current;
-    if (node === null) {
-      focusRef.current = null;
-      if (cur) setAnnounce("");
-    } else if (!cur || cur.node.id !== node.id || cur.node.kind !== node.kind) {
-      focusRef.current = { node, since: performance.now(), keyboard };
-      setAnnounce(`${node.label} — ${node.sub}`);
-    }
-    const canvas = canvasRef.current;
-    if (canvas) canvas.style.cursor = node ? "pointer" : "default";
-  };
-
-  const activate = (n: CNode) => {
-    switch (n.kind) {
-      case "kernel":
-        onOpenRef.current("signal.feed");
-        break;
-      case "agent":
-        onOpenRef.current("agent.channel", { agentId: n.id });
-        break;
-      case "workflow":
-        onOpenRef.current("workflow.run", { workflowId: n.id });
-        break;
-      case "knowledge":
-        onOpenRef.current("knowledge.search");
-        break;
-      case "spoke":
-        onOpenRef.current("tools.catalog", { server: n.id });
-        break;
-      case "thread":
-        onOpenRef.current(n.gated ? "authorizations" : "mission.dossier", { missionId: n.id });
-        break;
-      case "authrim":
-        onOpenRef.current("authorizations");
-        break;
-    }
-  };
+  }, [props.data, props.layers, requestPaint]);
 
   const d = props.data;
-  const summary = `The Construct: ${d.agents.length} agents, ${d.workflows.length} workflows, ${d.docs.length} knowledge documents, ${d.toolServers.length} tool namespaces, ${d.missions.filter((m) => LIVE_STATUS.has(m.status)).length} live missions, ${d.approvals.length} pending authorizations. Bus ${d.connected ? "online" : "offline"}. Arrow keys walk the instrument; Enter opens the focused task.`;
+  const activeLayer = props.layers.find((l) => l.id === props.active);
+  const summary =
+    `The Construct: ${props.layers.length} strata by creation year; active stratum ${props.active} holds ` +
+    `${activeLayer?.agents.length ?? 0} agents, ${activeLayer?.workflows.length ?? 0} workflows, ` +
+    `${activeLayer?.docs.length ?? 0} knowledge documents, ${activeLayer?.toolServers.length ?? 0} tool namespaces and ` +
+    `${activeLayer?.missions.length ?? 0} missions. ${d.approvals.length} pending authorizations. Bus ${d.connected ? "online" : "offline"}. ` +
+    `Arrow keys walk the instrument; Enter opens the focused task; bracket keys or Page keys shift strata; Enter on the kernel opens discovery.`;
 
   return (
     <div ref={wrapRef} className="nx-construct">
@@ -736,21 +1124,39 @@ export function Construct(props: {
           }
           activate(n);
         }}
-        onKeyDown={(e) => {
-          const nodes = nodesRef.current;
-          if (nodes.length === 0) return;
-          const cur = focusRef.current?.node ?? null;
-          const idx = cur ? nodes.findIndex((n) => n.id === cur.id && n.kind === cur.kind) : -1;
-          if (e.key === "ArrowRight" || e.key === "ArrowDown") {
-            setFocus(nodes[(idx + 1) % nodes.length]!, true);
-          } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-            setFocus(nodes[(idx - 1 + nodes.length) % nodes.length]!, true);
-          } else if ((e.key === "Enter" || e.key === " ") && cur) {
-            activate(cur);
-          } else if (e.key === "Escape") {
-            setFocus(null, true);
-          } else {
+        onWheel={(e) => {
+          // wheel = depth: scroll down dives to the older stratum (zoom in)
+          if (trans.current) {
+            wheelAcc.current = 0;
             return;
+          }
+          wheelAcc.current += e.deltaY;
+          if (Math.abs(wheelAcc.current) > 120) {
+            stepLayer(wheelAcc.current > 0 ? -1 : 1);
+            wheelAcc.current = 0;
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "[" || e.key === "PageDown") {
+            stepLayer(-1);
+          } else if (e.key === "]" || e.key === "PageUp") {
+            stepLayer(1);
+          } else {
+            const nodes = nodesRef.current;
+            if (nodes.length === 0) return;
+            const cur = focusRef.current?.node ?? null;
+            const idx = cur ? nodes.findIndex((n) => n.id === cur.id && n.kind === cur.kind) : -1;
+            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+              setFocus(nodes[(idx + 1) % nodes.length]!, true);
+            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+              setFocus(nodes[(idx - 1 + nodes.length) % nodes.length]!, true);
+            } else if ((e.key === "Enter" || e.key === " ") && cur) {
+              activate(cur);
+            } else if (e.key === "Escape") {
+              setFocus(null, true);
+            } else {
+              return;
+            }
           }
           e.preventDefault();
           if (props.reducedMotion) requestPaint();

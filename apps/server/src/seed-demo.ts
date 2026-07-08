@@ -21,6 +21,7 @@
  */
 import {
   appendAudit,
+  backdateEntity,
   createAgent,
   createDb,
   createUser,
@@ -478,6 +479,34 @@ async function main(): Promise<void> {
   await queueAgent("Incident Commander", "Investigate the latency alert on the checkout path.");
   await queueAgent("Security Sentinel", "Summarize today's dependency advisories.");
   await queueAgent("Data Librarian", "What is our certificate rotation window?");
+
+  // --- Backdate a slice of history across years --------------------------------
+  // The NEXUS Construct stacks its strata by creation year (docs/NEXUS.md §2),
+  // so the demo spans three of them: the founding stratum (Y-2), last year's
+  // build-out (Y-1) and the live present. Live threads, pending approvals and
+  // recent failures all stay in the present stratum.
+  const Y = new Date().getFullYear();
+  const on = (yearsBack: number, month: number, day: number) => new Date(Date.UTC(Y - yearsBack, month, day, 12));
+  const AGENT_VINTAGE: [string, number][] = [
+    ["Data Librarian", 2], ["Support Concierge", 2], ["Finance Analyst", 2],
+    ["Ops Responder", 1], ["Release Marshal", 1], ["Growth Scout", 1], ["QA Sentinel", 1],
+  ];
+  for (const [i, [name, back]] of AGENT_VINTAGE.entries()) {
+    await backdateEntity(db, "agent", agentIds[name]!, on(back, i % 9, 4 + i * 3));
+  }
+  const WORKFLOW_VINTAGE: [string, number][] = [
+    ["Nightly Reconciliation", 2], ["Backup Verify", 2], ["Access Review", 2],
+    ["Weekly Digest", 1], ["Uptime Monitor", 1], ["Churn Watch", 1], ["Invoice Sweep", 1],
+  ];
+  for (const [i, [name, back]] of WORKFLOW_VINTAGE.entries()) {
+    await backdateEntity(db, "workflow", workflowIds[name]!, on(back, (i * 2) % 11, 8 + i));
+  }
+  const allDocs = await listDocuments(db, workspaceId);
+  for (const [i, doc] of allDocs.slice(0, 3).entries()) await backdateEntity(db, "document", doc.id, on(2, 3 + i, 11));
+  for (const [i, doc] of allDocs.slice(3, 7).entries()) await backdateEntity(db, "document", doc.id, on(1, 1 + i * 2, 19));
+  const settled = (await listMissions(db, workspaceId, 200)).filter((m) => m.status === "succeeded");
+  for (const [i, m] of settled.slice(0, 3).entries()) await backdateEntity(db, "mission", m.id, on(2, 6 + i, 9));
+  for (const [i, m] of settled.slice(3, 8).entries()) await backdateEntity(db, "mission", m.id, on(1, 2 + i, 14));
 
   // --- Summary -----------------------------------------------------------------
   const agents = await listAgents(db, workspaceId);
