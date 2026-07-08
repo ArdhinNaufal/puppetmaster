@@ -35,12 +35,34 @@ Docker socket proxy.
       `main.ts` behind the same `WORKBENCH_MODE` executor. 4 golden tasks (write/read
       round-trip, exec+git.status, write-gated, push-gated) → suite 14→18 at pass^3.
       **exec allowlist deferred** (approval tier is the gate) — see below.
-- [ ] **WP3b.4** `bench.delegate` — headless coding CLI inside the workbench (ADR-002).
-      **Cleared to start 2026-07-07** — WP3b.5's egress path + secret injection are
-      host-verified, so delegate has the model-API route + API-key delivery it needs.
-      **This is the recommended next task; not yet authored.** Two things are the
-      operator's call before/while building, flagged here so a fresh session doesn't
-      have to re-derive them:
+- [~] **WP3b.4** `bench.delegate` — headless coding CLI inside the workbench (ADR-002).
+      **Authored 2026-07-08 (keyless slice); host acceptance pending** (needs Docker +
+      a live `ANTHROPIC_API_KEY`, spends real tokens). Shipped:
+      - `docker/workbench.Dockerfile`: the CLI layer is now enabled, pinned via
+        `ARG CLAUDE_CODE_VERSION=2.1.202` (installed as root, drops back to `bench`).
+      - `bench.delegate(projectId, task, { maxTurns?, timeoutMs? })` in
+        `packages/kernel/src/bench-tools.ts`, tier `write_approved` — runs
+        `claude -p <task> --output-format stream-json --verbose --max-turns <N>
+        --permission-mode acceptEdits` via `CommandExecutor.run()` (wall-clock via
+        `timeoutMs`), parses the transcript into `{ ok, numTurns, usage, result, costUsd }`.
+        Budgets clamped: `maxTurns` 1–50 (default 12), `timeoutMs` 1s–30min (default 5min).
+      - `parseDelegateStream` (exported) — the stream-json parser, robust to noise /
+        missing result / multiple result events; verified free by
+        `scripts/verify-delegate-parse.mjs` (DELEGATE PARSE PASS, 6 cases).
+      - Golden task `bench-delegate-gated` asserts the write-tier pause (suite 22→23,
+        pass^3, all green).
+      - `scripts/verify-delegate.mjs` — the **host** acceptance (Docker + key): CLI
+        present / key injected via the secrets path / a trivial task completes within
+        budget / turns+usage parse from the LIVE transcript / edit landed / destroy.
+        **Not yet run** — needs a Docker host and a key (spends tokens).
+
+      **Follow-up (not downgraded silently):** true mid-run token caps and live
+      progress→mission-trace streaming need a streaming `CommandExecutor.run()` the
+      seam doesn't have today; the enforceable budgets shipped are the turn cap +
+      wall-clock kill. Push/git-write stays outside the CLI (goes through
+      `bench.git.push`, destructive-tier) per ADR-002.
+
+      Two things were the operator's call before/while building, kept here for the record:
 
       1. **Pinned CLI version** (ADR-002: "pinned in the image, upgraded deliberately").
          The commented layer in `docker/workbench.Dockerfile` is
@@ -111,16 +133,32 @@ Docker socket proxy.
 
 ---
 
-## ▶ RESUME POINT — WP3b.5 host-verified 2026-07-07 ✅ (WP3b.4 is next, not yet authored)
+## ▶ RESUME POINT — WP3b.4 authored 2026-07-08 (keyless slice) · host acceptance pending
 
-**Done:** `EGRESS PROXY PASS` on a real Docker host (secret-inject / proxy-env /
-allowlisted-ok / denied-refused / direct-blocked / destroy). The egress path + vault
-secret injection are proven; WP3b.4 (`bench.delegate`) can build on them.
+**Done here (free, no Docker/no key):** `bench.delegate` + its stream-json parser are
+authored, typecheck + build clean, `DELEGATE PARSE PASS` (6 cases), golden suite 23/23 at
+pass^3 (added `bench-delegate-gated`), arch check OK. The Dockerfile CLI layer is enabled
+(pinned `CLAUDE_CODE_VERSION=2.1.202`).
 
-**The recommended next task is WP3b.4** (`bench.delegate`) — full suggested scope, the
-CLI-pin-version decision, and the cost/live-key caveat are written out under its checklist
-item above. Unlike every prior increment in this file, its host acceptance needs a live
-`ANTHROPIC_API_KEY` and will spend real tokens — budget for that before starting.
+**▶ NEXT — run `bench.delegate`'s HOST acceptance (Docker + live key, spends tokens):**
+
+```
+docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .
+pnpm --filter "@puppetmaster/kernel..." build
+ANTHROPIC_API_KEY=sk-... node scripts/verify-delegate.mjs
+```
+
+Expect `DELEGATE PASS: cli-present/key-injected/task-completes/turns+usage-parsed/edit-landed/destroy`
+(exit 3 = no daemon or no key). The `docker build` (not the egress-proxy image) is what
+now bakes the pinned CLI — rebuild it after any Dockerfile change. This is the FIRST WP3b
+increment whose acceptance costs money; every prior one verified for free. Record the PASS
+here before building further on delegate. Once green, WP5's EXECUTE templates
+(`/next` via `bench.delegate`, `/loop` gated) are unblocked.
+
+**Prior increment — WP3b.5 host-verified 2026-07-07 ✅:** `EGRESS PROXY PASS` on a real
+Docker host (secret-inject / proxy-env / allowlisted-ok / denied-refused / direct-blocked /
+destroy). The egress path + vault secret injection are proven; `bench.delegate` builds on
+them (its host script allowlists `api.anthropic.com` and injects the key via `secrets`).
 
 **The egress verify ritual (Docker-capable host) — build both images first:**
 

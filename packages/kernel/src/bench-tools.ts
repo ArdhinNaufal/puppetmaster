@@ -29,6 +29,79 @@ function shQuote(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
 }
 
+/** The parsed outcome of a `bench.delegate` run (a pinned coding-CLI session
+ *  inside the workbench, ADR-002). Derived purely from the CLI's stream-json
+ *  transcript — no Docker or live key needed to test this shape. */
+export interface DelegateResult {
+  /** Did the CLI session finish successfully (a non-error `result` event)? */
+  ok: boolean;
+  /** Agent turns the session took, from the `result` event (undefined if absent). */
+  numTurns?: number;
+  /** Token usage reported by the `result` event, passed through verbatim. */
+  usage?: unknown;
+  /** The CLI's final result text (its answer), or an error subtype description. */
+  result: string;
+  /** Total cost in USD the CLI reported for the session, if present. */
+  costUsd?: number;
+  /** Why `ok` is false, when it is (max-turns, execution error, or no result). */
+  reason?: string;
+}
+
+/**
+ * Parse the `claude -p … --output-format stream-json` transcript into a
+ * DelegateResult (WP3b.4, ADR-002). The CLI emits newline-delimited JSON: one
+ * object per line (`system`/`assistant`/`user` events) terminated by a single
+ * `result` event carrying `is_error`, `num_turns`, `usage`, and the answer text.
+ *
+ * Robust by design — this is untrusted subprocess output: unparseable lines are
+ * skipped (partial buffers, interleaved stderr), and a transcript with no
+ * `result` event is a failure, not a throw. The last `result` event wins.
+ */
+export function parseDelegateStream(raw: string): DelegateResult {
+  let resultEvent: Record<string, unknown> | undefined;
+  for (const line of String(raw ?? "").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue; // interleaved noise / partial line — ignore, don't fail the parse
+    }
+    if (event && typeof event === "object" && (event as { type?: unknown }).type === "result") {
+      resultEvent = event as Record<string, unknown>;
+    }
+  }
+
+  if (!resultEvent) {
+    return { ok: false, result: "", reason: "no result event in stream-json transcript" };
+  }
+
+  const isError = resultEvent.is_error === true;
+  const subtype = typeof resultEvent.subtype === "string" ? resultEvent.subtype : undefined;
+  const text = typeof resultEvent.result === "string" ? resultEvent.result : "";
+  const numTurns = typeof resultEvent.num_turns === "number" ? resultEvent.num_turns : undefined;
+  const costUsd =
+    typeof resultEvent.total_cost_usd === "number" ? resultEvent.total_cost_usd : undefined;
+
+  return {
+    ok: !isError,
+    numTurns,
+    usage: resultEvent.usage,
+    result: text || subtype || "",
+    costUsd,
+    ...(isError ? { reason: subtype ?? "the CLI reported an error result" } : {}),
+  };
+}
+
+/** Coerce an arg to an integer, clamped to [min, max]; falls back to `def`
+ *  when absent or not a finite number. Guards the delegate budgets. */
+function clampInt(value: unknown, def: number, min: number, max: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
 /** A file path confined to the workbench: relative, no `..` escape. */
 function safeRelPath(path: string): string {
   const p = String(path ?? "").trim();
@@ -111,6 +184,61 @@ export function registerBenchTools(
       const command = String(args.command ?? "");
       if (!command.trim()) throw new Error("bench.exec: a command is required");
       return inWorkbench(args.projectId, command);
+    },
+  );
+
+  registry.register(
+    "bench",
+    "delegate",
+    "Delegate a coding task to the pinned CLI running inside a project's workbench (ADR-002). " +
+      "Runs headless with a hard turn cap and wall-clock budget; returns the parsed outcome " +
+      "(ok, numTurns, usage, result). Mutating — gated behind approval. Does not push (use bench.git.push).",
+    "write_approved",
+    {
+      type: "object",
+      properties: {
+        projectId: { type: "string" },
+        task: { type: "string", description: "The coding task to hand the CLI (its -p prompt)." },
+        maxTurns: {
+          type: "number",
+          description: "Hard cap on agent turns (1–50, default 12). The CLI's --max-turns.",
+        },
+        timeoutMs: {
+          type: "number",
+          description: "Wall-clock budget in ms (default 300000, max 1800000). Kills the run if exceeded.",
+        },
+      },
+      required: ["projectId", "task"],
+    },
+    async (args) => {
+      const task = String(args.task ?? "");
+      if (!task.trim()) throw new Error("bench.delegate: a task is required");
+      // Clamp the two enforceable budgets. --max-turns caps agent turns; the
+      // executor timeout is the wall-clock kill. True mid-run token caps and
+      // live progress→trace streaming need a streaming exec API run() lacks
+      // today — a documented follow-up, not silently downgraded here.
+      const maxTurns = clampInt(args.maxTurns, 12, 1, 50);
+      const timeoutMs = clampInt(args.timeoutMs, 300_000, 1_000, 1_800_000);
+      const command =
+        `claude -p ${shQuote(task)} --output-format stream-json --verbose ` +
+        `--max-turns ${maxTurns} --permission-mode acceptEdits`;
+      const exec = requireExecutor();
+      const id = await requireProject(String(args.projectId ?? ""));
+      const res = await exec.run({ projectId: id, command, timeoutMs });
+      if (res.timedOut) {
+        throw new Error(`bench.delegate: exceeded the ${timeoutMs}ms wall-clock budget`);
+      }
+      const parsed = parseDelegateStream(res.stdout);
+      // A clean CLI exit but no parseable result event, or a non-zero exit
+      // with nothing parsed, is a delegate failure worth surfacing by name.
+      if (!parsed.numTurns && parsed.reason && res.code !== 0) {
+        throw new Error(
+          `bench.delegate: CLI exited ${res.code} — ${parsed.reason}${
+            res.stderr.trim() ? ` (${res.stderr.trim().slice(0, 200)})` : ""
+          }`,
+        );
+      }
+      return parsed;
     },
   );
 
