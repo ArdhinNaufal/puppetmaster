@@ -126,6 +126,17 @@ function mulberry(seed: number) {
   };
 }
 
+/** Radial bar centered on an orbit point — the content mark of every ring
+ *  (the reference look: rings of bars, not dots; length is the readout). */
+function bar(ctx: CanvasRenderingContext2D, x: number, y: number, a: number, len: number) {
+  const dx = Math.cos(a);
+  const dy = Math.sin(a);
+  ctx.beginPath();
+  ctx.moveTo(x - (dx * len) / 2, y - (dy * len) / 2);
+  ctx.lineTo(x + (dx * len) / 2, y + (dy * len) / 2);
+  ctx.stroke();
+}
+
 function poly(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, n: number, rot: number) {
   ctx.beginPath();
   for (let i = 0; i <= n; i++) {
@@ -485,7 +496,7 @@ export function Construct(props: {
       ctx.stroke();
     }
 
-    // --- knowledge particles (density is the readout; clustered per doc) -----
+    // --- knowledge shell: one bar per document, chunk particles around it -----
     let particles = 0;
     for (const n of nodes) {
       if (n.kind !== "knowledge" || particles >= 240) continue;
@@ -501,10 +512,12 @@ export function Construct(props: {
         ctx.fillRect(cx + r * Math.cos(a), cy + r * Math.sin(a), 1.4, 1.4);
         particles++;
       }
-      al(0.8);
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, 1.9, 0, Math.PI * 2);
-      ctx.fill();
+      // the document's bar: length = its chunk weight
+      ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
+      ctx.lineWidth = 1.6;
+      al(0.9);
+      bar(ctx, n.x, n.y, n.a, 5 + Math.min(doc.chunkCount, 24) * 0.55);
+      ctx.lineWidth = 1;
     }
 
     // --- mission threads (the puppet strings; beads for the settled ones) ----
@@ -539,14 +552,12 @@ export function Construct(props: {
         ctx.setLineDash([]);
         ctx.lineWidth = 1;
       }
-      // grip bead: the clickable handle for the dossier
-      ctx.fillStyle = n.gated ? C.warn : n.failed ? C.danger : n.active ? C.accent : C.lo;
-      al(n.active ? 1 : 0.65);
-      ctx.save();
-      ctx.translate(n.x, n.y);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillRect(-2.5, -2.5, 5, 5);
-      ctx.restore();
+      // grip bar: the clickable handle for the dossier (long = live, short = settled)
+      ctx.strokeStyle = n.gated ? C.warn : n.failed ? C.danger : n.active ? C.accent : C.lo;
+      ctx.lineWidth = 2.4;
+      al(n.active ? 1 : 0.6);
+      bar(ctx, n.x, n.y, n.a, n.active ? 14 : 8);
+      ctx.lineWidth = 1;
     }
 
     // --- tool spokes -----------------------------------------------------------
@@ -571,17 +582,15 @@ export function Construct(props: {
       }
     }
 
-    // --- workflow lattice -------------------------------------------------------
+    // --- workflow lattice: one bar per workflow, length = graph size -----------
     for (const n of nodes) {
       if (n.kind !== "workflow") continue;
       const wf = layer.workflows.find((x) => x.id === n.id);
       ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
+      ctx.lineWidth = 2.4;
       al(1);
-      ctx.save();
-      ctx.translate(n.x, n.y);
-      ctx.rotate(Math.PI / 4);
-      ctx.strokeRect(-5, -5, 10, 10);
-      ctx.restore();
+      bar(ctx, n.x, n.y, n.a, 7 + Math.min(wf?.nodeCount ?? 0, 12));
+      ctx.lineWidth = 1;
       if (wf?.nodeCount && wf.nodeCount >= 3) {
         ctx.strokeStyle = C.accent;
         al(0.8);
@@ -589,39 +598,27 @@ export function Construct(props: {
       }
     }
 
-    // --- agent orbit ----------------------------------------------------------
+    // --- agent orbit: one bar per agent, length = autonomy tier -----------------
     for (const n of nodes) {
       if (n.kind !== "agent") continue;
       const ag = layer.agents.find((a) => a.id === n.id);
       const hot = n.active && motion;
       ctx.strokeStyle = n.active || focus?.node.id === n.id ? C.accent : C.strokeHi;
+      ctx.lineWidth = 2.4;
       al(1);
       if (hot && interactive) {
         ctx.shadowColor = C.accent;
         ctx.shadowBlur = 8;
       }
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, 4.5, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = n.active ? C.accent : C.lo;
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, 1.6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.shadowBlur = 0;
       const ticks = AUTONOMY_TICKS[ag?.autonomy ?? ""] ?? 1;
-      ctx.strokeStyle = C.lo;
-      for (let i = 0; i < ticks; i++) {
-        const off = (i - (ticks - 1) / 2) * 4;
-        ctx.beginPath();
-        ctx.moveTo(n.x + off, n.y - 8);
-        ctx.lineTo(n.x + off, n.y - 11);
-        ctx.stroke();
-      }
+      bar(ctx, n.x, n.y, n.a, 7 + ticks * 4);
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = 1;
       if (hot) {
         const oa = time * 2.4 + (hash(n.id) % 7);
         ctx.fillStyle = C.accent;
         ctx.beginPath();
-        ctx.arc(n.x + 8 * Math.cos(oa), n.y + 8 * Math.sin(oa), 1.2, 0, Math.PI * 2);
+        ctx.arc(n.x + 9 * Math.cos(oa), n.y + 9 * Math.sin(oa), 1.2, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -772,15 +769,13 @@ export function Construct(props: {
     });
     ctx.lineWidth = 1;
 
-    // --- authrim node --------------------------------------------------------------
+    // --- authrim node: the widest warning bar on the bezel -------------------------
     for (const n of chrome.rest) {
       if (n.kind !== "authrim") continue;
       ctx.strokeStyle = C.warn;
-      ctx.save();
-      ctx.translate(n.x, n.y);
-      ctx.rotate(Math.PI / 4);
-      ctx.strokeRect(-4, -4, 8, 8);
-      ctx.restore();
+      ctx.lineWidth = 3;
+      bar(ctx, n.x, n.y, n.a, 16);
+      ctx.lineWidth = 1;
     }
 
     // --- depth gauge (stratum chips, bottom center) ---------------------------------

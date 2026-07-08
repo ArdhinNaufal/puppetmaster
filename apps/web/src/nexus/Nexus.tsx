@@ -9,17 +9,17 @@ import {
   type ConstructWorkflow,
 } from "./Construct.js";
 import { ROLE_RANK, TASKS, taskById, type DiscoveryItem, type NX } from "./registry.js";
-import { TaskWindow, type PaneSide, type PaneState } from "./TaskWindow.js";
+import { TaskWindow, type PaneState } from "./TaskWindow.js";
 
 /**
  * NEXUS (docs/NEXUS.md): the single-page operations theater. The Construct
- * fills the stage; tasks open as translucent panes docked to the left/right
- * flanks (never over the figure's center — a new pane lands on the emptier
- * flank). Urgent work (pending authorizations) and follow-ups (recent failed
- * missions) hail their panes one at a time on a cadence; tracking a mission
- * from this page opens its OPERATION LOG pane. The tray guarantees a path to
- * every registry task; pane layout persists per user in
- * ui_preferences.layout.nexus.
+ * fills the stage; tasks open as translucent panes floating above it — they
+ * drag anywhere and stack freely, but every pane *emerges* on a flank of the
+ * stage (the emptier of left/right), never over the figure's center. Urgent
+ * work (pending authorizations) and follow-ups (recent failed missions) hail
+ * their panes one at a time on a cadence; tracking a mission from this page
+ * opens its OPERATION LOG pane. The tray guarantees a path to every registry
+ * task; pane layout persists per user in ui_preferences.layout.nexus.
  */
 
 let paneSeq = 0;
@@ -27,10 +27,10 @@ const paneKey = () => `p${++paneSeq}-${Date.now().toString(36)}`;
 
 interface PersistedPane {
   task: string;
-  side?: PaneSide;
-  /** Legacy free-position layout (pre-dock); migrated to a side on restore. */
   x?: number;
   y?: number;
+  /** Interim dock-era layout; migrated back to a flank position on restore. */
+  side?: "left" | "right";
   ctx?: Record<string, unknown>;
   z?: number;
 }
@@ -47,6 +47,7 @@ export function Nexus(props: {
   const [panes, setPanes] = useState<PaneState[]>([]);
   const zSeq = useRef(1);
   const restored = useRef(false);
+  const stageRef = useRef<HTMLDivElement>(null);
 
   // --- Construct data (page-owned fetches; bus signals drive refresh) --------
   const [missions, setMissions] = useState<Mission[]>([]);
@@ -156,11 +157,18 @@ export function Nexus(props: {
   }, [layers, rank]);
 
   // --- pane operations ---------------------------------------------------------
-  /** The emptier flank hosts the next pane (requirement: never bury the figure). */
-  const pickSide = (ps: PaneState[]): PaneSide => {
-    const left = ps.filter((p) => p.side === "left").length;
-    const right = ps.filter((p) => p.side === "right").length;
-    return right <= left ? "right" : "left";
+  /** Spawn coordinates on a flank of the stage: panes emerge left or right
+   *  (the emptier side), never over the figure's center — then drag anywhere. */
+  const flankSpawn = (ps: PaneState[], width: number): { x: number; y: number } => {
+    const stage = stageRef.current;
+    const W = stage?.clientWidth ?? 1200;
+    const onLeft = ps.filter((p) => p.x + width / 2 < W / 2).length;
+    const onRight = ps.length - onLeft;
+    const side = onRight <= onLeft ? "right" : "left";
+    const n = side === "right" ? onRight : onLeft;
+    const x = side === "left" ? 16 + ((n * 26) % 96) : Math.max(16, W - width - 16 - ((n * 26) % 96));
+    const y = 56 + ((n * 34) % 240);
+    return { x, y };
   };
 
   const openPane = useCallback((task: string, ctx: Record<string, unknown> = {}) => {
@@ -180,8 +188,10 @@ export function Nexus(props: {
       if (existing) {
         return ps.map((p) => (p.key === existing.key ? { ...p, z: ++zSeq.current, ctx: { ...p.ctx, ...ctx } } : p));
       }
-      const side = (ctx.side as PaneSide | undefined) ?? pickSide(ps);
-      return [...ps, { key: paneKey(), task, side, z: ++zSeq.current, ctx }];
+      const spawn = flankSpawn(ps, def.width ?? 380);
+      const x = (ctx.x as number) ?? spawn.x;
+      const y = (ctx.y as number) ?? spawn.y;
+      return [...ps, { key: paneKey(), task, x, y, z: ++zSeq.current, ctx }];
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.nx.navigate]);
@@ -218,33 +228,8 @@ export function Nexus(props: {
     [props.nx, openPane, closeTask, trackAndLog, layers, activeLayer, setLayer, stepLayer, discoveryItems],
   );
 
-  const dock = (key: string, side: PaneSide, index: number) =>
-    setPanes((ps) => {
-      const pane = ps.find((p) => p.key === key);
-      if (!pane) return ps;
-      const rest = ps.filter((p) => p.key !== key);
-      const flank = rest.filter((p) => p.side === side);
-      const before = flank[Math.min(index, flank.length)];
-      const pos = before ? rest.indexOf(before) : rest.length;
-      const moved = { ...pane, side, z: ++zSeq.current };
-      return [...rest.slice(0, pos), moved, ...rest.slice(pos)];
-    });
-  const nudge = (key: string, dir: -1 | 1) =>
-    setPanes((ps) => {
-      const pane = ps.find((p) => p.key === key);
-      if (!pane) return ps;
-      const flank = ps.filter((p) => p.side === pane.side);
-      const i = flank.indexOf(pane);
-      const j = i + dir;
-      if (j < 0 || j >= flank.length) return ps;
-      const swap = flank[j]!;
-      const a = ps.indexOf(pane);
-      const b = ps.indexOf(swap);
-      const next = [...ps];
-      next[a] = swap;
-      next[b] = pane;
-      return next;
-    });
+  const move = (key: string, x: number, y: number) =>
+    setPanes((ps) => ps.map((p) => (p.key === key ? { ...p, x, y } : p)));
   const raise = (key: string) =>
     setPanes((ps) => {
       const top = Math.max(...ps.map((p) => p.z));
@@ -307,16 +292,17 @@ export function Nexus(props: {
       .then(({ layout }) => {
         const saved = (layout as { nexus?: { panes?: PersistedPane[] } }).nexus;
         if (saved?.panes?.length) {
+          const W = stageRef.current?.clientWidth ?? 1200;
           setPanes(
             saved.panes
               .filter((p) => taskById(p.task) && !taskById(p.task)?.jumpOnly)
-              .map((p) => ({
-                key: paneKey(),
-                task: p.task,
-                side: p.side ?? (typeof p.x === "number" && p.x > 460 ? "right" : "left"),
-                z: ++zSeq.current,
-                ctx: p.ctx ?? {},
-              })),
+              .map((p) => {
+                // dock-era layouts stored only a side — land them on that flank
+                const width = taskById(p.task)?.width ?? 380;
+                const x = p.x ?? (p.side === "right" ? Math.max(16, W - width - 24) : 24);
+                const y = p.y ?? 64;
+                return { key: paneKey(), task: p.task, x, y, z: ++zSeq.current, ctx: p.ctx ?? {} };
+              }),
           );
         }
         restored.current = true;
@@ -330,7 +316,7 @@ export function Nexus(props: {
   useEffect(() => {
     if (!restored.current) return;
     const t = setTimeout(() => {
-      const persisted: PersistedPane[] = panes.map((p) => ({ task: p.task, side: p.side, ctx: p.ctx, z: p.z }));
+      const persisted: PersistedPane[] = panes.map((p) => ({ task: p.task, x: p.x, y: p.y, ctx: p.ctx, z: p.z }));
       prefsApi.save({ nexus: { panes: persisted } }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
@@ -340,32 +326,9 @@ export function Nexus(props: {
   const trayTasks = TASKS.filter((t) => !t.hidden);
   const topZ = panes.reduce((m, p) => Math.max(m, p.z), 0);
 
-  const renderPane = (pane: PaneState) => {
-    const def = taskById(pane.task);
-    if (!def?.body) return null;
-    const Body = def.body;
-    return (
-      <TaskWindow
-        key={pane.key}
-        pane={pane}
-        title={def.title}
-        glyph={def.glyph}
-        focused={pane.z === topZ}
-        canJump={def.jumpView !== null}
-        onDock={dock}
-        onNudge={nudge}
-        onRaise={raise}
-        onClose={close}
-        onJump={jump}
-      >
-        <Body ctx={pane.ctx} nx={nx} />
-      </TaskWindow>
-    );
-  };
-
   return (
     <div className="nx-wrap">
-      <div className="nx-stage">
+      <div className="nx-stage" ref={stageRef}>
         <Construct
           data={data}
           layers={layers}
@@ -375,8 +338,28 @@ export function Nexus(props: {
           apiRef={constructApi}
           reducedMotion={props.reducedMotion}
         />
-        <div className="nx-dock left">{panes.filter((p) => p.side === "left").map(renderPane)}</div>
-        <div className="nx-dock right">{panes.filter((p) => p.side === "right").map(renderPane)}</div>
+        {panes.map((pane) => {
+          const def = taskById(pane.task);
+          if (!def?.body) return null;
+          const Body = def.body;
+          return (
+            <TaskWindow
+              key={pane.key}
+              pane={pane}
+              title={def.title}
+              glyph={def.glyph}
+              width={def.width ?? 380}
+              focused={pane.z === topZ}
+              canJump={def.jumpView !== null}
+              onMove={move}
+              onRaise={raise}
+              onClose={close}
+              onJump={jump}
+            >
+              <Body ctx={pane.ctx} nx={nx} />
+            </TaskWindow>
+          );
+        })}
       </div>
       <div className="nx-tray" role="toolbar" aria-label="All system tasks">
         <span className="nx-tray-label">TASKS //</span>

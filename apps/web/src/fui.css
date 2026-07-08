@@ -1080,29 +1080,11 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
   white-space: nowrap;
 }
 
-/* dock flanks: task panes stack on the stage's left/right edges so the
-   Construct's center stays unobstructed (docs/NEXUS.md §4.1) */
-.nx-dock {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: min(31%, 400px);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 10px;
-  overflow-y: auto;
-  pointer-events: none; /* the gaps stay click-through to the Construct */
-  z-index: 20;
-}
-.nx-dock.left { left: 0; }
-.nx-dock.right { right: 0; }
-
-/* task panes: vague transparent containers docked over the Construct's flanks */
+/* task panes: vague transparent containers floating over the Construct —
+   they drag anywhere and stack freely; only their spawn point is a flank
+   of the stage (docs/NEXUS.md §4.1) */
 .nx-pane {
-  position: relative;
-  pointer-events: auto;
-  flex: none;
+  position: absolute;
   border: 1px solid var(--stroke-hi);
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--panel) 45%, transparent);
@@ -1112,11 +1094,6 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
   display: flex;
   flex-direction: column;
   max-height: calc(100% - 24px);
-}
-.nx-pane.dragging {
-  opacity: 0.85;
-  z-index: 90;
-  box-shadow: 0 18px 56px rgba(0, 0, 0, 0.6);
 }
 .nx-pane .fui-bracket { border-color: var(--stroke-hi); }
 .nx-pane.focused { border-color: var(--accent-dim); }

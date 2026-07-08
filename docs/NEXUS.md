@@ -56,10 +56,10 @@ existing REST + WebSocket APIs (`apps/web/src/api.ts`); nothing is invented.
 |---|---|---|---|---|
 | **Kernel core** | 0 – 0.15R | A lattice of pixels animated as a **constant radial wave** (ripples run outward forever; speed rises with running missions, capped 3×), bounding ring | bus `connected`; every `BusEvent`; running count | The system's heartbeat. Click → **DISCOVERY** task (§2.4). Hold ≥700ms → SYSTEM SNAPSHOT ceremony. Gated → outer pixel band + ring blink amber. Disconnected → grey static lattice, "LINK DOWN". |
 | **Schema graticule** | 0.15 – 1.0R | Faint concentric arcs + radial degree ticks + orbit guides on populated rings | static geometry, labels are real counts | The "paper" of the instrument. Parallax-tilts with cursor. |
-| **Agent orbit** | 0.42R | One node per agent: ring glyph ◉ + autonomy tick (1/2/3 ticks = read/write/destructive), short name label on focus | `agentApi.list()` | Nodes **evenly spread** on the orbit (neat arrangement — v2). Agent active in last 20s → node glows + orbit dot spins. Click → **AGENT CHANNEL** task. |
-| **Mission ring** | 0.52R | One bead (rotated square) per mission of the active stratum, live-first, cap 14 | `api.listMissions()` + bus `mission.*`, `approval.*` | Live missions grow threads (below); settled beads stay as history (red = failed). Click → **MISSION DOSSIER** / **AUTHORIZATIONS** if gated. |
-| **Workflow lattice** | 0.63R | One node per workflow: square rotated 45°, inner n-gon with n = node count of its graph, `v{n}` tag on focus | `api.listWorkflows()` (+ graph node counts lazily) | Evenly spread. Click → **RUN WORKFLOW** task pre-selected. |
-| **Knowledge shell** | 0.76R | One node **per document** (evenly spread) with its chunk particles clustered around it (capped 240 total) | `kbApi.list()` | Density is the readout. Click → **KNOWLEDGE SEARCH** task. |
+| **Agent orbit** | 0.42R | One **radial bar** per agent (v2.1 — rings of bars, not dots, per the reference plate); bar length = autonomy tier (1/2/3 = read/write/destructive) | `agentApi.list()` | Bars **evenly spread** on the orbit. Agent active in last 20s → bar glows accent + orbit dot spins. Click → **AGENT CHANNEL** task. |
+| **Mission ring** | 0.52R | One **radial bar** per mission of the active stratum, live-first, cap 14 — long = live, short = settled; amber = gated, red = failed | `api.listMissions()` + bus `mission.*`, `approval.*` | Live missions grow threads (below); settled bars stay as history. Click → **MISSION DOSSIER** / **AUTHORIZATIONS** if gated. |
+| **Workflow lattice** | 0.63R | One **radial bar** per workflow — length = node count of its graph; a small n-gon spins beside ≥3-node graphs | `api.listWorkflows()` (+ graph node counts lazily) | Evenly spread. Click → **RUN WORKFLOW** task pre-selected. |
+| **Knowledge shell** | 0.76R | One **radial bar** per document — length = chunk weight — with its chunk particles clustered around it (capped 240 total) | `kbApi.list()` | Density is the readout. Click → **KNOWLEDGE SEARCH** task. |
 | **Tool spokes** | 0.88R | One spoke per MCP server/namespace, tick marks along the spoke = tools in it | `api.tools()` grouped by server | Tool namespaces live on the **newest stratum** (they have no birthday). Click spoke → **TOOL CATALOG** filtered to that server. |
 | **Mission threads** | core → rim | Strings from kernel to the bead's bearing; animated dash flow while running; **amber, taut (straight), vibrating** when `awaiting_approval` | live missions of the stratum | The signature motion. |
 | **Memory halo** | 1.0R rim | Rim ticks (neatly sequenced): pending authorizations (amber), failed missions last 24h (red) | approvals list, missions list | Global — consequences transcend strata. |
@@ -130,19 +130,20 @@ and a jump field accepting a year or stratum id.
 ┌────────────────────────────────────────────────────────────────────┐
 │ stage-head: 01 // NEXUS                     ⌘K COMMAND · 1–9 VIEWS │
 ├────────────────────────────────────────────────────────────────────┤
-│ ╔═ left dock ═╗                              ╔═ right dock ══╗     │
-│ ║ [pane]      ║        THE CONSTRUCT         ║ [pane]        ║     │
-│ ║ [pane]      ║     (full-stage canvas)      ║ [pane]        ║     │
-│ ╚═════════════╝                              ╚═══════════════╝     │
+│ [pane spawns left]                          [pane spawns right]    │
+│      ↘ then drags anywhere, stacks freely ↙                        │
+│                        THE CONSTRUCT                               │
+│                     (full-stage canvas)                            │
+│                                                                    │
 │                    STRATA // 2024 2025 [2026]                      │
 ├────────────────────────────────────────────────────────────────────┤
 │ task tray: ◉ CHANNEL ▤ RUN ⚑ AUTH ≡ DOSSIER ⌕ KB … (registry)      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-- The **Construct canvas fills the stage**. Panes **dock to the left/right
-  flanks** (v2) — never over the figure's center; a new pane lands on the
-  emptier flank. The dock gaps stay click-through to the Construct.
+- The **Construct canvas fills the stage**; panes float *above* it, drag
+  anywhere and stack/overlap freely — but every pane **emerges on a flank**
+  (the emptier of left/right, light cascade), never over the figure's center.
 - The **task tray** (bottom strip of the stage) lists every registry task as a chip —
   the guaranteed path to any task even if its stratum is empty (e.g. no agents yet).
   Chips show role-locked state for insufficient roles.
@@ -154,32 +155,30 @@ and a jump field accepting a year or stratum id.
 
 ## 4. Task pane system
 
-### 4.1 Pane anatomy (v2: docked flanks)
+### 4.1 Pane anatomy (v2.1: free-floating, flank spawn)
 
 ```
 ╭──────────────────────────────────────╮  ← 1px stroke, corner brackets
-│ ⣿ ◉ AGENT CHANNEL          ⇥  ⇱  ✕  │  ← title rail = drag handle
-│                                      │     ⇥/⇤ dock to the other flank
-│   (task body, compact module)        │     ⇱ jump-to-full-page
-│                                      │     ✕ close
+│ ⣿ ◉ AGENT CHANNEL             ⇱  ✕  │  ← title rail = drag handle
+│                                      │     ⇱ jump-to-full-page
+│   (task body, compact module)        │     ✕ close
 ╰──────────────────────────────────────╯
 ```
 
 - **Vague transparent background**: `background: color-mix(in srgb, var(--panel) 45%,
   transparent)` + `backdrop-filter: blur(9px)` + 1px stroke + brackets — deliberately
   *more* translucent than v1; the Construct stays present under every pane.
-- **Docked, not free-floating**: panes stack vertically inside a left or a right dock
-  column (`.nx-dock`, width `min(31%, 400px)`); the figure's center is never covered.
-  A new pane opens on the flank with fewer panes (explicit `ctx.side` overrides).
-- **Move**: pointer-drag on the title rail — release past the stage midline re-docks to
-  the other flank; release height picks the slot within the flank. The ⇥/⇤ rail button
-  re-docks in one click.
-- **Raise**: `pointerdown` anywhere marks the pane focused (accent brackets).
+- **Free-floating**: panes drag anywhere on the stage (pointer capture on the rail,
+  clamped to the stage) and **stack/overlap freely** — `pointerdown` anywhere raises
+  (z = monotonic counter); the focused pane gets accent brackets.
+- **Flank spawn**: a new pane *emerges* on the emptier flank of the stage (left or
+  right, whichever holds fewer panes by current position) with a light cascade — the
+  figure's center is never the spawn point. Explicit `ctx.x/ctx.y` overrides.
 - **Jump** (⇱): navigates the shell to the task's dedicated view and carries context
   (e.g. selected agent → Command view; mission → tracked dossier). The pane closes on
   jump (the full page supersedes it).
-- **Keyboard** (rail focused): ↑/↓ reorder within the flank, ←/→ switch flank, Escape
-  closes. Every control is tabbable.
+- **Keyboard** (rail focused): arrows nudge ±16px (Shift = 1px), Escape closes. Every
+  control is tabbable.
 
 ### 4.2 Task registry (the "all tasks" contract)
 
@@ -216,7 +215,7 @@ their full view; converting them to in-pane bodies is Phase P6 work, one row at 
 ### 4.3 Auto-hail (the system opens panes at you — v2 cadence)
 
 Attention items surface **one at a time on a fixed cadence** (2.8s apart), each
-docked to the emptier flank, so the operator is hailed, not buried:
+emerging on the emptier flank, so the operator is hailed, not buried:
 
 - **Urgent**: pending authorizations → the AUTHORIZATIONS pane.
 - **Need follow-up**: each mission failed in the last 24h (cap 5) → its MISSION
@@ -224,8 +223,8 @@ docked to the emptier flank, so the operator is hailed, not buried:
 - Each item hails **once per session**; closing a hailed pane is a decision the
   system respects (no re-hail until the trigger clears and fires again).
 - **Operation log on action**: tracking a mission from this page (launching a
-  workflow, hailing an agent) opens/raises the OPERATION LOG pane on the
-  emptier flank.
+  workflow, hailing an agent) opens/raises the OPERATION LOG pane, emerging on
+  the emptier flank.
 - The cadence timer is render-independent (refs), so shell re-renders never
   reset it.
 
@@ -236,15 +235,15 @@ docked to the emptier flank, so the operator is hailed, not buried:
 ```jsonc
 {
   "nexus": {
-    "panes": [ { "task": "agent.channel", "side": "right",
+    "panes": [ { "task": "agent.channel", "x": 820, "y": 120,
                  "ctx": { "agentId": "…" }, "z": 3 } ]
   }
 }
 ```
 
 Debounced 500ms; restored on entry; panes for since-deleted subjects drop
-silently. Legacy v1 layouts (free `x`/`y`) migrate on restore: `x > 460` →
-right flank, else left.
+silently. Interim dock-era layouts (a `side` with no `x`/`y`) land on that
+flank's default position on restore.
 
 ## 5. Interaction model — the cursor and the Construct
 
@@ -297,11 +296,11 @@ differ by *color + straightness*, never by motion alone.)
 
 ```
 apps/web/src/nexus/
-  Nexus.tsx        page: stage, dock/pane state, strata state, discovery index,
-                   auto-hail cadence, tray, persistence
+  Nexus.tsx        page: stage, pane state (flank spawn), strata state, discovery
+                   index, auto-hail cadence, tray, persistence
   Construct.tsx    canvas figure: buildLayers, layout pass, RAF painter, stratum
                    shift, pixel-wave kernel, homing beacon, cursor, hit-test
-  TaskWindow.tsx   docked translucent pane frame (rail, ⇥ ⇱ ✕, drag re-dock)
+  TaskWindow.tsx   draggable translucent pane frame (rail, ⇱ ✕, z-raise)
   registry.tsx     task registry (table §4.2) + compact task bodies + NX contract
 ```
 
@@ -387,6 +386,13 @@ lives. If code and doc disagree, the doc is intent, code is fact — reconcile a
 here.
 
 **Build log:**
+- 2026-07-08 · **v2.1 (owner feedback)**: panes float freely again — drag anywhere,
+  stack/overlap, z-raise — but every pane *emerges* on the emptier flank of the stage
+  (light cascade), never over the figure's center; dock columns removed; persistence
+  back to `x`/`y` with dock-era `side` layouts migrated on restore. Orbit content marks
+  changed from dots/glyphs to **radial bars** (reference plate look): agent bar length =
+  autonomy tier, workflow bar = graph node count, document bar = chunk weight, mission
+  bar = live/settled with amber gated / red failed, auth rim node = widest warn bar.
 - 2026-07-08 · **v2 overhaul (P7)**: NEXUS runs solo (shell side/OPERATION panels hidden
   on view 01 — their content became task panes); Construct stacked into year strata with
   a zoom-shift ceremony, ghost rings, depth gauge, wheel/`[` `]`/PageUp/Down navigation,
