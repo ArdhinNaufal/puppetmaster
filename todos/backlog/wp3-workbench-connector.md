@@ -47,9 +47,11 @@ Build **kernel only** — the script imports just `packages/kernel/dist/workbenc
 does not need the web app. (`pnpm build` also works but drags in the apps/web build, which
 needs a synced `pnpm install` for its `@fontsource` imports — unrelated to the workbench.)
 
-Expect `WORKBENCH EXECUTOR PASS: ensure/idempotent/non-root/exit-codes/in-container
-check/destroy` (exit 3 = no daemon). This is WP3b.1's acceptance — it drives the built
-`DockerCommandExecutor` against a real daemon.
+The script **builds the workbench image itself** if it's missing (the spike builds it then
+removes it, so it's normally absent). Expect `WORKBENCH EXECUTOR PASS:
+ensure/idempotent/non-root/exit-codes/in-container check/destroy` (exit 3 = no daemon).
+This is WP3b.1's acceptance — it drives the built `DockerCommandExecutor` against a real
+daemon.
 
 **Aside — the apps/web build failure (`@fontsource/rajdhani/500.css` unresolved):** not a
 repo bug — the lockfile pins it and it builds clean in CI/this repo. It's a stale local

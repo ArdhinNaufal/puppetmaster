@@ -14,8 +14,13 @@
 // inside and reports its real exit code both ways (pass + fail); destroy()
 // cleans up. Exit 0 = all assertions hold; 3 = no Docker daemon (skip).
 
+import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DockerCommandExecutor } from "../packages/kernel/dist/workbench.js";
 
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const IMAGE = process.env.WORKBENCH_IMAGE ?? "puppetmaster-workbench:spike";
 const projectId = `spike-${Date.now()}`;
 const wb = new DockerCommandExecutor();
 let fails = 0;
@@ -24,6 +29,26 @@ const bad = (m) => {
   console.error(`FAIL: ${m}`);
   fails++;
 };
+
+/** Raw docker invocation for image setup (the executor assumes the image exists). */
+function docker(args, timeoutMs = 300_000) {
+  return new Promise((resolve) => {
+    const child = spawn("docker", args);
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ code: -1, stdout, stderr: String(err) });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stdout, stderr });
+    });
+  });
+}
 
 // Preflight: is a daemon reachable? (executor.run rejects if docker can't run.)
 try {
@@ -38,6 +63,24 @@ try {
   // Other errors: daemon likely down.
   console.error(`SKIP: docker not usable (${err}). Run on a Docker-capable host.`);
   process.exit(3);
+}
+
+// The spike builds the image then removes it, so it usually isn't present here.
+// The executor assumes the image exists (image provisioning is a setup step,
+// not a runtime concern of ensure()) — so build it if missing.
+console.log("== workbench image present ==");
+const inspect = await docker(["image", "inspect", IMAGE]);
+if (inspect.code === 0) {
+  ok(`${IMAGE} already present`);
+} else {
+  console.log(`  building ${IMAGE} from docker/workbench.Dockerfile …`);
+  const built = await docker(["build", "-f", join(repoRoot, "docker/workbench.Dockerfile"), "-t", IMAGE, repoRoot]);
+  if (built.code === 0) {
+    ok(`built ${IMAGE}`);
+  } else {
+    console.error(`FAIL: could not build ${IMAGE}\n${built.stderr.trim()}`);
+    process.exit(1);
+  }
 }
 
 try {
