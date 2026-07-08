@@ -62,3 +62,9 @@ Protocol committed as `scripts/spike-adr002.sh`. Two halves:
 - native-agent coding quality reaches parity on the WP9 golden suite (measured, pass^k),
   **or** a customer segment requires fully local execution with no external CLI — then
   promote the native path from fallback to default.
+
+**Update (2026-07-08, ADR-008):** the "variety of provider / no lock to one vendor" facet of
+these triggers is addressed without a rewrite — `bench.delegate` is now pluggable over a
+`CodingCliAdapter` interface, shipping a `claude` and a provider-agnostic `aider` adapter. The
+native-path-as-default question above remains open; it becomes a future adapter-or-none choice
+rather than a re-architecture. See docs/adr/008-pluggable-coding-cli.md.

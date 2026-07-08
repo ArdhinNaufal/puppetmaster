@@ -30,13 +30,36 @@ RUN useradd --create-home --uid 10001 bench
 RUN mkdir -p /workbench && chown bench:bench /workbench
 WORKDIR /workbench
 
-# --- Pinned coding CLI per ADR-002 (bench.delegate) --------------------------
-# Pinned in the image, upgraded deliberately (ADR-002). The default is the
-# version the ADR-002 spike ran successfully (docs/adr/spike-002-record.md);
-# override with --build-arg CLAUDE_CODE_VERSION=<v>. Installed as root (global
-# npm prefix), then we drop back to the non-root workbench user.
+# --- Pluggable coding CLIs per ADR-002 + ADR-008 (bench.delegate) ------------
+# Each CLI is a bench.delegate adapter (packages/kernel/src/coding-cli.ts);
+# which one a call uses is a runtime choice. Both are pinned in the image and
+# upgraded deliberately (ADR-002), and each install is toggleable so a
+# deployment can slim the image to just the CLI it uses.
+
+# claude (Anthropic). Default engine. Pinned to the version the ADR-002 spike
+# ran (docs/adr/spike-002-record.md); override with --build-arg. Installed as
+# root into the global npm prefix.
+ARG INSTALL_CLAUDE_CODE=true
 ARG CLAUDE_CODE_VERSION=2.1.202
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+RUN if [ "$INSTALL_CLAUDE_CODE" = "true" ]; then \
+      npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}; \
+    fi
+
+# aider (provider-agnostic: OpenAI / Anthropic / Gemini / Ollama / local). Its
+# model is chosen at call time via DELEGATE_MODEL. Installed into an isolated
+# venv (Debian's PEP-668 externally-managed env forbids a bare pip install) and
+# symlinked onto PATH. Toggle off with --build-arg INSTALL_AIDER=false to skip
+# Python + aider entirely.
+ARG INSTALL_AIDER=true
+ARG AIDER_VERSION=0.86.1
+RUN if [ "$INSTALL_AIDER" = "true" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends python3 python3-venv \
+      && rm -rf /var/lib/apt/lists/* \
+      && python3 -m venv /opt/aider \
+      && /opt/aider/bin/pip install --no-cache-dir "aider-chat==${AIDER_VERSION}" \
+      && ln -s /opt/aider/bin/aider /usr/local/bin/aider; \
+    fi
 # -----------------------------------------------------------------------------
 
 USER bench

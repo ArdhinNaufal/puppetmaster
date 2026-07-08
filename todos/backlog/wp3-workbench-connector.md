@@ -35,26 +35,35 @@ Docker socket proxy.
       `main.ts` behind the same `WORKBENCH_MODE` executor. 4 golden tasks (write/read
       round-trip, exec+git.status, write-gated, push-gated) → suite 14→18 at pass^3.
       **exec allowlist deferred** (approval tier is the gate) — see below.
-- [~] **WP3b.4** `bench.delegate` — headless coding CLI inside the workbench (ADR-002).
-      **Authored 2026-07-08 (keyless slice); host acceptance pending** (needs Docker +
-      a live `ANTHROPIC_API_KEY`, spends real tokens). Shipped:
-      - `docker/workbench.Dockerfile`: the CLI layer is now enabled, pinned via
-        `ARG CLAUDE_CODE_VERSION=2.1.202` (installed as root, drops back to `bench`).
-      - `bench.delegate(projectId, task, { maxTurns?, timeoutMs? })` in
-        `packages/kernel/src/bench-tools.ts`, tier `write_approved` — runs
-        `claude -p <task> --output-format stream-json --verbose --max-turns <N>
-        --permission-mode acceptEdits` via `CommandExecutor.run()` (wall-clock via
-        `timeoutMs`), parses the transcript into `{ ok, numTurns, usage, result, costUsd }`.
-        Budgets clamped: `maxTurns` 1–50 (default 12), `timeoutMs` 1s–30min (default 5min).
-      - `parseDelegateStream` (exported) — the stream-json parser, robust to noise /
-        missing result / multiple result events; verified free by
-        `scripts/verify-delegate-parse.mjs` (DELEGATE PARSE PASS, 6 cases).
-      - Golden task `bench-delegate-gated` asserts the write-tier pause (suite 22→23,
-        pass^3, all green).
-      - `scripts/verify-delegate.mjs` — the **host** acceptance (Docker + key): CLI
-        present / key injected via the secrets path / a trivial task completes within
-        budget / turns+usage parse from the LIVE transcript / edit landed / destroy.
-        **Not yet run** — needs a Docker host and a key (spends tokens).
+- [~] **WP3b.4** `bench.delegate` — pluggable headless coding CLI inside the workbench
+      (ADR-002 + **ADR-008**). **Authored 2026-07-08 (keyless slice); host acceptance
+      pending** (needs Docker + a live provider key, spends real tokens). Shipped:
+      - **Pluggable coding CLI (ADR-008):** `bench.delegate` resolves a `CodingCliAdapter`
+        (`packages/kernel/src/coding-cli.ts`) by name instead of hardcoding one CLI. An
+        adapter = `buildCommand(task,{maxTurns})` + `parse(stdout,{code,stderr})` →
+        common `DelegateResult { cli, ok, numTurns?, usage?, result, costUsd?,
+        filesChanged?, reason? }`. Two adapters: **`claude`** (default; stream-json) and
+        **`aider`** (provider-agnostic — OpenAI/Anthropic/Gemini/Ollama/local, model via
+        `DELEGATE_MODEL`). Default adapter overridable via `DELEGATE_CLI`. This closes the
+        "variety of AI API, not just Claude" requirement — the agent runtime was already
+        multi-provider via the Model Router; delegate was the only Claude-locked surface.
+      - `docker/workbench.Dockerfile`: both CLI layers, each pinned + toggleable
+        (`INSTALL_CLAUDE_CODE`/`CLAUDE_CODE_VERSION=2.1.202`, `INSTALL_AIDER`/`AIDER_VERSION`
+        via an isolated venv). Slim the image to one CLI by toggling the other off.
+      - `bench.delegate(projectId, task, { cli?, maxTurns?, timeoutMs? })`, tier
+        `write_approved`, over `CommandExecutor.run()` (wall-clock via `timeoutMs`).
+        Budgets clamped: `maxTurns` 1–50 (default 12, advisory — ignored by aider),
+        `timeoutMs` 1s–30min (default 5min). Unknown `cli` refuses by name.
+      - `parseClaudeStream` + `parseAiderOutput` (exported from coding-cli) — verified
+        free by `scripts/verify-delegate-parse.mjs` (DELEGATE PARSE PASS, claude 6 cases
+        + aider 4 cases).
+      - Golden tasks: `bench-delegate-gated` + `bench-delegate-pluggable-cli-still-gated`
+        (choosing `cli:aider` does not bypass the write-tier gate). Suite 22→25, pass^3.
+      - `scripts/verify-delegate.mjs` — the **host** acceptance (Docker + key),
+        parameterized by `DELEGATE_CLI=claude|aider`: CLI present / key injected via the
+        secrets path / a trivial task completes within budget / adapter parses the LIVE
+        output / edit landed / destroy. **Not yet run** — needs a Docker host and a
+        provider key (spends tokens).
 
       **Follow-up (not downgraded silently):** true mid-run token caps and live
       progress→mission-trace streaming need a streaming `CommandExecutor.run()` the
@@ -140,20 +149,29 @@ authored, typecheck + build clean, `DELEGATE PARSE PASS` (6 cases), golden suite
 pass^3 (added `bench-delegate-gated`), arch check OK. The Dockerfile CLI layer is enabled
 (pinned `CLAUDE_CODE_VERSION=2.1.202`).
 
-**▶ NEXT — run `bench.delegate`'s HOST acceptance (Docker + live key, spends tokens):**
+**▶ NEXT — run `bench.delegate`'s HOST acceptance (Docker + live key, spends tokens).**
+Pluggable now (ADR-008): verify per CLI via `DELEGATE_CLI`.
 
 ```
 docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .
 pnpm --filter "@puppetmaster/kernel..." build
+
+# claude (Anthropic) — the default adapter
 ANTHROPIC_API_KEY=sk-... node scripts/verify-delegate.mjs
+
+# aider on any provider (here OpenAI) — proves the multi-provider path
+DELEGATE_CLI=aider DELEGATE_MODEL=openai/gpt-4o OPENAI_API_KEY=sk-... \
+  node scripts/verify-delegate.mjs
 ```
 
-Expect `DELEGATE PASS: cli-present/key-injected/task-completes/turns+usage-parsed/edit-landed/destroy`
-(exit 3 = no daemon or no key). The `docker build` (not the egress-proxy image) is what
-now bakes the pinned CLI — rebuild it after any Dockerfile change. This is the FIRST WP3b
-increment whose acceptance costs money; every prior one verified for free. Record the PASS
-here before building further on delegate. Once green, WP5's EXECUTE templates
-(`/next` via `bench.delegate`, `/loop` gated) are unblocked.
+Expect `DELEGATE PASS (<cli>): cli-present/key-injected/task-completes/parsed/edit-landed/destroy`
+(exit 3 = no daemon or no key). The `docker build` bakes both pinned CLIs (toggle either off
+with `--build-arg INSTALL_AIDER=false` / `INSTALL_CLAUDE_CODE=false`) — rebuild after any
+Dockerfile change. This is the FIRST WP3b increment whose acceptance costs money; every prior
+one verified for free. Record the PASS here (per CLI) before building further on delegate.
+Once at least one adapter is green, WP5's EXECUTE templates (`/next` via `bench.delegate`,
+`/loop` gated) are unblocked. Keyless parser acceptance already passes:
+`node scripts/verify-delegate-parse.mjs` → `DELEGATE PARSE PASS`.
 
 **Prior increment — WP3b.5 host-verified 2026-07-07 ✅:** `EGRESS PROXY PASS` on a real
 Docker host (secret-inject / proxy-env / allowlisted-ok / denied-refused / direct-blocked /

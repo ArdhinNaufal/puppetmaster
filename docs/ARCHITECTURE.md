@@ -244,6 +244,13 @@ shipped; the full phase orchestration (EXECUTE via a headless CLI) is in progres
   (write, gated), `bench.git.status`/`.diff` (read), `bench.git.push` (destructive) — a tiered,
   workspace-scoped surface over the same executor; results inherit the untrusted-data envelope
   and Stage 9C compaction like any catalog tool. Absent an executor, every call refuses by name.
+- **`bench.delegate`** (WP3b.4, ADR-002 + **ADR-008**): delegates a coding task to a headless
+  coding CLI running inside the workbench (write-tier, turn + wall-clock budget). The CLI is
+  **pluggable** via a `CodingCliAdapter` (`coding-cli.ts`) — ships `claude` (Anthropic,
+  stream-json) and `aider` (provider-agnostic: OpenAI/Anthropic/Gemini/Ollama/local, model via
+  `DELEGATE_MODEL`), selected per call (`cli`) or per deployment (`DELEGATE_CLI`). This is the
+  EXECUTE-phase complement to §3.5's already-multi-provider Model Router — together they mean no
+  Workshop surface is locked to a single AI provider.
 - **Knowledge mirror** (ADR-004): accepted `spec`/`learning` artifacts mirror into the KB on
   write (one live document per project+kind+title, replaced each version) so `kb.search` and
   citations work over them; a mirror failure never loses the artifact write.

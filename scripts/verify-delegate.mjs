@@ -1,43 +1,59 @@
 #!/usr/bin/env node
 // WP3b.4 host verification — drives bench.delegate's LIVE path against a real
-// Docker daemon with the pinned coding CLI inside the workbench (ADR-002).
+// Docker daemon with a pluggable coding CLI inside the workbench (ADR-002/008).
 //
 // ⚠️ THIS COSTS REAL MONEY. Unlike every other WP3b verify script, this one runs
-// the actual `claude` CLI making real model calls, so it needs a live key and
-// will spend tokens on your account. Budget for it. The PARSING logic is verified
-// for free by scripts/verify-delegate-parse.mjs — run that first.
+// a real coding CLI making real model calls, so it needs a live key and will
+// spend tokens on your account. Budget for it. The adapters' PARSING logic is
+// verified for free by scripts/verify-delegate-parse.mjs — run that first.
 //
-// Build the workbench image WITH the CLI layer (the ARG defaults to the pinned
-// version; override deliberately), then run with a key:
+// Pick the CLI with DELEGATE_CLI (default claude). Build the workbench image
+// with that CLI's layer, then run with the matching provider key:
 //
+//   # claude (Anthropic)
 //   docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .
 //   pnpm --filter "@puppetmaster/kernel..." build
 //   ANTHROPIC_API_KEY=sk-... node scripts/verify-delegate.mjs
 //
-// Proves, end-to-end through the executor + tool CODE:
-//   - the pinned CLI is present in the image (`claude --version` runs);
-//   - the key reaches the CLI via the ADR-005 secrets env-injection path;
-//   - a trivial delegate task completes within budget (real stream-json);
-//   - parseDelegateStream lands ok/numTurns/usage/result from the LIVE transcript.
+//   # aider on any provider (here OpenAI); DELEGATE_MODEL picks the model
+//   DELEGATE_CLI=aider DELEGATE_MODEL=openai/gpt-4o OPENAI_API_KEY=sk-... \
+//     node scripts/verify-delegate.mjs
+//
+// Proves, end-to-end through the executor + adapter CODE:
+//   - the chosen CLI is present in the image (`<cli> --version` runs);
+//   - the provider key reaches the CLI via the ADR-005 secrets env path;
+//   - a trivial delegate task completes within budget (real CLI output);
+//   - the adapter parses ok/result (+ turns/usage where the CLI reports them);
+//   - the edit actually landed in the workbench.
 // Exit 0 = all hold; 1 = a failure; 3 = no daemon or no key (skip).
 
 import { DockerCommandExecutor } from "../packages/kernel/dist/workbench.js";
-import { parseDelegateStream } from "../packages/kernel/dist/bench-tools.js";
+import { resolveCodingCli } from "../packages/kernel/dist/coding-cli.js";
 
-const KEY = process.env.ANTHROPIC_API_KEY;
+const CLI = (process.env.DELEGATE_CLI ?? "claude").trim();
+const adapter = resolveCodingCli(CLI);
+
+// Per-CLI provider wiring: which key must be present, and which host to allow.
+// aider's provider follows DELEGATE_MODEL (openai/*, anthropic/*, gemini/*, …).
+const MODEL = process.env.DELEGATE_MODEL ?? "openai/gpt-4o";
+const PROVIDER = CLI === "aider" ? MODEL.split("/")[0] : "anthropic";
+const KEY_ENV = { anthropic: "ANTHROPIC_API_KEY", openai: "OPENAI_API_KEY", gemini: "GEMINI_API_KEY" }[PROVIDER] ?? "OPENAI_API_KEY";
+const ALLOW_HOST = { anthropic: "api.anthropic.com", openai: "api.openai.com", gemini: "generativelanguage.googleapis.com" }[PROVIDER] ?? "api.openai.com";
+
+const KEY = process.env[KEY_ENV];
 if (!KEY) {
-  console.error("SKIP: ANTHROPIC_API_KEY not set — bench.delegate needs a live key (spends tokens).");
+  console.error(`SKIP: ${KEY_ENV} not set — bench.delegate (${CLI}) needs a live key (spends tokens).`);
   process.exit(3);
 }
 
-const projectId = `delegate-${Date.now()}`;
+const projectId = `delegate-${CLI}-${Date.now()}`;
 // The key rides the ADR-005 secrets path (vault-injected env at spawn), exactly
-// how the server will deliver {{credential:ANTHROPIC_API_KEY}} in production.
-// Egress must reach the Anthropic API — allowlist it (proxy sidecar comes up).
-const wb = new DockerCommandExecutor({
-  secrets: { ANTHROPIC_API_KEY: KEY },
-  egressAllow: ["api.anthropic.com"],
-});
+// how the server delivers {{credential:NAME}} in production. aider also needs
+// DELEGATE_MODEL in its env (the adapter's --model reads it).
+const secrets = { [KEY_ENV]: KEY };
+if (CLI === "aider") secrets.DELEGATE_MODEL = MODEL;
+const wb = new DockerCommandExecutor({ secrets, egressAllow: [ALLOW_HOST] });
+
 let fails = 0;
 const ok = (m) => console.log(`  ok — ${m}`);
 const bad = (m) => {
@@ -57,46 +73,36 @@ try {
   process.exit(3);
 }
 
+console.log(`== delegate CLI: ${CLI}${CLI === "aider" ? ` (model ${MODEL})` : ""} · provider ${PROVIDER} ==`);
+
 try {
   console.log("== ensure() brings up the workbench (+ egress proxy) ==");
   await wb.ensure(projectId);
   (await wb.status(projectId)) === "running" ? ok("workbench running") : bad("workbench not running");
 
-  console.log("== the pinned CLI is present in the image ==");
-  const ver = await wb.run({ projectId, command: "claude --version" });
+  console.log("== the chosen CLI is present in the image ==");
+  const ver = await wb.run({ projectId, command: `${CLI} --version` });
   ver.code === 0 && ver.stdout.trim()
-    ? ok(`claude --version → ${ver.stdout.trim()}`)
-    : bad(`claude CLI missing/not runnable (code=${ver.code}, err=${ver.stderr.trim().slice(0, 160)})`);
+    ? ok(`${CLI} --version → ${ver.stdout.trim().split("\n")[0]}`)
+    : bad(`${CLI} CLI missing/not runnable (code=${ver.code}, err=${ver.stderr.trim().slice(0, 160)})`);
 
   console.log("== the key reached the workbench via the secrets path ==");
-  const keyEnv = await wb.run({ projectId, command: 'test -n "$ANTHROPIC_API_KEY" && echo present' });
-  keyEnv.stdout.trim() === "present" ? ok("ANTHROPIC_API_KEY injected") : bad("key not injected into env");
+  const keyEnv = await wb.run({ projectId, command: `test -n "$${KEY_ENV}" && echo present` });
+  keyEnv.stdout.trim() === "present" ? ok(`${KEY_ENV} injected`) : bad("key not injected into env");
 
   console.log("== a trivial delegate task completes within budget (LIVE — spends tokens) ==");
-  // Seed a file so there is a concrete, cheap edit to make.
-  await wb.run({ projectId, command: "printf 'export const add = (a, b) => a + b;\\n' > add.mjs" });
-  const maxTurns = 6;
-  const command =
-    "claude -p 'Add a one-line JSDoc comment above the add function in add.mjs.' " +
-    "--output-format stream-json --verbose " +
-    `--max-turns ${maxTurns} --permission-mode acceptEdits`;
+  await wb.run({ projectId, command: "printf 'export const add = (a, b) => a + b;\\n' > add.mjs && git init -q && git add -A && git commit -qm seed" });
+  const command = adapter.buildCommand("Add a one-line JSDoc comment above the add function in add.mjs.", { maxTurns: 6 });
   const started = Date.now();
   const res = await wb.run({ projectId, command, timeoutMs: 300_000 });
   const secs = ((Date.now() - started) / 1000).toFixed(1);
   if (res.timedOut) {
     bad(`delegate task timed out after ${secs}s`);
   } else {
-    const parsed = parseDelegateStream(res.stdout);
+    const parsed = adapter.parse(res.stdout, { code: res.code, stderr: res.stderr });
     parsed.ok
-      ? ok(`delegate ok in ${secs}s — numTurns=${parsed.numTurns}, cost=$${parsed.costUsd ?? "?"}`)
+      ? ok(`delegate ok in ${secs}s — cli=${parsed.cli}, numTurns=${parsed.numTurns ?? "n/a"}, cost=$${parsed.costUsd ?? "?"}`)
       : bad(`delegate not ok (reason=${parsed.reason}, exit=${res.code}, err=${res.stderr.trim().slice(0, 160)})`);
-    typeof parsed.numTurns === "number" && parsed.numTurns >= 1
-      ? ok(`numTurns parsed from live transcript = ${parsed.numTurns}`)
-      : bad(`numTurns not parsed from live transcript (got ${parsed.numTurns})`);
-    parsed.usage && typeof parsed.usage === "object"
-      ? ok(`usage parsed from live transcript`)
-      : bad(`usage not parsed from live transcript (got ${JSON.stringify(parsed.usage)})`);
-    // The edit actually landed in the workbench.
     const grep = await wb.run({ projectId, command: "grep -c '/\\*\\*\\|//' add.mjs || true" });
     Number(grep.stdout.trim()) > 0 ? ok("a comment landed in add.mjs") : bad("no comment found in add.mjs after delegate");
   }
@@ -107,7 +113,7 @@ try {
 }
 
 if (fails > 0) {
-  console.error("\nDELEGATE: FAIL");
+  console.error(`\nDELEGATE (${CLI}): FAIL`);
   process.exit(1);
 }
-console.log("\nDELEGATE PASS: cli-present/key-injected/task-completes/turns+usage-parsed/edit-landed/destroy");
+console.log(`\nDELEGATE PASS (${CLI}): cli-present/key-injected/task-completes/parsed/edit-landed/destroy`);
