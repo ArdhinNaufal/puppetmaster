@@ -29,7 +29,19 @@
       deferred**: its home is the Command-view interview session, which needs the
       project↔conversation link (WP7 phase-flow actions, blocked on EXECUTE) — a
       name-matched card now would be speculative.
-- [ ] PLAN phase (read-only workbench explore → editable plan artifact; skip affordance)
+- [x] PLAN phase (read-only workbench explore → editable plan artifact; skip affordance) —
+      **landed 2026-07-08.** `Workshop Planner` builtin agent seeded (category `workshop`,
+      between Interviewer and Foreman): reads the spec first, explores the repo read-only
+      (least-privilege grants — `project.*` + only `bench.read`/`git.status`/`git.diff`,
+      never a mutating bench tool), writes an editable `plan` artifact (Approach / Increments
+      in build order / Risks & unknowns / Verification), and carries the skip affordance
+      (trivial change ⇒ one-line plan + skip rationale, refuse planning theater). Foreman
+      updated to read the plan and follow its increment order (diverge ⇒ back to PLAN, not
+      improvise). Golden task `workshop-plan-artifact-editable-versioned` pins the plan
+      lifecycle (v1→v2 supersede chain, newest current) and locks that plan is *not*
+      KB-mirrored (ADR-004 stays spec+learning — no semantic-search consumer yet). Suite
+      23→24 at pass^3. Judgment quality (does it plan *well*) needs real-model sessions —
+      deferred with the other agent-behavior evals, same as Interviewer/Foreman/Reviewer.
 - [ ] EXECUTE supervised template (`/next` contract via `bench.delegate`)
 - [ ] EXECUTE gated template (`/loop` contract; mode chooser asks the pass@k/pass^k
       question; refuses without enabled verify checks — linter rule exists, wire the mode)

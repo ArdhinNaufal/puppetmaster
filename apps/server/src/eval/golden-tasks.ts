@@ -485,6 +485,67 @@ export const GOLDEN_TASKS: GoldenTask[] = [
     },
   },
   {
+    id: "workshop-plan-artifact-editable-versioned",
+    description:
+      "Workshop WP5 PLAN phase: the plan artifact is editable — a revision is a new version that supersedes the prior (never a rewrite). Two writes leave two versions chained, the newest current. Plan is NOT KB-mirrored (ADR-004 mirrors spec+learning only — no semantic-search consumer for the plan yet).",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, { workspaceId: ctx.workspaceId, name: "eval-plan-version" });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "p1",
+          kind: "action",
+          label: "write plan v1",
+          config: {
+            server: "project",
+            tool: "artifact.write",
+            args: { projectId: "{{input.projectId}}", kind: "plan", title: "Plan", body: "## Approach\nBuild the widget store bottom-up.\n## Increments\n1. schema + repo; 2. service layer; 3. UI.\n## Risks & unknowns\nConcurrent-edit semantics unconfirmed.\n## Verification\nUnit tests per layer; the suite gates each increment." },
+          },
+        },
+        {
+          id: "p2",
+          kind: "action",
+          label: "revise plan v2",
+          config: {
+            server: "project",
+            tool: "artifact.write",
+            args: { projectId: "{{input.projectId}}", kind: "plan", title: "Plan", body: "## Approach\nBuild the widget store bottom-up.\n## Increments\n1. schema + repo; 2. service layer; 3. UI; 4. audit trail.\n## Risks & unknowns\nConcurrent edits resolved as last-write-wins with an audit entry.\n## Verification\nUnit tests per layer; the suite gates each increment; an e2e edit-and-audit check." },
+          },
+        },
+      ],
+      edges: [
+        // Payload-input trick (see learnings.md): the trigger edge declared
+        // first hands each node the mission payload; the chain edge orders.
+        { from: "t", to: "p1" },
+        { from: "t", to: "p2" },
+        { from: "p1", to: "p2" },
+      ],
+    },
+    expectState: async (db, ctx) => {
+      const { listProjects: lp } = await import("@puppetmaster/db");
+      const project = (await lp(db, ctx.workspaceId)).find((p) => p.name === "eval-plan-version");
+      if (!project) return false;
+      const plans = await listArtifacts(db, project.id, { kind: "plan" });
+      if (plans.length !== 2) return false;
+      const byVersion = [...plans].sort((a, b) => a.version - b.version);
+      const [v1, v2] = byVersion;
+      const versioned =
+        v1!.version === 1 &&
+        v2!.version === 2 &&
+        v2!.supersedesId === v1!.id &&
+        v1!.supersedesId === null &&
+        v2!.body.includes("audit trail");
+      // Plan is deliberately NOT mirrored into the KB (spec+learning only).
+      const source = `project:${project.id}:plan:Plan`;
+      const mirrors = (await listDocuments(db, ctx.workspaceId)).filter((d) => d.source === source);
+      return versioned && mirrors.length === 0;
+    },
+  },
+  {
     id: "workshop-test-check-pass-local",
     description:
       "Workshop WP3a: a project's `test` check runs `node --test` in the local workbench; passing → the gate opens, evidence is captured, the gated action runs",
