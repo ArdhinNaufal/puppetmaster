@@ -247,6 +247,10 @@ export class OpenAICompatProvider implements ModelProvider {
       },
       body: JSON.stringify({
         model,
+        // Non-streaming: this provider parses a single JSON body via res.json().
+        // Some OpenAI-compatible proxies stream by default, which breaks that
+        // parse ("data: {...}" SSE), so request the non-streamed shape explicitly.
+        stream: false,
         max_tokens: req.maxTokens ?? 4096,
         messages,
         ...(req.tools?.length
