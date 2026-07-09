@@ -10,6 +10,8 @@ Built for small teams running it on their own server.
 
 📐 Specification phase. Read the docs:
 
+- [Getting Started (non-technical, step-by-step)](docs/GETTING-STARTED.md)
+- [Installing Puppetmaster (technical reference)](docs/INSTALL.md)
 - [Product Requirements (PRD)](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [FUI Design Language](docs/DESIGN-LANGUAGE.md)
