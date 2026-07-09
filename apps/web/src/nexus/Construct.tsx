@@ -3,15 +3,20 @@ import type { Agent, Approval, Mission } from "../api.js";
 import type { SignalEntry } from "../Signal.js";
 
 /**
- * The Construct v2 (docs/NEXUS.md §2): Puppetmaster's avatar — an armillary
- * instrument stacked in time. Everything the system has grown is grouped into
- * strata (one layer per creation year); each stratum is a neatly-arranged
- * radial diagram, and the operator dives between strata with a zoom ceremony
- * (wheel, [ ] keys, the depth gauge, or DISCOVERY). The kernel core is a
- * constant pixel wave; clicking it opens the DISCOVERY pane. Canvas 2D, one
- * layout pass per frame shared by the painter, the hit-tester and the
- * keyboard walker. Reduced motion renders a static, fully interactive
- * diagram with instant stratum shifts.
+ * The Construct v2.2 (docs/NEXUS.md §2): Puppetmaster's avatar — an armillary
+ * instrument stacked in time. Strata group content by creation year; each
+ * stratum is rings of radial bars (never dots) that counter-rotate
+ * continuously — hovering an orbit (or a DISCOVERY locate) halts the motion,
+ * dwells, auto-opens the destination pane, then the rotation resumes. The
+ * kernel is a wandering pixel wave at rest (it leans toward the cursor) and
+ * an aggressive signal-line burst while missions run. Running missions cast
+ * dashed threads from the kernel circle to their bars; gated missions pulse
+ * their bar scale instead. Wheel (or the +/− buttons) zooms the instrument —
+ * zoomed in, the figure locks to the left half of the stage and the hovered
+ * orbit spins its content past the cursor. Canvas 2D, one layout pass per
+ * frame shared by painter, hit-tester and keyboard walker; reduced motion is
+ * a static, fully interactive diagram (no rotation, no dwell auto-open —
+ * click/Enter keep full parity).
  */
 
 export interface ConstructWorkflow {
@@ -126,8 +131,7 @@ function mulberry(seed: number) {
   };
 }
 
-/** Radial bar centered on an orbit point — the content mark of every ring
- *  (the reference look: rings of bars, not dots; length is the readout). */
+/** Radial bar centered on an orbit point — the content mark of every ring. */
 function bar(ctx: CanvasRenderingContext2D, x: number, y: number, a: number, len: number) {
   const dx = Math.cos(a);
   const dy = Math.sin(a);
@@ -149,6 +153,11 @@ function poly(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, n:
   ctx.stroke();
 }
 
+/** Bar-height variation: every bar carries its data readout times a stable
+ *  per-id unevenness (0.85–1.35) so the rings read like a live spectrum,
+ *  not a picket fence. */
+const jitter = (id: string) => 0.85 + ((hash(id) % 1000) / 1000) * 0.5;
+
 const AUTONOMY_TICKS: Record<string, number> = { read_auto: 1, write_approved: 2, destructive_confirmed: 3 };
 const LIVE_STATUS = new Set(["running", "awaiting_approval", "queued"]);
 /** Display caps per stratum ring (search sees everything; the figure stays legible). */
@@ -160,6 +169,27 @@ const NODE_KIND_FOR: Record<LocateKind, CNode["kind"]> = {
   tool: "spoke",
   mission: "thread",
 };
+
+/** Orbit table: radius, spin direction and idle speed (rad/s) — every ring
+ *  turns a different way at a different pace. */
+const RINGS = {
+  agent: { r: 0.42, dir: 1, speed: 0.05, offset: 0 },
+  thread: { r: 0.52, dir: -1, speed: 0.04, offset: 0.5 },
+  workflow: { r: 0.63, dir: 1, speed: 0.033, offset: 0 },
+  knowledge: { r: 0.76, dir: -1, speed: 0.026, offset: 0.5 },
+  spoke: { r: 0.88, dir: 1, speed: 0.02, offset: 0 },
+} as const;
+type RingKind = keyof typeof RINGS;
+const RING_KINDS = Object.keys(RINGS) as RingKind[];
+/** Spin rate of the hovered orbit while zoomed in (rad/s). */
+const ZOOM_SPIN = 0.3;
+/** Hover-dwell before the focused bar auto-opens its pane (ms). */
+const DWELL_MS = 650;
+const DWELL_COOLDOWN_MS = 1800;
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 2.6;
+/** Past this, the figure is "zoomed": it locks to the left half of the stage. */
+const ZOOM_LOCK = 1.15;
 
 interface Palette {
   accent: string;
@@ -210,11 +240,24 @@ export function Construct(props: {
   const renderRequested = useRef(false);
   /** Stratum shift in flight: dir 1 = diving deeper (older year), -1 = surfacing. */
   const trans = useRef<{ from: string; to: string; t0: number; dir: 1 | -1 } | null>(null);
-  /** Homing beacon from DISCOVERY: waits out any stratum shift, then converges. */
+  /** Homing beacon from DISCOVERY: waits out any stratum shift, converges, opens. */
   const locate = useRef<{ kind: CNode["kind"]; id: string; t0: number; until: number } | null>(null);
   const pixels = useRef<{ dx: number; dy: number; d: number }[]>([]);
-  const wheelAcc = useRef(0);
+  /** Continuous orbit rotation offsets, one per ring, advanced in the loop. */
+  const rot = useRef<Record<RingKind, number>>({ agent: 0, thread: 0, workflow: 0, knowledge: 0, spoke: 0 });
+  const lastFrame = useRef(0);
+  /** Idle kernel wave direction (random walk; leans toward the cursor). */
+  const waveDir = useRef(0);
+  /** Hover-dwell auto-open bookkeeping. */
+  const dwell = useRef<{ firedKey: string | null; cooldownUntil: number }>({ firedKey: null, cooldownUntil: 0 });
+  const [zoom, setZoom] = useState(1);
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
   const [announce, setAnnounce] = useState("");
+
+  const setZoomClamped = useCallback((z: number) => {
+    setZoom(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z)));
+  }, []);
 
   // Bus events → kernel pulses (flash-settle; alarms on failures).
   useEffect(() => {
@@ -228,6 +271,17 @@ export function Construct(props: {
       pulses.current = pulses.current.slice(-6);
     }
   }, [props.data.signals]);
+
+  /* ---- view: one transform for figure geometry (zoom + left-half lock) ----- */
+  const view = useCallback(() => {
+    const { w, h } = size.current;
+    const z = zoomRef.current;
+    const baseR = Math.max(120, Math.min(w, h) / 2 - 36);
+    // zoomed in → the figure locks into the left half of the stage
+    const lockT = Math.max(0, Math.min(1, (z - 1) / (ZOOM_LOCK - 1 + 0.35)));
+    const cx = w / 2 + (w * 0.28 - w / 2) * lockT;
+    return { cx, cy: h / 2, R: baseR * z, baseR };
+  }, []);
 
   /* ---- targeting ------------------------------------------------------------ */
   const findNode = useCallback((x: number, y: number): CNode | null => {
@@ -293,14 +347,13 @@ export function Construct(props: {
   }, []);
 
   /* ---- layout pass: one node table shared by painter/hits/keyboard ------- */
-  const baseR = () => Math.max(120, Math.min(size.current.w, size.current.h) / 2 - 36);
 
-  /** Ring nodes for one stratum, neatly spread on their orbits. */
+  /** Ring nodes for one stratum: bars evenly spread, rotated by the orbit spin. */
   const layoutLayer = useCallback((layer: ConstructLayer, scale: number, interactive: boolean): CNode[] => {
-    const { w, h } = size.current;
-    const cx = w / 2;
-    const cy = h / 2;
-    const R = baseR() * scale;
+    const v = view();
+    const cx = v.cx;
+    const cy = v.cy;
+    const R = v.baseR * zoomRef.current * scale;
     const tx = interactive ? tilt.current.x : 0;
     const ty = interactive ? tilt.current.y : 0;
     const place = (r: number, a: number): { x: number; y: number } => {
@@ -319,7 +372,8 @@ export function Construct(props: {
       }
       return { x, y };
     };
-    const spread = (i: number, n: number, offset = 0) => -Math.PI / 2 + ((i + offset) / Math.max(n, 1)) * Math.PI * 2;
+    const spread = (kind: RingKind, i: number, n: number) =>
+      -Math.PI / 2 + rot.current[kind] + ((i + RINGS[kind].offset) / Math.max(n, 1)) * Math.PI * 2;
 
     const d = dataRef.current;
     const activeSubjects = new Set(d.signals.filter((s) => Date.now() - s.at < 20_000).map((s) => s.subject));
@@ -327,8 +381,8 @@ export function Construct(props: {
 
     const ags = layer.agents.slice(0, CAP.agents);
     ags.forEach((ag, i) => {
-      const a = spread(i, ags.length);
-      const p = place(R * 0.42, a);
+      const a = spread("agent", i, ags.length);
+      const p = place(R * RINGS.agent.r, a);
       nodes.push({
         kind: "agent", id: ag.id, x: p.x, y: p.y, a, hit: 16,
         label: ag.name.toUpperCase(), sub: `${ag.model.toUpperCase()} · OPEN CHANNEL`,
@@ -340,8 +394,8 @@ export function Construct(props: {
     const rest = layer.missions.filter((m) => !LIVE_STATUS.has(m.status));
     const ms = [...live, ...rest].slice(0, CAP.missions);
     ms.forEach((m, i) => {
-      const a = spread(i, ms.length, 0.5);
-      const p = place(R * 0.52, a);
+      const a = spread("thread", i, ms.length);
+      const p = place(R * RINGS.thread.r, a);
       nodes.push({
         kind: "thread", id: m.id, x: p.x, y: p.y, a, hit: 14,
         label: `OP ${m.id.slice(0, 8)}`,
@@ -354,8 +408,8 @@ export function Construct(props: {
 
     const wfs = layer.workflows.slice(0, CAP.workflows);
     wfs.forEach((wf, i) => {
-      const a = spread(i, wfs.length);
-      const p = place(R * 0.63, a);
+      const a = spread("workflow", i, wfs.length);
+      const p = place(R * RINGS.workflow.r, a);
       nodes.push({
         kind: "workflow", id: wf.id, x: p.x, y: p.y, a, hit: 15,
         label: wf.name.toUpperCase(),
@@ -365,8 +419,8 @@ export function Construct(props: {
 
     const docs = layer.docs.slice(0, CAP.docs);
     docs.forEach((doc, i) => {
-      const a = spread(i, docs.length, 0.5);
-      const p = place(R * 0.76, a);
+      const a = spread("knowledge", i, docs.length);
+      const p = place(R * RINGS.knowledge.r, a);
       nodes.push({
         kind: "knowledge", id: doc.id, x: p.x, y: p.y, a, hit: 13,
         label: doc.title.toUpperCase().slice(0, 26),
@@ -376,8 +430,8 @@ export function Construct(props: {
 
     const srvs = layer.toolServers.slice(0, CAP.tools);
     srvs.forEach((srv, i) => {
-      const a = spread(i, srvs.length);
-      const p = place(R * 0.88, a);
+      const a = spread("spoke", i, srvs.length);
+      const p = place(R * RINGS.spoke.r, a);
       nodes.push({
         kind: "spoke", id: srv.server, x: p.x, y: p.y, a, hit: 15,
         label: srv.server.toUpperCase(), sub: `${srv.tools} TOOLS · CATALOG`,
@@ -385,30 +439,28 @@ export function Construct(props: {
     });
 
     return nodes;
-  }, []);
+  }, [view]);
 
   /** Kernel, authorization rim node and the depth gauge — stratum-independent. */
   const layoutChrome = useCallback((): { kernel: CNode; rest: CNode[] } => {
     const { w, h } = size.current;
-    const cx = w / 2;
-    const cy = h / 2;
-    const R = baseR();
+    const v = view();
     const d = dataRef.current;
     const kernel: CNode = {
-      kind: "kernel", id: "kernel", x: cx, y: cy, a: 0, hit: R * 0.15,
+      kind: "kernel", id: "kernel", x: v.cx, y: v.cy, a: 0, hit: v.R * 0.15,
       label: "KERNEL", sub: "CLICK · DISCOVERY — HOLD · SNAPSHOT",
     };
     const rest: CNode[] = [];
     if (d.approvals.length > 0) {
       const a = -Math.PI / 3;
       rest.push({
-        kind: "authrim", id: "auth", x: cx + R * 0.98 * Math.cos(a), y: cy + R * 0.98 * Math.sin(a), a, hit: 16,
+        kind: "authrim", id: "auth", x: v.cx + v.R * 0.98 * Math.cos(a), y: v.cy + v.R * 0.98 * Math.sin(a), a, hit: 16,
         label: "AUTHORIZATIONS", sub: `${d.approvals.length} PENDING · DECIDE`, gated: true,
       });
     }
     const ls = layersRef.current;
     const chipW = 62;
-    const x0 = cx - ((ls.length - 1) * chipW) / 2;
+    const x0 = w / 2 - ((ls.length - 1) * chipW) / 2;
     ls.forEach((l, i) => {
       rest.push({
         kind: "layer", id: l.id, x: x0 + i * chipW, y: h - 26, a: 0, hit: 15,
@@ -417,25 +469,23 @@ export function Construct(props: {
       });
     });
     return { kernel, rest };
-  }, []);
+  }, [view]);
 
   /* ---- painter ------------------------------------------------------------ */
 
   /** Faint concentric echo of an adjacent stratum (above or below the active one). */
-  const paintGhost = (ctx: CanvasRenderingContext2D, scale: number, alpha: number, C: Palette) => {
-    const { w, h } = size.current;
-    const cx = w / 2;
-    const cy = h / 2;
-    const R = baseR() * scale;
+  const paintGhost = useCallback((ctx: CanvasRenderingContext2D, scale: number, alpha: number, C: Palette) => {
+    const v = view();
+    const R = v.baseR * zoomRef.current * scale;
     ctx.strokeStyle = C.stroke;
     ctx.globalAlpha = alpha;
     for (const r of [0.3, 0.52, 0.8]) {
       ctx.beginPath();
-      ctx.arc(cx, cy, R * r, 0, Math.PI * 2);
+      ctx.arc(v.cx, v.cy, R * r, 0, Math.PI * 2);
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-  };
+  }, [view]);
 
   /** Paint one stratum at a zoom scale; returns its node table (for hits). */
   const paintLayer = useCallback((
@@ -448,14 +498,14 @@ export function Construct(props: {
     C: Palette,
     motion: boolean,
   ): CNode[] => {
-    const { w, h } = size.current;
-    const cx = w / 2;
-    const cy = h / 2;
-    const R = baseR() * scale;
+    const v = view();
+    const cx = v.cx;
+    const cy = v.cy;
+    const R = v.baseR * zoomRef.current * scale;
     const nodes = layoutLayer(layer, scale, interactive);
     const focus = interactive ? focusRef.current : null;
-    const al = (v: number) => {
-      ctx.globalAlpha = Math.max(0, Math.min(1, v * A));
+    const al = (x: number) => {
+      ctx.globalAlpha = Math.max(0, Math.min(1, x * A));
     };
 
     // --- schema graticule ---------------------------------------------------
@@ -483,10 +533,10 @@ export function Construct(props: {
     }
     // orbit guides only where the stratum has content
     const guides: [number, boolean][] = [
-      [0.42, layer.agents.length > 0],
-      [0.63, layer.workflows.length > 0],
-      [0.76, layer.docs.length > 0],
-      [0.88, layer.toolServers.length > 0],
+      [RINGS.agent.r, layer.agents.length > 0],
+      [RINGS.workflow.r, layer.workflows.length > 0],
+      [RINGS.knowledge.r, layer.docs.length > 0],
+      [RINGS.spoke.r, layer.toolServers.length > 0],
     ];
     for (const [r, on] of guides) {
       if (!on) continue;
@@ -512,93 +562,81 @@ export function Construct(props: {
         ctx.fillRect(cx + r * Math.cos(a), cy + r * Math.sin(a), 1.4, 1.4);
         particles++;
       }
-      // the document's bar: length = its chunk weight
+      // the document's bar: chunk weight × per-id unevenness
       ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
       ctx.lineWidth = 1.6;
       al(0.9);
-      bar(ctx, n.x, n.y, n.a, 5 + Math.min(doc.chunkCount, 24) * 0.55);
+      bar(ctx, n.x, n.y, n.a, (5 + Math.min(doc.chunkCount, 24) * 0.55) * jitter(doc.id));
       ctx.lineWidth = 1;
     }
 
-    // --- mission threads (the puppet strings; beads for the settled ones) ----
+    // --- mission ring ----------------------------------------------------------
+    // running → dashed thread flowing from the kernel circle to the bar;
+    // gated  → the bar itself pulses scale (no thread);
+    // settled → short bar whose height decays with age (recent = taller).
     for (const n of nodes) {
       if (n.kind !== "thread") continue;
+      const m = layer.missions.find((x) => x.id === n.id);
+      const running = m?.status === "running";
       const focused = focus?.node.id === n.id;
-      if (n.active) {
+      if (running) {
         const x1 = cx + R * 0.16 * Math.cos(n.a);
         const y1 = cy + R * 0.16 * Math.sin(n.a);
-        const x2 = cx + R * 0.93 * Math.cos(n.a);
-        const y2 = cy + R * 0.93 * Math.sin(n.a);
-        ctx.strokeStyle = n.gated ? C.warn : C.accent;
-        al(focused ? 1 : 0.75);
+        ctx.strokeStyle = C.accent;
+        al(focused ? 1 : 0.8);
         ctx.lineWidth = 1.4;
+        ctx.setLineDash([5, 4]);
+        ctx.lineDashOffset = motion ? -((time * 26) % 9) : 0;
         ctx.beginPath();
-        if (n.gated) {
-          const vib = motion ? Math.sin(time * 30 + n.a) * 1.2 : 0;
-          const px = -Math.sin(n.a) * vib;
-          const py = Math.cos(n.a) * vib;
-          ctx.moveTo(x1 + px, y1 + py);
-          ctx.lineTo(x2 + px, y2 + py);
-        } else {
-          const slack = R * 0.1;
-          const mx = (x1 + x2) / 2 - Math.sin(n.a) * slack;
-          const my = (y1 + y2) / 2 + Math.cos(n.a) * slack;
-          ctx.setLineDash([5, 4]);
-          ctx.lineDashOffset = motion ? -((time * 22) % 9) : 0;
-          ctx.moveTo(x1, y1);
-          ctx.quadraticCurveTo(mx, my, x2, y2);
-        }
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(n.x - Math.cos(n.a) * 9, n.y - Math.sin(n.a) * 9);
         ctx.stroke();
         ctx.setLineDash([]);
         ctx.lineWidth = 1;
       }
-      // grip bar: the clickable handle for the dossier (long = live, short = settled)
+      let len: number;
+      if (n.gated) {
+        // constant change of scale — the bar breathes for a decision
+        const pulse = motion ? 1 + 0.45 * Math.abs(Math.sin(time * 2.6 + hash(n.id) % 7)) : 1.25;
+        len = 11 * pulse;
+      } else if (running) {
+        len = 16 * jitter(n.id);
+      } else if (m?.status === "queued") {
+        len = 10 * jitter(n.id);
+      } else {
+        const ageDays = m ? Math.max(0, (Date.now() - Date.parse(m.createdAt)) / 86_400_000) : 30;
+        len = (6 + 6 * Math.exp(-ageDays / 21)) * jitter(n.id);
+      }
       ctx.strokeStyle = n.gated ? C.warn : n.failed ? C.danger : n.active ? C.accent : C.lo;
       ctx.lineWidth = 2.4;
       al(n.active ? 1 : 0.6);
-      bar(ctx, n.x, n.y, n.a, n.active ? 14 : 8);
+      bar(ctx, n.x, n.y, n.a, len);
       ctx.lineWidth = 1;
     }
 
-    // --- tool spokes -----------------------------------------------------------
+    // --- tool namespaces: one bar per server, height = tool count ---------------
     for (const n of nodes) {
       if (n.kind !== "spoke") continue;
       const srv = layer.toolServers.find((s) => s.server === n.id);
-      ctx.strokeStyle = C.strokeHi;
+      ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
+      ctx.lineWidth = 2;
       al(1);
-      ctx.beginPath();
-      ctx.moveTo(cx + R * 0.84 * Math.cos(n.a), cy + R * 0.84 * Math.sin(n.a));
-      ctx.lineTo(cx + R * 0.92 * Math.cos(n.a), cy + R * 0.92 * Math.sin(n.a));
-      ctx.stroke();
-      const ticks = Math.min(srv?.tools ?? 0, 12);
-      for (let i = 0; i < ticks; i++) {
-        const r = R * (0.84 + (0.08 * (i + 0.5)) / ticks);
-        const px = cx + r * Math.cos(n.a);
-        const py = cy + r * Math.sin(n.a);
-        ctx.beginPath();
-        ctx.moveTo(px - Math.sin(n.a) * 3, py + Math.cos(n.a) * 3);
-        ctx.lineTo(px + Math.sin(n.a) * 3, py - Math.cos(n.a) * 3);
-        ctx.stroke();
-      }
+      bar(ctx, n.x, n.y, n.a, (7 + Math.min(srv?.tools ?? 0, 14)) * jitter(n.id));
+      ctx.lineWidth = 1;
     }
 
-    // --- workflow lattice: one bar per workflow, length = graph size -----------
+    // --- workflow lattice: one bar per workflow, height = graph size ------------
     for (const n of nodes) {
       if (n.kind !== "workflow") continue;
       const wf = layer.workflows.find((x) => x.id === n.id);
       ctx.strokeStyle = focus?.node.id === n.id ? C.accent : C.strokeHi;
       ctx.lineWidth = 2.4;
       al(1);
-      bar(ctx, n.x, n.y, n.a, 7 + Math.min(wf?.nodeCount ?? 0, 12));
+      bar(ctx, n.x, n.y, n.a, (7 + Math.min(wf?.nodeCount ?? 0, 12)) * jitter(n.id));
       ctx.lineWidth = 1;
-      if (wf?.nodeCount && wf.nodeCount >= 3) {
-        ctx.strokeStyle = C.accent;
-        al(0.8);
-        poly(ctx, n.x, n.y, 3.2, Math.min(wf.nodeCount, 12), motion ? time * 0.2 : 0);
-      }
     }
 
-    // --- agent orbit: one bar per agent, length = autonomy tier -----------------
+    // --- agent orbit: one bar per agent, height = autonomy tier ------------------
     for (const n of nodes) {
       if (n.kind !== "agent") continue;
       const ag = layer.agents.find((a) => a.id === n.id);
@@ -611,7 +649,8 @@ export function Construct(props: {
         ctx.shadowBlur = 8;
       }
       const ticks = AUTONOMY_TICKS[ag?.autonomy ?? ""] ?? 1;
-      bar(ctx, n.x, n.y, n.a, 7 + ticks * 4);
+      const breathe = hot ? 1 + 0.12 * Math.sin(time * 2.2 + (hash(n.id) % 7)) : 1;
+      bar(ctx, n.x, n.y, n.a, (7 + ticks * 4) * jitter(n.id) * breathe);
       ctx.shadowBlur = 0;
       ctx.lineWidth = 1;
       if (hot) {
@@ -625,7 +664,7 @@ export function Construct(props: {
 
     ctx.globalAlpha = 1;
     return nodes;
-  }, [layoutLayer]);
+  }, [view, layoutLayer]);
 
   const paint = useCallback((t: number) => {
     const canvas = canvasRef.current;
@@ -646,7 +685,12 @@ export function Construct(props: {
       lo: css.getPropertyValue("--text-lo").trim() || "#7d95a0",
     };
     const dormant = !d.connected;
-    const running = d.missions.filter((m) => m.status === "running").length;
+    // A process is "running" if the snapshot says so — or if execution traffic
+    // crossed the bus in the last 3s (fast missions finish between refetches).
+    const busActive = d.signals.some(
+      (s) => (s.type === "mission.step" || s.type === "mission.started") && Date.now() - s.at < 3000,
+    );
+    const running = d.missions.filter((m) => m.status === "running").length || (busActive ? 1 : 0);
     const gated = d.approvals.length > 0;
     const motion = !reducedRef.current && !dormant;
     const time = motion ? t / 1000 : 0;
@@ -655,9 +699,11 @@ export function Construct(props: {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     ctx.lineWidth = 1;
-    const cx = w / 2;
-    const cy = h / 2;
-    const R = baseR();
+    const v = view();
+    const cx = v.cx;
+    const cy = v.cy;
+    const R = v.R;
+    const zoomed = zoomRef.current > ZOOM_LOCK;
     const mono = '9px "IBM Plex Mono", monospace';
     const dim = dormant ? 0.45 : 1;
 
@@ -684,34 +730,79 @@ export function Construct(props: {
       }
     }
     if (!tr) {
-      // faint echo of adjacent strata: the stack is visible even at rest
-      const li = layers.indexOf(activeLayer);
-      if (layers[li - 1]) paintGhost(ctx, 0.45, 0.12 * dim, C);
-      if (layers[li + 1]) paintGhost(ctx, 1.9, 0.07 * dim, C);
+      // faint echo of adjacent strata — skipped when zoomed in (clutter)
+      if (!zoomed) {
+        const li = layers.indexOf(activeLayer);
+        if (layers[li - 1]) paintGhost(ctx, 0.45, 0.12 * dim, C);
+        if (layers[li + 1]) paintGhost(ctx, 1.9, 0.07 * dim, C);
+      }
       ringNodes = paintLayer(ctx, activeLayer, 1, dim, true, time, C, motion);
     }
 
     // --- shared node table (kernel first, then rings, then chrome) -----------
     const chrome = layoutChrome();
     nodesRef.current = [chrome.kernel, ...ringNodes, ...chrome.rest];
+    // the rings rotate — keep the focus snapshot glued to its bar
+    if (focusRef.current) {
+      const f = focusRef.current;
+      const cur = nodesRef.current.find((n) => n.kind === f.node.kind && n.id === f.node.id);
+      if (cur) f.node = cur;
+    }
     const focus = focusRef.current;
 
-    // --- kernel core: the constant pixel wave --------------------------------
+    // --- kernel core ----------------------------------------------------------
     const kcx = cx + tilt.current.x * 0.08;
     const kcy = cy + tilt.current.y * 0.08;
-    const speed = 1 + Math.min(running, 3) * 0.5;
+    const kR = R * 0.15;
     const blink = motion && Math.sin(time * 2.1) > 0.55;
-    for (const px of pixels.current) {
-      const wave = 0.5 + 0.5 * Math.sin(px.d * 7 - time * 2.6 * speed);
-      const a = (0.08 + 0.72 * wave * wave) * (1 - px.d * 0.35);
-      ctx.fillStyle = dormant ? C.lo : gated && blink && px.d > 0.72 ? C.warn : C.accent;
-      ctx.globalAlpha = a * (dormant ? 0.35 : 1);
-      ctx.fillRect(kcx + px.dx - 1.2, kcy + px.dy - 1.2, 2.4, 2.4);
+    if (running > 0 && motion) {
+      // WORKING: aggressive random signal lines — the kernel is transmitting
+      const rows = 5;
+      const amp = Math.min(3 + running * 1.6, 8) * (kR / 45);
+      for (let j = 0; j < rows; j++) {
+        const dy = ((j + 0.5) / rows - 0.5) * 2 * kR * 0.78;
+        const half = Math.sqrt(Math.max(kR * kR - dy * dy, 0)) * 0.92;
+        ctx.strokeStyle = gated && blink && j === 0 ? C.warn : C.accent;
+        ctx.globalAlpha = dim * (j === Math.floor(rows / 2) ? 0.95 : 0.55);
+        ctx.lineWidth = j === Math.floor(rows / 2) ? 1.4 : 1;
+        ctx.beginPath();
+        const tick = Math.floor(time * 9);
+        for (let x = -half; x <= half; x += 4) {
+          const spike = (((hash(`${j}:${Math.floor(x / 4)}:${tick}`) % 1000) / 1000) - 0.5) * 2;
+          const yy = dy + (Math.sin(x * 0.55 + time * 14 + j * 5) * 0.35 + spike * 0.65) * amp;
+          if (x === -half) ctx.moveTo(kcx + x, kcy + yy);
+          else ctx.lineTo(kcx + x, kcy + yy);
+        }
+        ctx.stroke();
+      }
+      ctx.lineWidth = 1;
+    } else {
+      // IDLE: constant pixel wave with a wandering direction that leans
+      // toward the operator's cursor
+      let target = Math.sin(time * 0.23) * 2.1 + Math.sin(time * 0.11 + 1.7) * 1.4;
+      if (cursor.current.inside && !dormant) {
+        target = Math.atan2(cursor.current.y - kcy, cursor.current.x - kcx);
+      }
+      let delta = target - waveDir.current;
+      while (delta > Math.PI) delta -= Math.PI * 2;
+      while (delta < -Math.PI) delta += Math.PI * 2;
+      waveDir.current += delta * (motion ? 0.05 : 1);
+      const wa = waveDir.current;
+      const ux = Math.cos(wa);
+      const uy = Math.sin(wa);
+      for (const px of pixels.current) {
+        const proj = (px.dx * ux + px.dy * uy) / Math.max(kR, 1);
+        const wave = 0.5 + 0.5 * Math.sin(proj * 6.5 - time * 2.4);
+        const a = (0.08 + 0.72 * wave * wave) * (1 - px.d * 0.35);
+        ctx.fillStyle = dormant ? C.lo : gated && blink && px.d > 0.72 ? C.warn : C.accent;
+        ctx.globalAlpha = a * (dormant ? 0.35 : 1);
+        ctx.fillRect(kcx + px.dx - 1.2, kcy + px.dy - 1.2, 2.4, 2.4);
+      }
     }
     ctx.globalAlpha = dim;
     ctx.strokeStyle = dormant ? C.lo : gated && blink ? C.warn : C.strokeHi;
     ctx.beginPath();
-    ctx.arc(kcx, kcy, R * 0.15, 0, Math.PI * 2);
+    ctx.arc(kcx, kcy, kR, 0, Math.PI * 2);
     ctx.stroke();
     if (dormant) {
       ctx.fillStyle = C.lo;
@@ -769,12 +860,13 @@ export function Construct(props: {
     });
     ctx.lineWidth = 1;
 
-    // --- authrim node: the widest warning bar on the bezel -------------------------
+    // --- authrim node: the widest warning bar, breathing for a decision ------------
     for (const n of chrome.rest) {
       if (n.kind !== "authrim") continue;
+      const pulse = motion ? 1 + 0.45 * Math.abs(Math.sin(time * 2.6)) : 1.25;
       ctx.strokeStyle = C.warn;
       ctx.lineWidth = 3;
-      bar(ctx, n.x, n.y, n.a, 16);
+      bar(ctx, n.x, n.y, n.a, 13 * pulse);
       ctx.lineWidth = 1;
     }
 
@@ -795,8 +887,8 @@ export function Construct(props: {
           ctx.globalAlpha = dim * (isActive ? 1 : 0.75);
           ctx.fillText(n.label, n.x, n.y + 3);
           const layer = layers.find((l) => l.id === n.id);
-          const bar = Math.min((layer?.count ?? 0) / 2, 22);
-          ctx.fillRect(n.x - bar / 2, n.y + 8, bar, 1.5);
+          const b = Math.min((layer?.count ?? 0) / 2, 22);
+          ctx.fillRect(n.x - b / 2, n.y + 8, b, 1.5);
           if (isActive) {
             ctx.strokeStyle = C.accent;
             ctx.strokeRect(n.x - 24, n.y - 9, 48, 22);
@@ -820,6 +912,7 @@ export function Construct(props: {
         } else if (reducedRef.current) {
           setFocus(n, false);
           locate.current = null;
+          activate(n); // pointed out → open the destination
         } else {
           if (lc.t0 === 0) lc.t0 = now;
           const p = Math.min((now - lc.t0) / 900, 1);
@@ -842,23 +935,23 @@ export function Construct(props: {
           }
           // kind-shaped converger: the reticle takes the target's own geometry
           const rr = n.hit + 6 + (1 - e) * 140;
-          const rot = (1 - e) * 2.4;
+          const rrot = (1 - e) * 2.4;
           ctx.globalAlpha = 0.35 + 0.6 * e;
           switch (n.kind) {
             case "agent":
               ctx.beginPath();
-              ctx.arc(n.x, n.y, rr, rot, rot + Math.PI * 1.5);
+              ctx.arc(n.x, n.y, rr, rrot, rrot + Math.PI * 1.5);
               ctx.stroke();
               ctx.beginPath();
-              ctx.arc(n.x, n.y, rr * 0.7, -rot, -rot + Math.PI * 1.5);
+              ctx.arc(n.x, n.y, rr * 0.7, -rrot, -rrot + Math.PI * 1.5);
               ctx.stroke();
               break;
             case "workflow":
-              poly(ctx, n.x, n.y, rr, 4, rot + Math.PI / 4);
+              poly(ctx, n.x, n.y, rr, 4, rrot + Math.PI / 4);
               break;
             case "knowledge":
               for (let i = 0; i < 12; i++) {
-                const a = rot + (i / 12) * Math.PI * 2;
+                const a = rrot + (i / 12) * Math.PI * 2;
                 ctx.fillStyle = tone;
                 ctx.fillRect(n.x + rr * Math.cos(a) - 1, n.y + rr * Math.sin(a) - 1, 2, 2);
               }
@@ -875,18 +968,19 @@ export function Construct(props: {
               ctx.stroke();
               break;
             default:
-              // mission thread: brighten the string and converge a diamond
+              // mission: flash the kernel thread line and converge a diamond
               ctx.beginPath();
               ctx.moveTo(cx + R * 0.16 * Math.cos(n.a), cy + R * 0.16 * Math.sin(n.a));
               ctx.lineTo(n.x, n.y);
               ctx.stroke();
-              poly(ctx, n.x, n.y, rr * 0.8, 4, rot);
+              poly(ctx, n.x, n.y, rr * 0.8, 4, rrot);
           }
           ctx.globalAlpha = dim;
           if (p >= 1) {
             setFocus(n, false);
             locate.current = null;
             pulses.current.push({ t0: now, tone: n.gated ? "warn" : "accent", alarm: false });
+            activate(n); // pointed out → auto-open the destination pane
           }
         }
       }
@@ -908,12 +1002,12 @@ export function Construct(props: {
     ctx.textAlign = "right";
     ctx.fillText(`DOCS ${activeLayer.docs.length} / CHUNKS ${chunks}`, w - 10, 16);
     ctx.fillText(
-      `RX ${d.rxTotal} · LIVE OPS ${d.missions.filter((m) => LIVE_STATUS.has(m.status)).length} · GATED ${d.approvals.length}`,
+      `RX ${d.rxTotal} · LIVE OPS ${d.missions.filter((m) => LIVE_STATUS.has(m.status)).length} · GATED ${d.approvals.length} · ZOOM ${zoomRef.current.toFixed(1)}×`,
       w - 10,
       h - 10,
     );
 
-    // --- magnet reticle + decode label ------------------------------------------------
+    // --- magnet reticle + decode label + dwell progress ---------------------------
     if (focus && !tr) {
       const n = focus.node;
       const rr = n.hit + 5;
@@ -925,8 +1019,26 @@ export function Construct(props: {
         ctx.lineTo(n.x + sx * rr - sx * 5, n.y + sy * rr);
         ctx.stroke();
       }
-      const dt = performance.now() - focus.since;
-      const frac = reducedRef.current ? 1 : Math.min(dt / 160, 1);
+      // dwell ring: hover long enough and the destination opens itself
+      if (motion && !focus.keyboard && n.kind !== "kernel" && n.kind !== "layer") {
+        const key = `${n.kind}:${n.id}`;
+        if (key !== dwell.current.firedKey) {
+          const start = Math.max(focus.since, dwell.current.cooldownUntil);
+          const frac = (now - start) / DWELL_MS;
+          if (frac > 0) {
+            ctx.strokeStyle = C.accent;
+            ctx.globalAlpha = 0.85;
+            ctx.lineWidth = 1.6;
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, rr + 5, -Math.PI / 2, -Math.PI / 2 + Math.min(frac, 1) * Math.PI * 2);
+            ctx.stroke();
+            ctx.lineWidth = 1;
+            ctx.globalAlpha = dim;
+          }
+        }
+      }
+      const dt2 = performance.now() - focus.since;
+      const frac = reducedRef.current ? 1 : Math.min(dt2 / 160, 1);
       const chars = Math.ceil(n.label.length * frac);
       ctx.font = '600 11px "Rajdhani", sans-serif';
       ctx.textAlign = n.x > w - 180 ? "right" : "left";
@@ -939,7 +1051,7 @@ export function Construct(props: {
       ctx.fillText(n.sub, lx, ly + 12);
     }
     ctx.globalAlpha = 1;
-  }, [layoutLayer, layoutChrome, paintLayer, setFocus]);
+  }, [view, layoutLayer, layoutChrome, paintLayer, paintGhost, setFocus, activate]);
 
   const requestPaint = useCallback(() => {
     if (renderRequested.current) return;
@@ -1026,7 +1138,59 @@ export function Construct(props: {
       raf = requestAnimationFrame(loop);
       if (document.hidden) return;
       frame++;
+      const now = performance.now();
+      const dt = Math.min((t - (lastFrame.current || t)) / 1000, 0.1);
+      lastFrame.current = t;
       const d = dataRef.current;
+
+      // --- orbit rotation: each ring turns its own way, until the operator
+      // (or DISCOVERY) points at something ------------------------------------
+      const vw = view();
+      const distC = Math.hypot(cursor.current.x - vw.cx, cursor.current.y - vw.cy);
+      const hoverIn = cursor.current.inside && distC < vw.R * 1.02;
+      let hoverRing: RingKind | null = null;
+      if (hoverIn) {
+        for (const k of RING_KINDS) {
+          if (Math.abs(distC - vw.R * RINGS[k].r) < vw.R * 0.05) hoverRing = k;
+        }
+      }
+      const f = focusRef.current;
+      const focusKey = f ? `${f.node.kind}:${f.node.id}` : null;
+      const zoomed = zoomRef.current > ZOOM_LOCK;
+      const busy = !!locate.current || !!trans.current || (f?.keyboard ?? false);
+      const dwellDone = focusKey !== null && focusKey === dwell.current.firedKey;
+      for (const k of RING_KINDS) {
+        let rate = 0;
+        if (!busy) {
+          if (!zoomed) {
+            // pointing at an orbit (or a bar on it) halts the motion; once the
+            // dwell has opened its pane, the spin resumes
+            const pointed = (hoverRing !== null || (f !== null && !f.keyboard)) && !dwellDone;
+            rate = pointed ? 0 : RINGS[k].speed * RINGS[k].dir;
+          } else {
+            // zoomed in: only the orbit under the cursor turns, parading its
+            // content past the operator — a locked bar still halts it
+            const dwelling = f !== null && !f.keyboard && !dwellDone;
+            rate = k === hoverRing && !dwelling ? ZOOM_SPIN * RINGS[k].dir : 0;
+          }
+        }
+        if (rate !== 0) rot.current[k] += rate * dt;
+      }
+
+      // --- hover dwell: the pointed-at bar opens its own pane -----------------
+      if (f && !f.keyboard && f.node.kind !== "kernel" && f.node.kind !== "layer" && !busy) {
+        const key = `${f.node.kind}:${f.node.id}`;
+        if (key !== dwell.current.firedKey) {
+          const start = Math.max(f.since, dwell.current.cooldownUntil);
+          if (now - start > DWELL_MS) {
+            dwell.current.firedKey = key;
+            dwell.current.cooldownUntil = now + DWELL_COOLDOWN_MS;
+            activate(f.node);
+          }
+        }
+      }
+      if (!hoverIn) dwell.current.firedKey = null;
+
       const patient =
         !cursor.current.inside &&
         pulses.current.length === 0 &&
@@ -1060,12 +1224,12 @@ export function Construct(props: {
       cancelAnimationFrame(raf);
       ro.disconnect();
     };
-  }, [paint, requestPaint, props.reducedMotion]);
+  }, [paint, requestPaint, view, activate, props.reducedMotion]);
 
   // Repaint on data changes (only path to fresh pixels under reduced motion).
   useEffect(() => {
     requestPaint();
-  }, [props.data, props.layers, requestPaint]);
+  }, [props.data, props.layers, zoom, requestPaint]);
 
   const d = props.data;
   const activeLayer = props.layers.find((l) => l.id === props.active);
@@ -1074,7 +1238,8 @@ export function Construct(props: {
     `${activeLayer?.agents.length ?? 0} agents, ${activeLayer?.workflows.length ?? 0} workflows, ` +
     `${activeLayer?.docs.length ?? 0} knowledge documents, ${activeLayer?.toolServers.length ?? 0} tool namespaces and ` +
     `${activeLayer?.missions.length ?? 0} missions. ${d.approvals.length} pending authorizations. Bus ${d.connected ? "online" : "offline"}. ` +
-    `Arrow keys walk the instrument; Enter opens the focused task; bracket keys or Page keys shift strata; Enter on the kernel opens discovery.`;
+    `Arrow keys walk the instrument; Enter opens the focused task; bracket keys or Page keys shift strata; ` +
+    `plus and minus zoom; Enter on the kernel opens discovery.`;
 
   return (
     <div ref={wrapRef} className="nx-construct">
@@ -1092,6 +1257,7 @@ export function Construct(props: {
         onPointerLeave={() => {
           cursor.current.inside = false;
           hold.current = null;
+          dwell.current.firedKey = null;
           setFocus(null, false);
           if (props.reducedMotion) requestPaint();
         }}
@@ -1120,22 +1286,19 @@ export function Construct(props: {
           activate(n);
         }}
         onWheel={(e) => {
-          // wheel = depth: scroll down dives to the older stratum (zoom in)
-          if (trans.current) {
-            wheelAcc.current = 0;
-            return;
-          }
-          wheelAcc.current += e.deltaY;
-          if (Math.abs(wheelAcc.current) > 120) {
-            stepLayer(wheelAcc.current > 0 ? -1 : 1);
-            wheelAcc.current = 0;
-          }
+          // wheel = magnification: dive the lens, not the strata (those shift
+          // via [ ] / PageUp / PageDown / the depth gauge / DISCOVERY)
+          setZoomClamped(zoomRef.current * Math.exp(-e.deltaY * 0.0012));
         }}
         onKeyDown={(e) => {
           if (e.key === "[" || e.key === "PageDown") {
             stepLayer(-1);
           } else if (e.key === "]" || e.key === "PageUp") {
             stepLayer(1);
+          } else if (e.key === "+" || e.key === "=") {
+            setZoomClamped(zoomRef.current * 1.25);
+          } else if (e.key === "-" || e.key === "_") {
+            setZoomClamped(zoomRef.current / 1.25);
           } else {
             const nodes = nodesRef.current;
             if (nodes.length === 0) return;
@@ -1160,6 +1323,19 @@ export function Construct(props: {
           if (focusRef.current?.keyboard) setFocus(null, true);
         }}
       />
+      <div className="nx-zoom" role="group" aria-label="Construct zoom">
+        <button className="ph-btn" title="Zoom in (+)" onClick={() => setZoomClamped(zoom * 1.25)} disabled={zoom >= ZOOM_MAX}>
+          ＋
+        </button>
+        <button className="ph-btn" title="Zoom out (−)" onClick={() => setZoomClamped(zoom / 1.25)} disabled={zoom <= ZOOM_MIN}>
+          －
+        </button>
+        {zoom > ZOOM_LOCK && (
+          <button className="ph-btn" title="Reset zoom" onClick={() => setZoomClamped(1)}>
+            1:1
+          </button>
+        )}
+      </div>
       <span className="visually-hidden" aria-live="polite">{announce}</span>
     </div>
   );

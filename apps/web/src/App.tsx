@@ -43,12 +43,12 @@ const ROLE_VIEWS: Record<Role, View[]> = {
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
-/** …and where each role lands after sign-in (role dashboards). */
+/** …and where each role lands after sign-in: the NEXUS is every role's home. */
 const ROLE_HOME: Record<Role, View> = {
   member: "nexus",
-  builder: "canvas",
-  admin: "missions",
-  owner: "missions",
+  builder: "nexus",
+  admin: "nexus",
+  owner: "nexus",
 };
 
 /** Arrangeable side panels: default layout per role; users override via ui_preferences. */

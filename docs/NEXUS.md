@@ -54,14 +54,14 @@ existing REST + WebSocket APIs (`apps/web/src/api.ts`); nothing is invented.
 
 | Stratum | Radius | Geometry | Data source | Live behavior |
 |---|---|---|---|---|
-| **Kernel core** | 0 – 0.15R | A lattice of pixels animated as a **constant radial wave** (ripples run outward forever; speed rises with running missions, capped 3×), bounding ring | bus `connected`; every `BusEvent`; running count | The system's heartbeat. Click → **DISCOVERY** task (§2.4). Hold ≥700ms → SYSTEM SNAPSHOT ceremony. Gated → outer pixel band + ring blink amber. Disconnected → grey static lattice, "LINK DOWN". |
+| **Kernel core** | 0 – 0.15R | Two live modes (v2.3): **idle** = a pixel-lattice plane wave whose direction wanders randomly and leans toward the operator's cursor; **working** = aggressive random signal lines (a jagged multi-row waveform burst) whenever a mission is running or execution traffic crossed the bus in the last 3s | bus `connected`; every `BusEvent`; running count + live `mission.*` traffic | The system's heartbeat. Click → **DISCOVERY** task (§2.4). Hold ≥700ms → SYSTEM SNAPSHOT ceremony. Gated → outer pixel band + ring blink amber. Disconnected → grey static lattice, "LINK DOWN". |
 | **Schema graticule** | 0.15 – 1.0R | Faint concentric arcs + radial degree ticks + orbit guides on populated rings | static geometry, labels are real counts | The "paper" of the instrument. Parallax-tilts with cursor. |
 | **Agent orbit** | 0.42R | One **radial bar** per agent (v2.1 — rings of bars, not dots, per the reference plate); bar length = autonomy tier (1/2/3 = read/write/destructive) | `agentApi.list()` | Bars **evenly spread** on the orbit. Agent active in last 20s → bar glows accent + orbit dot spins. Click → **AGENT CHANNEL** task. |
-| **Mission ring** | 0.52R | One **radial bar** per mission of the active stratum, live-first, cap 14 — long = live, short = settled; amber = gated, red = failed | `api.listMissions()` + bus `mission.*`, `approval.*` | Live missions grow threads (below); settled bars stay as history. Click → **MISSION DOSSIER** / **AUTHORIZATIONS** if gated. |
+| **Mission ring** | 0.52R | One **radial bar** per mission of the active stratum, live-first, cap 14. Heights vary by state (v2.3): **gated bars pulse their scale constantly** (a decision breathing), running = tallest, queued = mid, settled bars decay with age (recent = taller); amber = gated, red = failed | `api.listMissions()` + bus `mission.*`, `approval.*` | **Running missions only** cast a dashed flowing thread from the kernel circle to their bar; gated/queued/settled never do. Click → **MISSION DOSSIER** / **AUTHORIZATIONS** if gated. |
 | **Workflow lattice** | 0.63R | One **radial bar** per workflow — length = node count of its graph; a small n-gon spins beside ≥3-node graphs | `api.listWorkflows()` (+ graph node counts lazily) | Evenly spread. Click → **RUN WORKFLOW** task pre-selected. |
 | **Knowledge shell** | 0.76R | One **radial bar** per document — length = chunk weight — with its chunk particles clustered around it (capped 240 total) | `kbApi.list()` | Density is the readout. Click → **KNOWLEDGE SEARCH** task. |
-| **Tool spokes** | 0.88R | One spoke per MCP server/namespace, tick marks along the spoke = tools in it | `api.tools()` grouped by server | Tool namespaces live on the **newest stratum** (they have no birthday). Click spoke → **TOOL CATALOG** filtered to that server. |
-| **Mission threads** | core → rim | Strings from kernel to the bead's bearing; animated dash flow while running; **amber, taut (straight), vibrating** when `awaiting_approval` | live missions of the stratum | The signature motion. |
+| **Tool ring** | 0.88R | One **radial bar** per MCP server/namespace (v2.3) — height = tool count | `api.tools()` grouped by server | Tool namespaces live on the **newest stratum** (they have no birthday). Click → **TOOL CATALOG** filtered to that server. |
+| **Mission threads** | kernel circle → bar | Dashed flowing string from the kernel circle to the mission's bar — drawn **only while the mission is running** (v2.3); approvals speak through their pulsing bar instead | running missions of the stratum | The signature motion. |
 | **Memory halo** | 1.0R rim | Rim ticks (neatly sequenced): pending authorizations (amber), failed missions last 24h (red) | approvals list, missions list | Global — consequences transcend strata. |
 | **Depth gauge** | bottom center | One chip per stratum (year + unit-count bar), active chip bracketed | `buildLayers()` | Click/Enter a chip → stratum shift (§2.3). Walkable by keyboard like any node. |
 | **Count readouts** | corners of stage | Micro stat lines: `STRATUM y — AGENTS n · WORKFLOWS n · OPS n`, `DOCS n/CHUNKS n`, `TOOLS n · NS n`, `RX n · LIVE OPS n · GATED n` | same fetches | Tertiary type stratum, per density rules. |
@@ -75,10 +75,10 @@ per frame (see §8 performance).
 | State | Trigger | Presentation |
 |---|---|---|
 | **DORMANT** | bus disconnected | Greyed strata, no motion, static grey kernel lattice, "LINK DOWN" microtype. |
-| **PATIENT** (idle) | connected, no running mission, no cursor in stage | The pixel wave rolls at base speed; frame rate halves. Nearly still. |
-| **ATTENTIVE** | cursor inside stage | Figure tilts toward cursor (§5.1), nearest-node reticle engages. |
-| **WORKING** | ≥1 running mission | Threads drawn + flowing; the acting nodes pulse; the kernel wave quickens with running count (cap 3×). |
-| **GATED** | ≥1 pending authorization | Amber taut thread(s) + rim ticks; the kernel's outer pixel band and ring blink amber every 3s. Takes visual priority over WORKING. |
+| **PATIENT** (idle) | connected, no running mission, no cursor in stage | The pixel wave wanders slowly; orbits counter-rotate at their idle speeds; frame rate halves. Nearly still. |
+| **ATTENTIVE** | cursor inside stage | Figure tilts toward cursor (§5.1), the kernel wave leans toward the cursor, nearest-bar reticle engages, pointed orbits halt (§5.3). |
+| **WORKING** | ≥1 running mission (or `mission.*` bus traffic in the last 3s) | The kernel switches to its aggressive signal-line burst; running missions cast dashed kernel→bar threads. |
+| **GATED** | ≥1 pending authorization | Gated mission bars + the auth rim bar pulse their scale constantly; rim ticks; the kernel's outer pixel band and ring blink amber every 3s. Takes visual priority over WORKING. |
 | **ALARM** | a mission failed in last 60s | One red ripple from kernel to rim (once per failure event, not looping). |
 
 ### 2.3 Strata — the Construct stacked in time (v2)
@@ -147,10 +147,11 @@ and a jump field accepting a year or stratum id.
 - The **task tray** (bottom strip of the stage) lists every registry task as a chip —
   the guaranteed path to any task even if its stratum is empty (e.g. no agents yet).
   Chips show role-locked state for insufficient roles.
-- NEXUS is **view 01 for every role** and runs **solo** (v2): the shell's left
-  side panel and right OPERATION panel are hidden on this view — their content
-  lives on as task panes (AUTHORIZATIONS, SIGNAL FEED, OPERATION LOG). The
-  rail, ⌘K palette, WATCH strip and signal ticker stay. Palette gains
+- NEXUS is **view 01 and the home screen for every role** (v2.3 — all
+  `ROLE_HOME`s land here after sign-in) and runs **solo** (v2): the shell's
+  left side panel and right OPERATION panel are hidden on this view — their
+  content lives on as task panes (AUTHORIZATIONS, SIGNAL FEED, OPERATION LOG).
+  The rail, ⌘K palette, WATCH strip and signal ticker stay. Palette gains
   `TASK //` entries for every registry task.
 
 ## 4. Task pane system
@@ -277,13 +278,41 @@ flank's default position on restore.
 | click | amber (gated) bead / auth rim node | open AUTHORIZATIONS pane |
 | click | kernel core | open **DISCOVERY** pane (§2.4) |
 | hold ≥700ms | kernel core | **ceremony**: SYSTEM SNAPSHOT — one pane with the full count readout + link state + month tokens (an "all-clear sweep") |
-| wheel | stage | **stratum shift**: down = deeper (older year), up = newer (§2.3) |
+| hover ≥650ms | any bar | **dwell auto-open** (§5.3): the pointed-at bar opens its own destination pane; a progress ring counts the dwell in |
+| wheel / `+` `-` / corner buttons | stage | **magnification** (§5.4): zoom the instrument in and out; zoomed in, the figure locks to the left half of the stage |
 | click / Enter | depth-gauge chip | shift to that stratum |
-| `[` `]` / PageDown PageUp | focused canvas | shift stratum deeper / newer |
+| `[` `]` / PageDown PageUp | focused canvas | shift stratum deeper / newer (§2.3) |
 | click | empty stage | nothing (no accidental spawns) |
-| Tab | page | canvas is one tab stop; then **↑/↓/←/→ walk strata/nodes** (kernel → rings → auth rim → depth gauge) with the same reticle + labels; Enter = click. Full keyboard parity with cursor targeting. |
+| Tab | page | canvas is one tab stop; then **↑/↓/←/→ walk strata/nodes** (kernel → rings → auth rim → depth gauge) with the same reticle + labels; Enter = click (keyboard walk never auto-opens — Enter is the deliberate act). Full keyboard parity with cursor targeting. |
 
-### 5.3 Reduced motion (`prefers-reduced-motion: reduce`)
+### 5.3 Orbit rotation & dwell auto-open (v2.3)
+
+Every orbit **counter-rotates continuously** — adjacent rings turn opposite
+ways at slightly different idle speeds (agents +, missions −, workflows +,
+knowledge −, tools +), so the instrument is never a still photograph. The
+motion yields to attention:
+
+- **Pointing halts it**: the cursor entering an orbit's band (or locking a
+  bar), a keyboard focus, or a DISCOVERY homing beacon stops the rotation.
+- **Dwell opens it**: keep the reticle on a bar for 650ms (a progress ring
+  counts it in) and the bar's destination pane opens itself — the same effect
+  a click would have. After the auto-open the rotation resumes; a 1.8s
+  cooldown and a once-per-bar latch keep a parked cursor from spraying panes.
+- DISCOVERY's locate does the same: the beacon converges, then **auto-opens
+  the destination pane** and the rings resume.
+
+### 5.4 Magnification (v2.3)
+
+The wheel (and the `＋`/`－`/`1:1` corner buttons, and the `+`/`-` keys) zooms
+the whole instrument between 1× and 2.6×. Past ~1.15× the figure **locks into
+the left half of the stage** (its center glides to 28% of the width), leaving
+the right clear for panes — and the browsing grammar inverts: orbits hold
+still, and **the one orbit under the cursor rotates**, parading its bars past
+the operator until one locks (then the dwell rules above apply). The zoom
+readout lives in the bottom-right corner line. Strata shifts stay on the
+keyboard/gauge/DISCOVERY (§2.3) — the wheel is magnification, not time.
+
+### 5.5 Reduced motion (`prefers-reduced-motion: reduce`)
 
 No RAF loop. The Construct renders **once per data/cursor change**: static diagram, no
 drift/pulse/flow; the kernel lattice is a still pattern; threads drawn solid; stratum
@@ -386,6 +415,24 @@ lives. If code and doc disagree, the doc is intent, code is fact — reconcile a
 here.
 
 **Build log:**
+- 2026-07-09 · **v2.3 (owner feedback)**: kernel gained two live modes — an idle
+  pixel-lattice wave whose direction wanders randomly and leans toward the cursor, and
+  an aggressive multi-row random signal-line burst while a process runs (snapshot
+  `running` or `mission.*` bus traffic in the last 3s). Mission indicators reworked:
+  threads only for running missions (dashed flow from the kernel circle to the bar),
+  gated missions pulse their bar scale constantly (as does the auth rim bar), settled
+  bars decay with age. Every orbit now counter-rotates continuously (each ring its own
+  direction/speed); pointing at an orbit or bar — or a DISCOVERY locate — halts the
+  motion, a 650ms dwell auto-opens the pointed-at destination pane (progress ring,
+  once-per-bar latch, 1.8s cooldown), then rotation resumes; DISCOVERY's beacon also
+  auto-opens its target's pane on convergence. Tool spokes became bars (height = tool
+  count) so every ring is bars with data-driven, hash-jittered heights. Wheel is now
+  magnification (1–2.6×, with ＋/－/1:1 corner buttons and +/- keys); past 1.15× the
+  figure locks into the left half of the stage and only the orbit under the cursor
+  rotates, parading its bars past the operator. Demo seed now backdates three years of
+  strata (Y-3/Y-2/Y-1 + present = 4 layers). NEXUS is the post-login home for every
+  role. Playwright-verified: home landing, 4 strata, rotating frames, hover-dwell
+  auto-open, zoom lock + buttons, kernel signal mode.
 - 2026-07-08 · **v2.1 (owner feedback)**: panes float freely again — drag anywhere,
   stack/overlap, z-raise — but every pane *emerges* on the emptier flank of the stage
   (light cascade), never over the figure's center; dock columns removed; persistence

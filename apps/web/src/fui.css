@@ -1071,6 +1071,24 @@ input[type="color"] { background: #050d12; border: 1px solid var(--stroke-hi); b
 .nx-construct { position: absolute; inset: 0; }
 .nx-construct canvas { display: block; outline-offset: -2px; }
 
+/* construct zoom controls (wheel has parity; buttons for discoverability) —
+   bottom-right corner, clear of the pane spawn flanks */
+.nx-zoom {
+  position: absolute;
+  right: 10px;
+  bottom: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 15;
+}
+.nx-zoom .ph-btn {
+  border: 1px solid var(--stroke);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  padding: 0.3rem 0.4rem;
+}
+.nx-zoom .ph-btn:disabled { opacity: 0.35; }
+
 .visually-hidden {
   position: absolute;
   width: 1px;
