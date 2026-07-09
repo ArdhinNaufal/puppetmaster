@@ -158,16 +158,23 @@ export function Nexus(props: {
 
   // --- pane operations ---------------------------------------------------------
   /** Spawn coordinates on a flank of the stage: panes emerge left or right
-   *  (the emptier side), never over the figure's center — then drag anywhere. */
+   *  (the emptier side), never over the figure's center — then drag anywhere.
+   *  The cascade steps 42px down per pane so every rail stays grabbable
+   *  (no pane buries another's drag handle at birth). */
   const flankSpawn = (ps: PaneState[], width: number): { x: number; y: number } => {
     const stage = stageRef.current;
     const W = stage?.clientWidth ?? 1200;
+    const H = stage?.clientHeight ?? 700;
     const onLeft = ps.filter((p) => p.x + width / 2 < W / 2).length;
     const onRight = ps.length - onLeft;
     const side = onRight <= onLeft ? "right" : "left";
     const n = side === "right" ? onRight : onLeft;
-    const x = side === "left" ? 16 + ((n * 26) % 96) : Math.max(16, W - width - 16 - ((n * 26) % 96));
-    const y = 56 + ((n * 34) % 240);
+    // wrap the cascade into fresh columns rather than piling at the bottom
+    const step = 42;
+    const span = Math.max(step * 3, H - 300);
+    const wrap = Math.floor((n * step) / span);
+    const y = 48 + ((n * step) % span);
+    const x = side === "left" ? 16 + wrap * 42 : Math.max(16, W - width - 16 - wrap * 42);
     return { x, y };
   };
 

@@ -1,17 +1,17 @@
 /* Puppetmaster FUI design tokens + component styles — docs/DESIGN-LANGUAGE.md v0.2 */
 :root {
-  --bg-void: #030709;
-  --panel: #081014;
-  --panel-hi: #0c161c;
-  --stroke: #1c2c34;
-  --stroke-hi: #2c424d;
-  --accent: #45d6e6;
-  --accent-dim: #1d6b74;
-  --warn: #e2ac3f;
-  --danger: #e25555;
-  --ok: #4cd18e;
-  --text-hi: #d9e6ea;
-  --text-lo: #7d95a0;
+  --bg-void: #000000;
+  --panel: #0a0a0b;
+  --panel-hi: #131315;
+  --stroke: #29292e;
+  --stroke-hi: #43434a;
+  --accent: #f4f4f0;
+  --accent-dim: #8b8b90;
+  --warn: #e9b23c;
+  --danger: #e8443a;
+  --ok: #d9d9d2;
+  --text-hi: #e9e9e4;
+  --text-lo: #8f8f94;
   --radius: 2px;
   --font-data: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --font-display: "Rajdhani", "Bahnschrift", "DIN Alternate", "Franklin Gothic Medium", sans-serif;
@@ -121,8 +121,8 @@
 .fui-dot.st-queued { background: var(--text-lo); }
 .fui-dot.st-awaiting_approval { background: var(--warn); }
 .fui-status.st-awaiting_approval { color: var(--warn); }
-.fui-dot.st-skipped { background: #29343a; }
-.fui-dot.st-cancelled { background: #29343a; }
+.fui-dot.st-skipped { background: #3a3a40; }
+.fui-dot.st-cancelled { background: #3a3a40; }
 
 /* ---- Chip --------------------------------------------------------------- */
 .fui-chip {
@@ -139,11 +139,11 @@
 }
 .fui-chip:hover { border-color: var(--accent-dim); color: var(--accent); }
 .fui-chip.tiny { padding: 0.2rem 0.4rem; font-size: 0.58rem; }
-.fui-chip.tone-solid { background: #12222a; }
-.fui-chip.tone-accent { color: #03151a; background: var(--accent); border-color: var(--accent); font-weight: 600; }
-.fui-chip.tone-accent:hover { filter: brightness(1.1); color: #03151a; box-shadow: var(--glow); }
-.fui-chip.tone-danger { color: var(--danger); border-color: #4a2a2d; }
-.fui-chip.tone-danger:hover { background: #1e1113; border-color: var(--danger); }
+.fui-chip.tone-solid { background: #1d1d21; }
+.fui-chip.tone-accent { color: #0a0a0b; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+.fui-chip.tone-accent:hover { filter: brightness(1.1); color: #0a0a0b; box-shadow: var(--glow); }
+.fui-chip.tone-danger { color: var(--danger); border-color: #4a201d; }
+.fui-chip.tone-danger:hover { background: #201110; border-color: var(--danger); }
 .fui-chip:disabled { opacity: 0.45; cursor: default; }
 
 /* ---- Hold-to-authorize ---------------------------------------------------- */
@@ -163,7 +163,7 @@
   touch-action: none;
 }
 .fui-hold.tiny { padding: 0.22rem 0.5rem; font-size: 0.58rem; }
-.fui-hold.tone-danger { border-color: #4a2a2d; color: var(--danger); }
+.fui-hold.tone-danger { border-color: #4a201d; color: var(--danger); }
 .fui-hold-fill {
   position: absolute;
   inset: 0;
@@ -190,9 +190,9 @@
   color: var(--text-lo);
   font-family: var(--font-data);
 }
-.fui-tier.t-read { color: var(--ok); border-color: #1e3d2e; }
-.fui-tier.t-write { color: var(--warn); border-color: #46381d; }
-.fui-tier.t-destructive { color: var(--danger); border-color: #45272a; }
+.fui-tier.t-read { color: var(--ok); border-color: #37373c; }
+.fui-tier.t-write { color: var(--warn); border-color: #463a1d; }
+.fui-tier.t-destructive { color: var(--danger); border-color: #45211e; }
 
 /* ---- Motion (all gated on reduced-motion) -------------------------------- */
 @media (prefers-reduced-motion: no-preference) {

@@ -337,7 +337,9 @@ async function main(): Promise<void> {
   const workspaceId = await ensureDefaultWorkspace(db);
   await updateWorkspace(db, workspaceId, {
     name: "Acme Operations",
-    branding: { brandName: "ACME OPS", accent: "#35d0e0" },
+    // No accent override: the workspace rides the theme's monochrome accent
+    // (branding.accent remains available for tenants that want a color).
+    branding: { brandName: "ACME OPS" },
   });
 
   await seedBuiltinTemplates(db, BUILTIN_TEMPLATES);

@@ -47,6 +47,8 @@ export function TaskWindow(props: {
   }, [pane.x, pane.y]);
 
   const startDrag = (e: React.PointerEvent) => {
+    // the rail's buttons are buttons, not handles
+    if ((e.target as HTMLElement).closest("button")) return;
     drag.current = { px: e.clientX, py: e.clientY, ox: pane.x, oy: pane.y };
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
   };

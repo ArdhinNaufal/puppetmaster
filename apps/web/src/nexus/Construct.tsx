@@ -675,14 +675,14 @@ export function Construct(props: {
     if (w === 0 || h === 0) return;
     const css = getComputedStyle(canvas);
     const C: Palette = {
-      accent: css.getPropertyValue("--accent").trim() || "#45d6e6",
-      stroke: css.getPropertyValue("--stroke").trim() || "#1c2c34",
-      strokeHi: css.getPropertyValue("--stroke-hi").trim() || "#2c424d",
-      warn: css.getPropertyValue("--warn").trim() || "#e2ac3f",
-      danger: css.getPropertyValue("--danger").trim() || "#e25555",
-      ok: css.getPropertyValue("--ok").trim() || "#4cd18e",
-      hi: css.getPropertyValue("--text-hi").trim() || "#d9e6ea",
-      lo: css.getPropertyValue("--text-lo").trim() || "#7d95a0",
+      accent: css.getPropertyValue("--accent").trim() || "#f4f4f0",
+      stroke: css.getPropertyValue("--stroke").trim() || "#29292e",
+      strokeHi: css.getPropertyValue("--stroke-hi").trim() || "#43434a",
+      warn: css.getPropertyValue("--warn").trim() || "#e9b23c",
+      danger: css.getPropertyValue("--danger").trim() || "#e8443a",
+      ok: css.getPropertyValue("--ok").trim() || "#d9d9d2",
+      hi: css.getPropertyValue("--text-hi").trim() || "#e9e9e4",
+      lo: css.getPropertyValue("--text-lo").trim() || "#8f8f94",
     };
     const dormant = !d.connected;
     // A process is "running" if the snapshot says so — or if execution traffic

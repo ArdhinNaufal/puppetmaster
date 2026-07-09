@@ -50,8 +50,13 @@ What makes the SPECTRE screens work — and what this system copies deliberately
 
 1. **Command center, not dashboard.** The user is an operator overseeing live agents and
    missions. Density is a feature — but every readout must be real data, never decoration.
-2. **Dark-first.** Near-black base, low-contrast panel strokes, one or two accent hues
-   (signal cyan/teal for activity, amber for approvals pending, red for failures).
+2. **Dark-first, monochrome + alarm (v0.3).** Pure-black base, grey panel strokes,
+   **white** as the activity/highlight hue (beams, active states, live data), **red**
+   reserved for failures and critical selection, **amber** for approvals pending. No
+   ambient color: when color appears, it *means* something. (v0.2's signal cyan/teal
+   was retired in the v0.3 retheme — tokens: `--bg-void #000`, `--panel #0a0a0b`,
+   `--stroke #29292e`, `--accent #f4f4f0`, `--danger #e8443a`, `--warn #e9b23c`,
+   `--ok #d9d9d2` — nominal reads paper-white; red is the only alarm.)
 3. **Thin linework & precise type.** 1px strokes, corner ticks/brackets on focus, monospaced
    numerals for telemetry; generous letter-spacing on labels (small caps); a condensed
    grotesk for display and navigation.

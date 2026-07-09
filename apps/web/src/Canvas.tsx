@@ -335,7 +335,7 @@ export function Canvas(props: {
           fitView
           proOptions={{ hideAttribution: true }}
         >
-          <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#16232a" />
+          <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#26262b" />
           <Controls showInteractive={false} />
         </ReactFlow>
 

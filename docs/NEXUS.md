@@ -415,6 +415,13 @@ lives. If code and doc disagree, the doc is intent, code is fact — reconcile a
 here.
 
 **Build log:**
+- 2026-07-09 · **v2.4 (owner feedback)**: total retheme to DESIGN-LANGUAGE v0.3 —
+  monochrome black/white with red as the only alarm and amber for pending gates (tokens
+  in `packages/ui/styles.css`; every teal-tinted hardcoded hex in `fui.css`, node-kind
+  accents, canvas dots, `index.html`, and the demo workspace accent remapped). Pane
+  hygiene: spawn cascade steps 42px per pane and wraps into fresh columns so no pane
+  buries another's rail at birth; rail buttons no longer start drags; pane bodies are
+  vertical-scroll-only (prompts/pre/labels wrap, inputs clamp — no horizontal scroll).
 - 2026-07-09 · **v2.3 (owner feedback)**: kernel gained two live modes — an idle
   pixel-lattice wave whose direction wanders randomly and leans toward the cursor, and
   an aggressive multi-row random signal-line burst while a process runs (snapshot

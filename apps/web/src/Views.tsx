@@ -700,7 +700,7 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
               <span>Accent hue</span>
               <input
                 type="color"
-                defaultValue={ws.branding.accent ?? "#35d0e0"}
+                defaultValue={ws.branding.accent ?? "#f4f4f0"}
                 onChange={(e) => save({ branding: { ...ws.branding, accent: e.target.value } })}
               />
             </label>
