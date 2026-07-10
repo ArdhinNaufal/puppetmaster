@@ -1,6 +1,7 @@
 import { and, asc, desc, eq } from "drizzle-orm";
+import { TraceRefType, TraceRelation } from "@puppetmaster/shared";
 import type { Db } from "./client.js";
-import { evidence, missions, projectArtifacts, projects, verifyChecks } from "./schema.js";
+import { evidence, missions, projectArtifacts, projects, projectTraceLinks, verifyChecks } from "./schema.js";
 
 /**
  * Workshop repository (AI-SDLC plan WP2, ADR-003/004). The artifact lifecycle
@@ -287,6 +288,11 @@ export async function createVerifyCheck(
     earnedNote?: string;
   },
 ): Promise<VerifyCheckRow> {
+  const enabled = input.enabled ?? false;
+  const earnedNote = input.earnedNote?.trim() ?? "";
+  if (enabled && !earnedNote) {
+    throw new Error("an enabled verify check requires an earned note");
+  }
   const [row] = await db
     .insert(verifyChecks)
     .values({
@@ -294,8 +300,8 @@ export async function createVerifyCheck(
       name: input.name,
       command: input.command ?? null,
       baseline: input.baseline ?? null,
-      enabled: input.enabled ?? false,
-      earnedNote: input.earnedNote ?? "",
+      enabled,
+      earnedNote,
     })
     .returning();
   return row!;
@@ -322,25 +328,146 @@ export async function getVerifyCheckByName(
   return row ?? null;
 }
 
+export async function getVerifyCheck(db: Db, id: string): Promise<VerifyCheckRow | null> {
+  const [row] = await db.select().from(verifyChecks).where(eq(verifyChecks.id, id)).limit(1);
+  return row ?? null;
+}
+
 export async function updateVerifyCheck(
   db: Db,
   id: string,
   patch: { command?: string | null; baseline?: number | null; enabled?: boolean; earnedNote?: string },
 ): Promise<VerifyCheckRow | null> {
+  const current = await getVerifyCheck(db, id);
+  if (!current) return null;
+  const nextEnabled = patch.enabled ?? current.enabled;
+  const nextEarnedNote = patch.earnedNote === undefined ? current.earnedNote : patch.earnedNote.trim();
+  if (nextEnabled && !nextEarnedNote) {
+    throw new Error("an enabled verify check requires an earned note");
+  }
   const values: Record<string, unknown> = {};
   if (patch.command !== undefined) values.command = patch.command;
   if (patch.baseline !== undefined) values.baseline = patch.baseline;
   if (patch.enabled !== undefined) values.enabled = patch.enabled;
-  if (patch.earnedNote !== undefined) values.earnedNote = patch.earnedNote;
+  if (patch.earnedNote !== undefined) values.earnedNote = nextEarnedNote;
   if (Object.keys(values).length === 0) {
-    const [row] = await db.select().from(verifyChecks).where(eq(verifyChecks.id, id)).limit(1);
-    return row ?? null;
+    return current;
   }
   const [row] = await db.update(verifyChecks).set(values).where(eq(verifyChecks.id, id)).returning();
   return row ?? null;
 }
 
-/* ————— Evidence (WP4) — attached to verify steps / escalation approvals ————— */
+/* ————— Project trace links: artifact/check provenance and coverage ————— */
+
+export type ProjectTraceLinkRow = typeof projectTraceLinks.$inferSelect;
+
+async function requireTraceEndpoint(
+  db: Db,
+  projectId: string,
+  type: TraceRefType,
+  id: string,
+  side: "source" | "target",
+): Promise<void> {
+  if (type === "artifact") {
+    const [row] = await db
+      .select({ id: projectArtifacts.id })
+      .from(projectArtifacts)
+      .where(and(eq(projectArtifacts.id, id), eq(projectArtifacts.projectId, projectId)))
+      .limit(1);
+    if (!row) throw new Error(`trace link ${side} artifact "${id}" was not found in this project`);
+    return;
+  }
+
+  const [row] = await db
+    .select({ id: verifyChecks.id })
+    .from(verifyChecks)
+    .where(and(eq(verifyChecks.id, id), eq(verifyChecks.projectId, projectId)))
+    .limit(1);
+  if (!row) throw new Error(`trace link ${side} check "${id}" was not found in this project`);
+}
+
+export async function listProjectTraceLinks(db: Db, projectId: string): Promise<ProjectTraceLinkRow[]> {
+  return db
+    .select()
+    .from(projectTraceLinks)
+    .where(eq(projectTraceLinks.projectId, projectId))
+    .orderBy(asc(projectTraceLinks.createdAt));
+}
+
+export async function createProjectTraceLink(
+  db: Db,
+  input: {
+    projectId: string;
+    sourceType: TraceRefType;
+    sourceId: string;
+    targetType: TraceRefType;
+    targetId: string;
+    relation: TraceRelation;
+    rationale: string;
+  },
+): Promise<ProjectTraceLinkRow> {
+  const sourceType = TraceRefType.parse(input.sourceType);
+  const targetType = TraceRefType.parse(input.targetType);
+  const relation = TraceRelation.parse(input.relation);
+  const rationale = input.rationale.trim();
+  if (!rationale) throw new Error("trace link rationale is required");
+  if (relation === "derives" && (sourceType !== "artifact" || targetType !== "artifact")) {
+    throw new Error('a "derives" link must connect an artifact to an artifact');
+  }
+  if (relation === "verifies" && (sourceType !== "artifact" || targetType !== "check")) {
+    throw new Error('a "verifies" link must connect an artifact to a check');
+  }
+
+  await requireTraceEndpoint(db, input.projectId, sourceType, input.sourceId, "source");
+  await requireTraceEndpoint(db, input.projectId, targetType, input.targetId, "target");
+  if (sourceType === targetType && input.sourceId === input.targetId) {
+    throw new Error("a trace link cannot reference itself");
+  }
+
+  const [duplicate] = await db
+    .select({ id: projectTraceLinks.id })
+    .from(projectTraceLinks)
+    .where(
+      and(
+        eq(projectTraceLinks.projectId, input.projectId),
+        eq(projectTraceLinks.sourceType, sourceType),
+        eq(projectTraceLinks.sourceId, input.sourceId),
+        eq(projectTraceLinks.targetType, targetType),
+        eq(projectTraceLinks.targetId, input.targetId),
+        eq(projectTraceLinks.relation, relation),
+      ),
+    )
+    .limit(1);
+  if (duplicate) throw new Error("trace link already exists");
+
+  const [row] = await db
+    .insert(projectTraceLinks)
+    .values({
+      projectId: input.projectId,
+      sourceType,
+      sourceId: input.sourceId,
+      targetType,
+      targetId: input.targetId,
+      relation,
+      rationale,
+    })
+    .returning();
+  return row!;
+}
+
+export async function deleteProjectTraceLink(
+  db: Db,
+  projectId: string,
+  id: string,
+): Promise<ProjectTraceLinkRow | null> {
+  const [row] = await db
+    .delete(projectTraceLinks)
+    .where(and(eq(projectTraceLinks.id, id), eq(projectTraceLinks.projectId, projectId)))
+    .returning();
+  return row ?? null;
+}
+
+/* Gate evidence attached to verify steps / escalation approvals. */
 
 export type EvidenceRow = typeof evidence.$inferSelect;
 

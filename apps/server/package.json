@@ -17,6 +17,7 @@
     "@puppetmaster/kernel": "workspace:*",
     "@puppetmaster/mcp-connectors": "workspace:*",
     "@puppetmaster/shared": "workspace:*",
+    "drizzle-orm": "^0.38.3",
     "fastify": "^5.2.0",
     "jose": "^6.2.3",
     "zod": "^3.24.0"

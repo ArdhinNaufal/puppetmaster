@@ -244,6 +244,28 @@ export const VerifyCheck = z.object({
 });
 export type VerifyCheck = z.infer<typeof VerifyCheck>;
 
+/** Endpoint kinds and semantic relations for project-scoped SDLC traceability.
+ *  Links intentionally connect durable artifacts and deterministic checks only:
+ *  conversations remain transient, while both endpoint kinds have stable ids. */
+export const TraceRefType = z.enum(["artifact", "check"]);
+export type TraceRefType = z.infer<typeof TraceRefType>;
+
+export const TraceRelation = z.enum(["informs", "derives", "verifies", "mitigates"]);
+export type TraceRelation = z.infer<typeof TraceRelation>;
+
+export const ProjectTraceLink = z.object({
+  id: z.string().uuid(),
+  projectId: z.string().uuid(),
+  sourceType: TraceRefType,
+  sourceId: z.string().uuid(),
+  targetType: TraceRefType,
+  targetId: z.string().uuid(),
+  relation: TraceRelation,
+  rationale: z.string().trim().min(1),
+  createdAt: z.coerce.date(),
+});
+export type ProjectTraceLink = z.infer<typeof ProjectTraceLink>;
+
 /** Config for the `verify` node kind (WP4): a deterministic gate. The check
  *  runs via the deployment's CheckRunner; on failure the executor loops the
  *  fix agent (if configured) up to `retriesBeforeEscalate` times with the

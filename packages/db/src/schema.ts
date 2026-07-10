@@ -499,6 +499,36 @@ export const verifyChecks = pgTable("verify_checks", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Project-scoped traceability graph. Endpoints are polymorphic references to
+ *  either project_artifacts or verify_checks, so repository validation (rather
+ *  than a cross-table foreign key) enforces endpoint ownership. */
+export const projectTraceLinks = pgTable(
+  "project_trace_links",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    sourceType: text("source_type").notNull(), // artifact | check
+    sourceId: uuid("source_id").notNull(),
+    targetType: text("target_type").notNull(), // artifact | check
+    targetId: uuid("target_id").notNull(),
+    relation: text("relation").notNull(), // informs | derives | verifies | mitigates
+    rationale: text("rationale").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqTrace: unique("project_trace_links_unique").on(
+      t.projectId,
+      t.sourceType,
+      t.sourceId,
+      t.targetType,
+      t.targetId,
+      t.relation,
+    ),
+  }),
+);
+
 /** Machine-checkable evidence attached to verify steps / approvals (org
  *  layer §1: the gate reviews evidence, not assertions). Written by WP4. */
 export const evidence = pgTable("evidence", {
@@ -541,5 +571,6 @@ export const schema = {
   projects,
   projectArtifacts,
   verifyChecks,
+  projectTraceLinks,
   evidence,
 };

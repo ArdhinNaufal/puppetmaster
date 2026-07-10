@@ -6,6 +6,7 @@ import {
   completeTodo,
   createAgent,
   createProject,
+  createProjectTraceLink,
   createVerifyCheck,
   getMission,
   getMissionSteps,
@@ -15,6 +16,8 @@ import {
   listDocuments,
   listEvidenceForApproval,
   listEvidenceForStep,
+  listProjectTraceLinks,
+  listVerifyChecks,
   searchMemories,
   updateArtifact,
   writeArtifact,
@@ -231,6 +234,134 @@ export const GOLDEN_TASKS: GoldenTask[] = [
     trajectory: {
       mustCall: ["project.artifact.write", "project.todo.complete"],
       mayCallOnly: ["project.artifact.write", "project.todo.complete"],
+    },
+  },
+  {
+    id: "workshop-decision-graph-persistence",
+    description:
+      "Workshop Decision Graph: spec -> plan -> todo provenance and todo -> check verification persist with rationales; duplicate links are rejected",
+    kind: "workflow",
+    setup: async (db, ctx) => {
+      const project = await createProject(db, {
+        workspaceId: ctx.workspaceId,
+        name: "eval-decision-graph",
+        mode: "gated",
+      });
+      const spec = await writeArtifact(db, {
+        projectId: project.id,
+        kind: "spec",
+        title: "Decision Graph spec",
+        body: "## Verification\nEvery implementation decision remains traceable to a deterministic check.",
+      });
+      const plan = await writeArtifact(db, {
+        projectId: project.id,
+        kind: "plan",
+        title: "Decision Graph plan",
+        body: "Persist the trace links before rendering the graph.",
+      });
+      const todo = await writeArtifact(db, {
+        projectId: project.id,
+        kind: "todo",
+        title: "Persist trace links",
+        status: "active",
+      });
+      const check = await createVerifyCheck(db, {
+        projectId: project.id,
+        name: "todo-sync",
+        enabled: true,
+        earnedNote: "A prior change lost the decision-to-verification trail",
+      });
+
+      await createProjectTraceLink(db, {
+        projectId: project.id,
+        sourceType: "artifact",
+        sourceId: spec.id,
+        targetType: "artifact",
+        targetId: plan.id,
+        relation: "derives",
+        rationale: "The plan decomposes the approved specification into buildable work",
+      });
+      await createProjectTraceLink(db, {
+        projectId: project.id,
+        sourceType: "artifact",
+        sourceId: plan.id,
+        targetType: "artifact",
+        targetId: todo.id,
+        relation: "derives",
+        rationale: "The todo is the smallest executable increment from the plan",
+      });
+      await createProjectTraceLink(db, {
+        projectId: project.id,
+        sourceType: "artifact",
+        sourceId: todo.id,
+        targetType: "check",
+        targetId: check.id,
+        relation: "verifies",
+        rationale: "The todo-sync gate detects drift before this increment can complete",
+      });
+      return { projectId: project.id };
+    },
+    graph: {
+      nodes: [
+        { id: "t", kind: "trigger", label: "go", config: { mode: "manual" } },
+        {
+          id: "grade-ready",
+          kind: "code",
+          label: "decision graph ready",
+          config: { source: 'return { decisionGraph: "persisted" };' },
+        },
+      ],
+      edges: [{ from: "t", to: "grade-ready" }],
+    },
+    expectOutput: (o) => (o as { decisionGraph?: string } | null)?.decisionGraph === "persisted",
+    expectState: async (db, ctx) => {
+      const { listProjects } = await import("@puppetmaster/db");
+      const project = (await listProjects(db, ctx.workspaceId)).find(
+        (p) => p.name === "eval-decision-graph",
+      );
+      if (!project) return false;
+
+      const artifacts = await listArtifacts(db, project.id);
+      const spec = artifacts.find((a) => a.kind === "spec");
+      const plan = artifacts.find((a) => a.kind === "plan");
+      const todo = artifacts.find((a) => a.kind === "todo");
+      const check = (await listVerifyChecks(db, project.id)).find((c) => c.name === "todo-sync");
+      if (!spec || !plan || !todo || !check?.enabled || !check.earnedNote.trim()) return false;
+
+      const links = await listProjectTraceLinks(db, project.id);
+      const expected = new Map([
+        [
+          `artifact:${spec.id}->artifact:${plan.id}:derives`,
+          "The plan decomposes the approved specification into buildable work",
+        ],
+        [
+          `artifact:${plan.id}->artifact:${todo.id}:derives`,
+          "The todo is the smallest executable increment from the plan",
+        ],
+        [
+          `artifact:${todo.id}->check:${check.id}:verifies`,
+          "The todo-sync gate detects drift before this increment can complete",
+        ],
+      ]);
+      if (links.length !== expected.size) return false;
+      for (const link of links) {
+        const key = `${link.sourceType}:${link.sourceId}->${link.targetType}:${link.targetId}:${link.relation}`;
+        if (expected.get(key) !== link.rationale) return false;
+      }
+
+      const duplicateRejected = await createProjectTraceLink(db, {
+        projectId: project.id,
+        sourceType: "artifact",
+        sourceId: spec.id,
+        targetType: "artifact",
+        targetId: plan.id,
+        relation: "derives",
+        rationale: "A duplicate must not create a second edge",
+      }).then(
+        () => false,
+        (err: unknown) => err instanceof Error && err.message.includes("already exists"),
+      );
+      return duplicateRejected && (await listProjectTraceLinks(db, project.id)).length === 3;
     },
   },
   {

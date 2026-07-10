@@ -1,10 +1,13 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+import { z } from "zod";
 import {
   ArtifactKind,
   ProjectMode,
   ProjectPhase,
   ProjectStatus,
+  TraceRefType,
+  TraceRelation,
   VerifyCheckName,
   WorkflowGraph,
 } from "@puppetmaster/shared";
@@ -15,8 +18,10 @@ import {
   createApproval,
   createBudget,
   createMcpServer,
+  createProjectTraceLink,
   createRouterProfile,
   deleteMcpServer,
+  deleteProjectTraceLink,
   deleteRouterProfile,
   getMcpServer,
   getRouterProfile,
@@ -40,6 +45,7 @@ import {
   getAgent,
   getAgentMessages,
   getApproval,
+  getArtifact,
   getDocument,
   getDocumentChunks,
   getMemory,
@@ -47,6 +53,7 @@ import {
   getMissionSteps,
   getProject,
   getTemplate,
+  getVerifyCheck,
   getVerifyCheckByName,
   getWorkflow,
   getWorkflowVersionById,
@@ -67,6 +74,7 @@ import {
   listMemories,
   listMissions,
   listPoliciesForAgent,
+  listProjectTraceLinks,
   listTemplates,
   listWorkflows,
   migrate,
@@ -618,6 +626,15 @@ app.delete("/api/templates/:id", async (req, reply) => {
 // --- The Workshop: projects + artifacts (AI-SDLC plan WP2, ADR-001/003/004) ---
 // Reads are member-tier; mutations are builder+ (auth.ts). Artifact lifecycle
 // rules are enforced in the repo layer; violations surface here as 400s.
+const ProjectTraceLinkInput = z.object({
+  sourceType: TraceRefType,
+  sourceId: z.string().uuid(),
+  targetType: TraceRefType,
+  targetId: z.string().uuid(),
+  relation: TraceRelation,
+  rationale: z.string().trim().min(1),
+});
+
 app.get("/api/projects", async () => listProjects(db, workspaceId));
 
 app.post("/api/projects", async (req, reply) => {
@@ -742,6 +759,88 @@ app.post("/api/projects/:id/artifacts", async (req, reply) => {
   }
 });
 
+// Artifact/check traceability graph: project-scoped provenance, verification,
+// and risk coverage links. Endpoint ownership is revalidated in the repo layer
+// so a caller cannot stitch together ids from different projects.
+app.get("/api/projects/:id/trace-links", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  return listProjectTraceLinks(db, id);
+});
+
+app.post("/api/projects/:id/trace-links", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  const parsed = ProjectTraceLinkInput.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: "invalid trace link", detail: parsed.error.issues });
+  }
+  try {
+    const row = await createProjectTraceLink(db, { projectId: id, ...parsed.data });
+    await appendAudit(db, {
+      workspaceId,
+      actorKind: "user",
+      actorId: req.authUser?.id ?? null,
+      actorLabel: req.authUser?.email ?? "unknown",
+      action: "project.trace-link.create",
+      target: row.id,
+      detail: {
+        projectId: id,
+        sourceType: row.sourceType,
+        sourceId: row.sourceId,
+        targetType: row.targetType,
+        targetId: row.targetId,
+        relation: row.relation,
+        rationale: row.rationale,
+      },
+    });
+    return reply.code(201).send(row);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "invalid trace link";
+    const duplicate =
+      message.includes("already exists") ||
+      message.includes("project_trace_links_unique") ||
+      message.includes("duplicate key");
+    return reply.code(duplicate ? 409 : 400).send({ error: message });
+  }
+});
+
+app.delete("/api/projects/:id/trace-links/:linkId", async (req, reply) => {
+  const { id, linkId } = req.params as { id: string; linkId: string };
+  const project = await getProject(db, id);
+  if (!project || project.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "project not found" });
+  }
+  if (!z.string().uuid().safeParse(linkId).success) {
+    return reply.code(400).send({ error: "invalid trace link id" });
+  }
+  const row = await deleteProjectTraceLink(db, id, linkId);
+  if (!row) return reply.code(404).send({ error: "trace link not found" });
+  await appendAudit(db, {
+    workspaceId,
+    actorKind: "user",
+    actorId: req.authUser?.id ?? null,
+    actorLabel: req.authUser?.email ?? "unknown",
+    action: "project.trace-link.delete",
+    target: row.id,
+    detail: {
+      projectId: id,
+      sourceType: row.sourceType,
+      sourceId: row.sourceId,
+      targetType: row.targetType,
+      targetId: row.targetId,
+      relation: row.relation,
+    },
+  });
+  return reply.code(204).send();
+});
+
 // Verify checks (WP4): earned policies — created disabled unless explicitly
 // enabled with a note on what failure earned them. Mutations are admin
 // (ADR-001 role matrix: check config is admin).
@@ -760,7 +859,7 @@ app.post("/api/projects/:id/checks", async (req, reply) => {
   if (!project || project.workspaceId !== workspaceId) {
     return reply.code(404).send({ error: "project not found" });
   }
-  const body = req.body as {
+  const body = (req.body ?? {}) as {
     name?: string;
     command?: string;
     baseline?: number;
@@ -769,6 +868,17 @@ app.post("/api/projects/:id/checks", async (req, reply) => {
   };
   const name = VerifyCheckName.safeParse(body.name);
   if (!name.success) return reply.code(400).send({ error: "invalid check name" });
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    return reply.code(400).send({ error: "enabled must be a boolean" });
+  }
+  if (body.earnedNote !== undefined && typeof body.earnedNote !== "string") {
+    return reply.code(400).send({ error: "earnedNote must be a string" });
+  }
+  const enabled = body.enabled ?? false;
+  const earnedNote = body.earnedNote?.trim() ?? "";
+  if (enabled && !earnedNote) {
+    return reply.code(400).send({ error: "an enabled verify check requires an earned note" });
+  }
   if (await getVerifyCheckByName(db, id, name.data)) {
     return reply.code(409).send({ error: `check "${name.data}" already exists for this project` });
   }
@@ -777,8 +887,8 @@ app.post("/api/projects/:id/checks", async (req, reply) => {
     name: name.data,
     command: body.command ?? null,
     baseline: body.baseline ?? null,
-    enabled: body.enabled ?? false,
-    earnedNote: body.earnedNote ?? "",
+    enabled,
+    earnedNote,
   });
   await appendAudit(db, {
     workspaceId,
@@ -798,9 +908,26 @@ app.put("/api/projects/:id/checks/:checkId", async (req, reply) => {
   if (!project || project.workspaceId !== workspaceId) {
     return reply.code(404).send({ error: "project not found" });
   }
-  const body = req.body as { command?: string; baseline?: number; enabled?: boolean; earnedNote?: string };
-  const row = await updateVerifyCheck(db, checkId, body);
-  if (!row || row.projectId !== id) return reply.code(404).send({ error: "check not found" });
+  const current = await getVerifyCheck(db, checkId);
+  if (!current || current.projectId !== id) return reply.code(404).send({ error: "check not found" });
+  const body = (req.body ?? {}) as { command?: string; baseline?: number; enabled?: boolean; earnedNote?: string };
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    return reply.code(400).send({ error: "enabled must be a boolean" });
+  }
+  if (body.earnedNote !== undefined && typeof body.earnedNote !== "string") {
+    return reply.code(400).send({ error: "earnedNote must be a string" });
+  }
+  const nextEnabled = body.enabled ?? current.enabled;
+  const nextEarnedNote = body.earnedNote === undefined ? current.earnedNote : body.earnedNote.trim();
+  if (nextEnabled && !nextEarnedNote) {
+    return reply.code(400).send({ error: "an enabled verify check requires an earned note" });
+  }
+  const patch = {
+    ...body,
+    ...(body.earnedNote !== undefined ? { earnedNote: nextEarnedNote } : {}),
+  };
+  const row = await updateVerifyCheck(db, checkId, patch);
+  if (!row) return reply.code(404).send({ error: "check not found" });
   await appendAudit(db, {
     workspaceId,
     actorKind: "user",
@@ -808,7 +935,7 @@ app.put("/api/projects/:id/checks/:checkId", async (req, reply) => {
     actorLabel: req.authUser?.email ?? "unknown",
     action: "project.check.update",
     target: checkId,
-    detail: { projectId: id, ...body },
+    detail: { projectId: id, ...patch },
   });
   return row;
 });
@@ -821,7 +948,11 @@ app.post("/api/projects/:id/artifacts/:artifactId/complete", async (req, reply) 
   if (!project || project.workspaceId !== workspaceId) {
     return reply.code(404).send({ error: "project not found" });
   }
-  const body = req.body as { missionId?: string };
+  const artifact = await getArtifact(db, artifactId);
+  if (!artifact || artifact.projectId !== id) {
+    return reply.code(404).send({ error: "artifact not found" });
+  }
+  const body = (req.body ?? {}) as { missionId?: string };
   try {
     const row = await completeTodo(db, artifactId, body.missionId ?? "");
     await appendAudit(db, {

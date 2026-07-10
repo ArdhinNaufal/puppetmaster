@@ -467,6 +467,23 @@ export interface SpecCoverage {
   missing: string[];
 }
 
+export type TraceRefType = "artifact" | "check";
+export type TraceRelation = "informs" | "derives" | "verifies" | "mitigates";
+
+/** A human-confirmed edge in the Workshop's decision graph. Links are
+ * directional and keep their rationale so provenance survives hand-offs. */
+export interface ProjectTraceLink {
+  id: string;
+  projectId: string;
+  sourceType: TraceRefType;
+  sourceId: string;
+  targetType: TraceRefType;
+  targetId: string;
+  relation: TraceRelation;
+  rationale: string;
+  createdAt: string;
+}
+
 export const projectApi = {
   list: () => fetch("/api/projects").then(json<Project[]>),
   create: (input: { name: string; repoRef?: string; mode?: string }) =>
@@ -497,6 +514,26 @@ export const projectApi = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(patch),
     }).then(json<VerifyCheckRow>),
+  traceLinks: (id: string) =>
+    fetch(`/api/projects/${id}/trace-links`).then(json<ProjectTraceLink[]>),
+  createTraceLink: (
+    id: string,
+    input: {
+      sourceType: TraceRefType;
+      sourceId: string;
+      targetType: TraceRefType;
+      targetId: string;
+      relation: TraceRelation;
+      rationale: string;
+    },
+  ) => post(`/api/projects/${id}/trace-links`, input).then(json<ProjectTraceLink>),
+  deleteTraceLink: async (id: string, linkId: string) => {
+    const res = await fetch(`/api/projects/${id}/trace-links/${linkId}`, { method: "DELETE" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? res.statusText);
+    }
+  },
 };
 
 // --- Evals & observability (Stage 5) ----------------------------------------------

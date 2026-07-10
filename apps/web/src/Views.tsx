@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Chip, Gauge, Panel, Stat, StatusDot, StatusText, TierBadge } from "@puppetmaster/ui";
 import {
   agentApi,
@@ -27,10 +27,13 @@ import {
   type Mission,
   type Project,
   type ProjectArtifact,
+  type ProjectTraceLink,
   type Role,
   type RouterProfile,
   type SpecCoverage,
   type Template,
+  type TraceRefType,
+  type TraceRelation,
   type UsageReport,
   type VerifyCheckRow,
   type Workflow,
@@ -965,6 +968,23 @@ export function KnowledgeView(props: { canBuild: boolean }) {
 
 /* -------------------------------------------------------------- Workshop */
 
+function checkConfigurationIssue(name: string, command: string | null | undefined): string | null {
+  if (["test", "arch", "custom"].includes(name) && !command?.trim()) {
+    return `${name} requires a shell command`;
+  }
+  if (name === "load") {
+    if (!command?.trim()) return "load requires JSON with declared slos and a run command";
+    try {
+      const config = JSON.parse(command) as { slos?: unknown; run?: unknown };
+      if (!Array.isArray(config.slos) || config.slos.length === 0) return "load requires at least one declared SLO";
+      if (typeof config.run !== "string" || !config.run.trim()) return "load requires a run command";
+    } catch {
+      return "load configuration must be valid JSON";
+    }
+  }
+  return null;
+}
+
 /** WORKSHOP view (AI-SDLC plan WP7a): projects + their artifact sets and
  *  verify checks. Phase-flow actions (interview, execute) arrive with WP5's
  *  remaining increments; this surface reads and manages what WP2/WP4 built. */
@@ -974,23 +994,83 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
   const [artifacts, setArtifacts] = useState<ProjectArtifact[]>([]);
   const [checks, setChecks] = useState<VerifyCheckRow[]>([]);
   const [coverage, setCoverage] = useState<SpecCoverage | null>(null);
+  const [traceLinks, setTraceLinks] = useState<ProjectTraceLink[]>([]);
   const [reading, setReading] = useState<ProjectArtifact | null>(null);
   const [name, setName] = useState("");
   const [repoRef, setRepoRef] = useState("");
   const [gated, setGated] = useState(false);
   const [notice, setNotice] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [loadFailures, setLoadFailures] = useState<string[]>([]);
+  const [artifactKind, setArtifactKind] = useState<ProjectArtifact["kind"]>("spec");
+  const [artifactTitle, setArtifactTitle] = useState("");
+  const [artifactBody, setArtifactBody] = useState("");
+  const [artifactStatus, setArtifactStatus] = useState("backlog");
+  const [revisionBase, setRevisionBase] = useState<ProjectArtifact | null>(null);
+  const [writingArtifact, setWritingArtifact] = useState(false);
+  const [checkName, setCheckName] = useState("todo-sync");
+  const [checkCommand, setCheckCommand] = useState("");
+  const [creatingCheck, setCreatingCheck] = useState(false);
+  const [earningCheckId, setEarningCheckId] = useState<string | null>(null);
+  const [earningNote, setEarningNote] = useState("");
+  const [earningCommand, setEarningCommand] = useState("");
+  const [traceSource, setTraceSource] = useState("");
+  const [traceTarget, setTraceTarget] = useState("");
+  const [traceRelation, setTraceRelation] = useState<TraceRelation>("derives");
+  const [traceRationale, setTraceRationale] = useState("");
+  const [writingTrace, setWritingTrace] = useState(false);
+  const [confirmDeleteLinkId, setConfirmDeleteLinkId] = useState<string | null>(null);
+  const openSequence = useRef(0);
 
-  const refresh = () => projectApi.list().then(setProjects).catch(() => {});
+  const refresh = async () => {
+    const next = await projectApi.list();
+    setProjects(next);
+    return next;
+  };
   useEffect(() => {
-    refresh();
+    void refresh().catch(() => setNotice("Projects could not be loaded."));
   }, []);
 
-  const open = (p: Project) => {
+  const open = async (p: Project) => {
+    const sequence = ++openSequence.current;
     setSelected(p);
     setReading(null);
-    projectApi.artifacts(p.id).then(setArtifacts).catch(() => setArtifacts([]));
-    projectApi.checks(p.id).then(setChecks).catch(() => setChecks([]));
-    projectApi.specCoverage(p.id).then(setCoverage).catch(() => setCoverage(null));
+    setRevisionBase(null);
+    setArtifacts([]);
+    setChecks([]);
+    setCoverage(null);
+    setTraceLinks([]);
+    setTraceSource("");
+    setTraceTarget("");
+    setTraceRationale("");
+    setConfirmDeleteLinkId(null);
+    setEarningCheckId(null);
+    setEarningNote("");
+    setEarningCommand("");
+    setLoadFailures([]);
+    setLoading(true);
+    setNotice("");
+    const results = await Promise.allSettled([
+      projectApi.artifacts(p.id),
+      projectApi.checks(p.id),
+      projectApi.specCoverage(p.id),
+      projectApi.traceLinks(p.id),
+    ]);
+    if (sequence !== openSequence.current) return;
+    const [artifactResult, checkResult, coverageResult, traceResult] = results;
+    setArtifacts(artifactResult.status === "fulfilled" ? artifactResult.value : []);
+    setChecks(checkResult.status === "fulfilled" ? checkResult.value : []);
+    setCoverage(coverageResult.status === "fulfilled" ? coverageResult.value : null);
+    setTraceLinks(traceResult.status === "fulfilled" ? traceResult.value : []);
+    setLoading(false);
+    const failures = results
+      .map((result, index) => result.status === "rejected" ? ["artifacts", "checks", "spec coverage", "trace links"][index]! : null)
+      .filter((label): label is string => label !== null);
+    setLoadFailures(failures);
+    if (failures.length > 0) {
+      setNotice(`${failures.join(", ")} could not be loaded. Retry by selecting the project again.`);
+    }
+    return failures;
   };
 
   const create = async () => {
@@ -1000,50 +1080,317 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
       setName("");
       setRepoRef("");
       setGated(false);
-      refresh();
-      open(p);
-    } catch {
-      setNotice("Create failed.");
+      await refresh();
+      await open(p);
+    } catch (err) {
+      setNotice(`Create failed: ${err instanceof Error ? err.message : "unknown error"}`);
     }
   };
 
-  const toggleCheck = async (c: VerifyCheckRow) => {
-    if (!props.isAdmin || !selected) return;
-    const note = c.enabled
-      ? c.earnedNote
-      : window.prompt("Checks are earned policies. What failure earned this one?", c.earnedNote) ?? "";
-    if (!c.enabled && !note.trim()) return; // enabling requires the earned note
+  const toggleCheck = async (c: VerifyCheckRow, note = c.earnedNote, command = c.command ?? "") => {
+    if (!props.isAdmin || !selected) return false;
+    if (!c.enabled && !note.trim()) return false;
+    if (!c.enabled && checkConfigurationIssue(c.name, command)) return false;
     try {
-      await projectApi.updateCheck(selected.id, c.id, { enabled: !c.enabled, earnedNote: note });
-      projectApi.checks(selected.id).then(setChecks);
-    } catch {
-      setNotice("Check update failed.");
+      await projectApi.updateCheck(selected.id, c.id, {
+        enabled: !c.enabled,
+        earnedNote: note,
+        ...(command !== (c.command ?? "") ? { command } : {}),
+      });
+      await open(selected);
+      return true;
+    } catch (err) {
+      setNotice(`Check update failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      return false;
     }
   };
 
-  const todos = artifacts.filter((a) => a.kind === "todo");
-  const knowledge = artifacts.filter((a) => a.kind !== "todo");
+  const writeArtifact = async () => {
+    const kind = draftArtifactKind;
+    const title = draftArtifactTitle.trim();
+    if (!selected || !title || !artifactBody.trim()) return;
+    setWritingArtifact(true);
+    try {
+      await projectApi.writeArtifact(selected.id, {
+        kind,
+        title,
+        body: artifactBody.trim(),
+        ...(kind === "todo" || kind === "adr" ? { status: artifactStatus } : {}),
+      });
+      setArtifactTitle("");
+      setArtifactBody("");
+      setRevisionBase(null);
+      const failures = await open(selected);
+      if (failures?.length === 0) {
+        setNotice("Artifact recorded. New spec and plan versions require their trace links to be re-confirmed.");
+      }
+    } catch (err) {
+      setNotice(`Artifact write failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setWritingArtifact(false);
+    }
+  };
+
+  const createCheck = async () => {
+    if (!selected || !props.isAdmin) return;
+    const issue = checkConfigurationIssue(checkName, checkCommand);
+    if (issue) {
+      setNotice(`Check configuration is incomplete: ${issue}.`);
+      return;
+    }
+    setCreatingCheck(true);
+    try {
+      await projectApi.createCheck(selected.id, {
+        name: checkName,
+        ...(checkCommand.trim() ? { command: checkCommand.trim() } : {}),
+      });
+      setCheckCommand("");
+      const failures = await open(selected);
+      if (failures?.length === 0) {
+        setNotice("Check added in the disabled state. Enable it only when a real failure has earned the policy.");
+      }
+    } catch (err) {
+      setNotice(`Check creation failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setCreatingCheck(false);
+    }
+  };
+
+  const parseTraceRef = (value: string): { type: TraceRefType; id: string } | null => {
+    const split = value.indexOf(":");
+    if (split < 1) return null;
+    const type = value.slice(0, split);
+    if (type !== "artifact" && type !== "check") return null;
+    return { type, id: value.slice(split + 1) };
+  };
+
+  const createTraceLink = async () => {
+    if (!selected || !props.canBuild || !traceRationale.trim()) return;
+    const source = parseTraceRef(traceSource);
+    const target = parseTraceRef(traceTarget);
+    if (!source || !target || (source.type === target.type && source.id === target.id)) return;
+    const sequence = openSequence.current;
+    setWritingTrace(true);
+    try {
+      const link = await projectApi.createTraceLink(selected.id, {
+        sourceType: source.type,
+        sourceId: source.id,
+        targetType: target.type,
+        targetId: target.id,
+        relation: traceRelation,
+        rationale: traceRationale.trim(),
+      });
+      if (sequence !== openSequence.current) return;
+      setTraceLinks((current) => [...current, link]);
+      setTraceSource("");
+      setTraceTarget("");
+      setTraceRationale("");
+      setNotice("Trace link confirmed and added to the decision graph.");
+    } catch (err) {
+      if (sequence === openSequence.current) {
+        setNotice(`Trace link failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      }
+    } finally {
+      setWritingTrace(false);
+    }
+  };
+
+  const deleteTraceLink = async (linkId: string) => {
+    if (!selected || !props.canBuild) return;
+    const sequence = openSequence.current;
+    try {
+      await projectApi.deleteTraceLink(selected.id, linkId);
+      if (sequence !== openSequence.current) return;
+      setTraceLinks((current) => current.filter((link) => link.id !== linkId));
+      setConfirmDeleteLinkId(null);
+      setNotice("Trace link removed. Review the resulting orphan warning before proceeding.");
+    } catch (err) {
+      if (sequence === openSequence.current) {
+        setNotice(`Trace link removal failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      }
+    }
+  };
+
+  // Only current artifact versions drive readiness. Historical versions and
+  // their links remain visible so a revision cannot silently inherit trust.
+  const supersededIds = new Set(artifacts.map((artifact) => artifact.supersedesId).filter(Boolean));
+  const currentArtifacts = artifacts.filter((artifact) => !supersededIds.has(artifact.id));
+  const currentArtifactIds = new Set(currentArtifacts.map((artifact) => artifact.id));
+  const currentCheckIds = new Set(checks.map((check) => check.id));
+  const endpointIsCurrent = (type: TraceRefType, id: string) =>
+    type === "artifact" ? currentArtifactIds.has(id) : currentCheckIds.has(id);
+  const currentTraceLinks = traceLinks.filter(
+    (link) => endpointIsCurrent(link.sourceType, link.sourceId) && endpointIsCurrent(link.targetType, link.targetId),
+  );
+  const todos = currentArtifacts.filter((artifact) => artifact.kind === "todo");
+  const knowledgeHistory = artifacts
+    .filter((artifact) => artifact.kind !== "todo")
+    .slice()
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const newestOfKind = (kind: ProjectArtifact["kind"]) =>
+    currentArtifacts
+      .filter((artifact) => artifact.kind === kind)
+      .reduce<ProjectArtifact | null>(
+        (latest, artifact) => !latest || new Date(artifact.createdAt) > new Date(latest.createdAt) ? artifact : latest,
+        null,
+      );
+  const latestSpec = coverage?.spec
+    ? currentArtifacts.find((artifact) => artifact.id === coverage.spec?.id) ?? newestOfKind("spec")
+    : newestOfKind("spec");
+  const latestPlan = newestOfKind("plan");
+  const openTodos = todos.filter((todo) => todo.status !== "completed");
+  const enabledChecks = checks.filter((check) => check.enabled);
+  const unrunnableChecks = enabledChecks.filter((check) => checkConfigurationIssue(check.name, check.command));
+
+  const planHasUpstream = !latestPlan || Boolean(latestSpec && currentTraceLinks.some(
+    (link) =>
+      link.sourceType === "artifact" &&
+      link.sourceId === latestSpec.id &&
+      link.targetType === "artifact" &&
+      link.targetId === latestPlan.id &&
+      (link.relation === "derives" || link.relation === "informs"),
+  ));
+  const deliveryUpstreamIds = new Set([latestSpec?.id, latestPlan?.id].filter((id): id is string => Boolean(id)));
+  const orphanTodos = openTodos.filter((todo) => !currentTraceLinks.some(
+    (link) =>
+      link.sourceType === "artifact" &&
+      deliveryUpstreamIds.has(link.sourceId) &&
+      link.targetType === "artifact" &&
+      link.targetId === todo.id &&
+      (link.relation === "derives" || link.relation === "informs"),
+  ));
+  const unlinkedChecks = enabledChecks.filter(
+    (check) => !currentTraceLinks.some(
+      (link) =>
+        link.sourceType === "artifact" &&
+        link.targetType === "check" &&
+        link.targetId === check.id &&
+        link.relation === "verifies",
+    ),
+  );
+  const orphanCount = (planHasUpstream ? 0 : 1) + orphanTodos.length + unlinkedChecks.length;
+  const specReady = Boolean(
+    coverage?.spec && coverage.missing.length === 0 && coverage.thin.length === 0,
+  );
+  const planReady = Boolean(latestPlan && planHasUpstream);
+  const todoReady = openTodos.length > 0 && orphanTodos.length === 0;
+  const verifyReady = enabledChecks.length > 0 && unlinkedChecks.length === 0 && unrunnableChecks.length === 0;
+  const artifactsAvailable = !loading && !loadFailures.includes("artifacts");
+  const checksAvailable = !loading && !loadFailures.includes("checks");
+  const coverageAvailable = !loading && !loadFailures.includes("spec coverage");
+  const linksAvailable = !loading && !loadFailures.includes("trace links");
+  const graphDataAvailable = artifactsAvailable && checksAvailable && linksAvailable;
+  const readiness = [
+    { label: "Concrete spec", ready: artifactsAvailable && coverageAvailable ? specReady : null },
+    { label: "Plan retains spec context", ready: artifactsAvailable && linksAvailable ? planReady : null },
+    { label: "Delivery todos are traced", ready: artifactsAvailable && linksAvailable ? todoReady : null },
+    { label: "Verification intent is runnable + linked", ready: graphDataAvailable ? verifyReady : null },
+  ];
+  const traceSubjects = [
+    ...(latestSpec ? [{ type: "artifact" as const, id: latestSpec.id, traced: currentTraceLinks.some((link) => link.sourceId === latestSpec.id || link.targetId === latestSpec.id) }] : []),
+    ...(latestPlan ? [{ type: "artifact" as const, id: latestPlan.id, traced: planHasUpstream }] : []),
+    ...openTodos.map((todo) => ({ type: "artifact" as const, id: todo.id, traced: !orphanTodos.some((orphan) => orphan.id === todo.id) })),
+    ...enabledChecks.map((check) => ({ type: "check" as const, id: check.id, traced: !unlinkedChecks.some((unlinked) => unlinked.id === check.id) })),
+  ];
+  const traceDataAvailable = graphDataAvailable;
+  const traceCoverage = traceDataAvailable && traceSubjects.length > 0
+    ? Math.round((traceSubjects.filter((subject) => subject.traced).length / traceSubjects.length) * 100)
+    : null;
+  const nextMove = loading
+    ? "Refreshing project evidence…"
+    : loadFailures.length > 0
+      ? `Retry before judging readiness: ${loadFailures.join(", ")} unavailable.`
+    : !latestSpec
+      ? "Capture a concrete spec before planning."
+      : !specReady
+        ? `Resolve ${coverage?.missing.length ?? 0} missing and ${coverage?.thin.length ?? 0} thin spec sections.`
+        : !latestPlan
+          ? "Create a delivery plan from the current spec."
+          : !planHasUpstream
+            ? "Re-confirm how the current plan derives from the current spec."
+            : openTodos.length === 0
+              ? "Decompose the plan into at least one delivery todo."
+              : orphanTodos.length > 0
+                ? `Restore upstream context for ${orphanTodos.length} orphaned todo${orphanTodos.length === 1 ? "" : "s"}.`
+                : enabledChecks.length === 0
+                  ? "Define and enable the checks that will prove the increment."
+                  : unrunnableChecks.length > 0
+                    ? `Fix configuration for ${unrunnableChecks.length} enabled check${unrunnableChecks.length === 1 ? "" : "s"}.`
+                    : unlinkedChecks.length > 0
+                    ? `Link ${unlinkedChecks.length} enabled check${unlinkedChecks.length === 1 ? "" : "s"} to what they verify.`
+                    : "Ready for the next execution increment; keep the graph current as evidence changes.";
+
+  const traceOptions = [
+    ...currentArtifacts.map((artifact) => ({
+      value: `artifact:${artifact.id}`,
+      label: `${artifact.kind.toUpperCase()} · ${artifact.title}${artifact.version > 1 ? ` v${artifact.version}` : ""}`,
+    })),
+    ...checks.map((check) => ({
+      value: `check:${check.id}`,
+      label: `CHECK · ${check.name}${check.enabled ? " · enabled" : " · disabled"}`,
+    })),
+  ];
+  const traceSourceOptions = traceRelation === "derives" || traceRelation === "verifies"
+    ? traceOptions.filter((option) => option.value.startsWith("artifact:"))
+    : traceOptions;
+  const traceTargetOptions = traceRelation === "derives"
+    ? traceOptions.filter((option) => option.value.startsWith("artifact:"))
+    : traceRelation === "verifies"
+      ? traceOptions.filter((option) => option.value.startsWith("check:"))
+      : traceOptions;
+  const refLabel = (type: TraceRefType, id: string) => {
+    if (type === "artifact") {
+      const artifact = artifacts.find((candidate) => candidate.id === id);
+      return artifact
+        ? `${artifact.kind.toUpperCase()} · ${artifact.title}${artifact.version > 1 ? ` v${artifact.version}` : ""}`
+        : "ARTIFACT · removed";
+    }
+    const check = checks.find((candidate) => candidate.id === id);
+    return check ? `CHECK · ${check.name}` : "CHECK · removed";
+  };
+  const availableArtifactKind = artifactKind === "spec" && latestSpec
+    ? latestPlan ? "todo" : "plan"
+    : artifactKind === "plan" && latestPlan
+      ? "todo"
+      : artifactKind;
+  const draftArtifactKind = revisionBase?.kind ?? availableArtifactKind;
+  const draftArtifactTitle = revisionBase?.title ?? artifactTitle;
+  const draftCheckIssue = checkConfigurationIssue(checkName, checkCommand);
+  const draftCheckHelp = draftCheckIssue ?? (
+    ["todo-sync", "spec-sections"].includes(checkName)
+      ? "This check is DB-native and needs no shell command."
+      : checkName === "refactor-gate"
+        ? "This check uses the workbench git diff and needs no custom command."
+        : "Configuration is structurally runnable."
+  );
   const PHASES = ["idle", "specify", "plan", "execute", "verify", "record"] as const;
 
   return (
     <div className="view-wrap">
       <div className="stat-row">
         <Panel><Stat label="PROJECTS" value={projects.length} tone="accent" /></Panel>
-        <Panel><Stat label="ACTIVE TODOS" value={todos.filter((t) => t.status === "active").length} /></Panel>
-        <Panel><Stat label="COMPLETED" value={todos.filter((t) => t.status === "completed").length} /></Panel>
-        <Panel><Stat label="CHECKS ENABLED" value={checks.filter((c) => c.enabled).length} /></Panel>
+        <Panel><Stat label="PROJECT ACTIVE" value={todos.filter((t) => t.status === "active").length} /></Panel>
+        <Panel><Stat label="PROJECT DONE" value={todos.filter((t) => t.status === "completed").length} /></Panel>
+        <Panel><Stat label="PROJECT CHECKS" value={checks.filter((c) => c.enabled).length} /></Panel>
+        <Panel><Stat label="TRACE COVERAGE" value={traceCoverage === null ? "—" : `${traceCoverage}%`} /></Panel>
       </div>
 
-      <div className="tool-grid">
-        <Panel title="PROJECTS" index="01" scroll>
+      <div className="tool-grid workshop-grid">
+        <Panel title="PROJECTS" index="01" scroll className="workshop-projects-panel">
           <ul className="tool-list">
             {projects.map((p) => (
-              <li key={p.id} className="tool-row" onClick={() => open(p)} style={{ cursor: "pointer" }}>
-                <div className="tool-row-head">
-                  <span className="tool-name">{selected?.id === p.id ? "▸ " : ""}{p.name}</span>
-                  <span className="tag-lo">{p.mode.toUpperCase()} · {p.phase.toUpperCase()}</span>
-                </div>
-                {p.repoRef && <p className="tool-desc">{p.repoRef}</p>}
+              <li key={p.id}>
+                <button
+                  className={`workshop-project-button ${selected?.id === p.id ? "sel" : ""}`}
+                  aria-pressed={selected?.id === p.id}
+                  onClick={() => void open(p)}
+                >
+                  <span className="tool-row-head">
+                    <span className="tool-name">{selected?.id === p.id ? "▸ " : ""}{p.name}</span>
+                    <span className="tag-lo">{p.mode.toUpperCase()} · {p.phase.toUpperCase()}</span>
+                  </span>
+                  {p.repoRef && <span className="tool-desc">{p.repoRef}</span>}
+                </button>
               </li>
             ))}
             {projects.length === 0 && (
@@ -1051,20 +1398,23 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
             )}
           </ul>
           {props.canBuild && (
-            <div className="pad" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <input className="text-input" placeholder="Project name" value={name} onChange={(e) => setName(e.target.value)} />
-              <input className="text-input" placeholder="Repo ref (optional until the workbench lands)" value={repoRef} onChange={(e) => setRepoRef(e.target.value)} />
+            <div className="inspector-grid workshop-compose">
+              <label className="ins-field"><span>Project name</span>
+                <input value={name} onChange={(e) => setName(e.target.value)} />
+              </label>
+              <label className="ins-field"><span>Repository reference</span>
+                <input placeholder="optional until workbench attach" value={repoRef} onChange={(e) => setRepoRef(e.target.value)} />
+              </label>
               <label className="tag-lo" style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <input type="checkbox" checked={gated} onChange={(e) => setGated(e.target.checked)} />
                 GATED MODE (autonomous between verify gates — requires enabled checks to run)
               </label>
-              <button className="chip" disabled={!name.trim()} onClick={create}>CREATE PROJECT</button>
-              {notice && <p className="dim">{notice}</p>}
+              <button className="chip" disabled={!name.trim()} onClick={() => void create()}>CREATE PROJECT</button>
             </div>
           )}
         </Panel>
 
-        <Panel title={selected ? `DOSSIER · ${selected.name.toUpperCase()}` : "DOSSIER"} index="02" scroll>
+        <Panel title={selected ? `DOSSIER · ${selected.name.toUpperCase()}` : "DOSSIER"} index="02" scroll className="workshop-dossier-panel">
           {!selected && <p className="dim pad">Select a project to inspect its phases, todos, and artifacts.</p>}
           {selected && (
             <div className="pad" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -1075,6 +1425,14 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
                   </span>
                 ))}
               </div>
+              <div className="workshop-next-card" aria-live="polite">
+                <span className="tag-lo">ADVISORY READINESS · NEXT MOVE</span>
+                <strong>{nextMove}</strong>
+                <span className="dim">Guidance only; deterministic verify checks remain the execution gates.</span>
+              </div>
+              {loading && <p className="dim">Refreshing artifacts, checks, coverage, and trace links…</p>}
+              {loadFailures.includes("artifacts") && <p className="dim warn-text">Artifacts are unavailable; lists and authoring are paused.</p>}
+              {loadFailures.includes("spec coverage") && <p className="dim warn-text">Spec coverage is unavailable; readiness is unknown.</p>}
               {coverage && coverage.required.length > 0 && (
                 <div>
                   <span className="tag-lo">
@@ -1120,56 +1478,375 @@ export function WorkshopView(props: { canBuild: boolean; isAdmin: boolean }) {
               ))}
               <span className="tag-lo">KNOWLEDGE ARTIFACTS</span>
               <ul className="tool-list">
-                {knowledge.map((a) => (
-                  <li key={a.id} className="tool-row" onClick={() => setReading(a)} style={{ cursor: "pointer" }}>
-                    <div className="tool-row-head">
-                      <span className="tool-name">{a.title}</span>
-                      <span className="tag-lo">
-                        {a.kind.toUpperCase()} v{a.version}
-                        {a.status ? ` · ${a.status.toUpperCase()}` : ""}
+                {knowledgeHistory.map((a) => (
+                  <li key={a.id} className="workshop-artifact-row">
+                    <button className="workshop-artifact-button" onClick={() => setReading(a)}>
+                      <span className="tool-row-head">
+                        <span className="tool-name">{a.title}</span>
+                        <span className="tag-lo">
+                          {a.kind.toUpperCase()} v{a.version}
+                          {a.status ? ` · ${a.status.toUpperCase()}` : ""}
+                          {currentArtifactIds.has(a.id) ? " · CURRENT" : " · HISTORY"}
+                        </span>
                       </span>
-                    </div>
+                    </button>
+                    {props.canBuild && currentArtifactIds.has(a.id) && (a.kind === "spec" || a.kind === "plan") && (
+                      <button
+                        className="chip tiny workshop-revise-button"
+                        aria-label={`Create a new version of ${a.title}`}
+                        onClick={() => {
+                          setRevisionBase(a);
+                          setArtifactKind(a.kind);
+                          setArtifactTitle(a.title);
+                          setArtifactBody("");
+                          setReading(a);
+                        }}
+                      >
+                        REVISE
+                      </button>
+                    )}
                   </li>
                 ))}
-                {knowledge.length === 0 && <li className="dim pad">No spec/plan/learnings/ADR artifacts yet.</li>}
+                {knowledgeHistory.length === 0 && <li className="dim pad">No spec/plan/learnings/ADR artifacts yet.</li>}
               </ul>
               {reading && (
                 <pre className="appr-evidence" style={{ maxHeight: 260, overflowY: "auto" }}>
                   {`${reading.kind.toUpperCase()} · ${reading.title} (v${reading.version})\n\n${reading.body || "(empty)"}`}
                 </pre>
               )}
+              {props.canBuild && artifactsAvailable && (
+                <div className="inspector-grid workshop-compose">
+                  <div>
+                    <span className="tag-lo">{revisionBase ? `NEW VERSION · ${revisionBase.title} v${revisionBase.version + 1}` : "ADD ARTIFACT"}</span>
+                    <p className="dim">
+                      {revisionBase
+                        ? "The artifact identity is locked. Its existing trace links remain historical and must be re-confirmed for this version."
+                        : "Use REVISE on a current spec or plan to create a bound next version."}
+                    </p>
+                  </div>
+                  <div className="ins-row">
+                    <label className="ins-field"><span>Kind</span>
+                      <select
+                        value={draftArtifactKind}
+                        disabled={revisionBase !== null}
+                        onChange={(e) => {
+                          const kind = e.target.value as ProjectArtifact["kind"];
+                          setArtifactKind(kind);
+                          setArtifactStatus(kind === "adr" ? "proposed" : "backlog");
+                        }}
+                      >
+                        {!latestSpec && <option value="spec">spec (initial)</option>}
+                        {!latestPlan && <option value="plan">plan (initial)</option>}
+                        <option value="todo">todo</option>
+                        <option value="learning">learning</option>
+                        <option value="adr">ADR</option>
+                      </select>
+                    </label>
+                    {(draftArtifactKind === "todo" || draftArtifactKind === "adr") && (
+                      <label className="ins-field"><span>Status</span>
+                        <select value={artifactStatus} onChange={(e) => setArtifactStatus(e.target.value)}>
+                          {draftArtifactKind === "todo" ? (
+                            <><option value="backlog">backlog</option><option value="active">active</option></>
+                          ) : (
+                            <><option value="proposed">proposed</option><option value="accepted">accepted</option></>
+                          )}
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                  <label className="ins-field"><span>Title</span>
+                    <input
+                      value={draftArtifactTitle}
+                      readOnly={revisionBase !== null}
+                      onChange={(e) => setArtifactTitle(e.target.value)}
+                    />
+                  </label>
+                  <label className="ins-field"><span>Body / evidence</span>
+                    <textarea rows={6} value={artifactBody} onChange={(e) => setArtifactBody(e.target.value)} />
+                  </label>
+                  <button
+                    className="chip"
+                    disabled={writingArtifact || !draftArtifactTitle.trim() || !artifactBody.trim()}
+                    onClick={() => void writeArtifact()}
+                  >
+                    {writingArtifact ? "RECORDING…" : revisionBase ? "RECORD NEW VERSION" : "RECORD ARTIFACT"}
+                  </button>
+                  {revisionBase && (
+                    <button
+                      className="chip"
+                      onClick={() => {
+                        setRevisionBase(null);
+                        setArtifactTitle("");
+                        setArtifactBody("");
+                      }}
+                    >
+                      CANCEL REVISION
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </Panel>
 
-        <Panel title="VERIFY CHECKS" index="03" scroll>
+        <Panel title="VERIFY CHECKS" index="03" scroll className="workshop-checks-panel">
           {!selected && <p className="dim pad">Checks are earned policies, per project — off by default.</p>}
           {selected && (
-            <ul className="tool-list">
-              {checks.map((c) => (
-                <li key={c.id} className="tool-row">
-                  <div className="tool-row-head">
-                    <span className="tool-name">{c.name}</span>
-                    <span className="tag-lo">
-                      {c.enabled ? "ENABLED" : "DISABLED"}
-                      {c.baseline !== null ? ` · BASELINE ${c.baseline}` : ""}
+            <>
+              {loadFailures.includes("checks") && <p className="dim pad warn-text">Checks are unavailable; configuration is paused.</p>}
+              <ul className="tool-list">
+                {checks.map((c) => (
+                  <li key={c.id} className="tool-row">
+                    <div className="tool-row-head">
+                      <span className="tool-name">{c.name}</span>
+                      <span className="tag-lo">
+                        {c.enabled ? "ENABLED" : "DISABLED"}
+                        {c.baseline !== null ? ` · BASELINE ${c.baseline}` : ""}
+                      </span>
+                    </div>
+                    {c.command && <p className="tool-desc">command: {c.command}</p>}
+                    {checkConfigurationIssue(c.name, c.command) && (
+                      <p className="tool-desc warn-text">configuration: {checkConfigurationIssue(c.name, c.command)}</p>
+                    )}
+                    {c.earnedNote && <p className="tool-desc">earned: {c.earnedNote}</p>}
+                    {props.isAdmin && c.enabled && (
+                      <p className="tool-desc">
+                        <button className="chip tiny" onClick={() => void toggleCheck(c)}>DISABLE</button>
+                      </p>
+                    )}
+                    {props.isAdmin && !c.enabled && earningCheckId !== c.id && (
+                      <p className="tool-desc">
+                        <button
+                          className="chip tiny"
+                          onClick={() => {
+                            setEarningCheckId(c.id);
+                            setEarningNote(c.earnedNote);
+                            setEarningCommand(c.command ?? "");
+                          }}
+                        >
+                          ENABLE (EARN)
+                        </button>
+                      </p>
+                    )}
+                    {props.isAdmin && !c.enabled && earningCheckId === c.id && (
+                      <div className="workshop-earn-check">
+                        <label className="ins-field"><span>Failure that earned this policy</span>
+                          <input value={earningNote} onChange={(e) => setEarningNote(e.target.value)} />
+                        </label>
+                        <label className="ins-field"><span>Command / configuration</span>
+                          <input value={earningCommand} onChange={(e) => setEarningCommand(e.target.value)} />
+                        </label>
+                        {checkConfigurationIssue(c.name, earningCommand) && (
+                          <p className="dim warn-text">{checkConfigurationIssue(c.name, earningCommand)}</p>
+                        )}
+                        <div className="ins-row">
+                          <button
+                            className="chip tiny"
+                            disabled={!earningNote.trim() || Boolean(checkConfigurationIssue(c.name, earningCommand))}
+                            onClick={() => void toggleCheck(c, earningNote, earningCommand).then((updated) => {
+                              if (updated) {
+                                setEarningCheckId(null);
+                                setEarningNote("");
+                                setEarningCommand("");
+                              }
+                            })}
+                          >
+                            CONFIRM ENABLE
+                          </button>
+                          <button
+                            className="chip tiny"
+                            onClick={() => {
+                              setEarningCheckId(null);
+                              setEarningCommand("");
+                            }}
+                          >
+                            CANCEL
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </li>
+                ))}
+                {checks.length === 0 && <li className="dim pad">No checks configured. Gated mode refuses to run without one.</li>}
+              </ul>
+              {props.isAdmin && checksAvailable && (
+                <div className="inspector-grid workshop-compose">
+                  <span className="tag-lo">ADD DISABLED CHECK</span>
+                  <label className="ins-field"><span>Check</span>
+                    <select
+                      value={checkName}
+                      onChange={(e) => {
+                        setCheckName(e.target.value);
+                        setCheckCommand("");
+                      }}
+                    >
+                      <option value="test">test</option>
+                      <option value="arch">arch</option>
+                      <option value="refactor-gate">refactor-gate</option>
+                      <option value="todo-sync">todo-sync</option>
+                      <option value="spec-sections">spec-sections</option>
+                      <option value="load">load</option>
+                      <option value="custom">custom</option>
+                    </select>
+                  </label>
+                  <label className="ins-field"><span>Command / configuration</span>
+                    <input
+                      value={checkCommand}
+                      placeholder={checkName === "load" ? '{"slos":[{"name":"p95_ms","max":200}],"run":"k6 run load.js"}' : "e.g. pnpm test"}
+                      onChange={(e) => setCheckCommand(e.target.value)}
+                    />
+                  </label>
+                  <p className={`dim ${draftCheckIssue ? "warn-text" : ""}`}>
+                    {draftCheckHelp}
+                  </p>
+                  <button className="chip" disabled={creatingCheck || Boolean(draftCheckIssue)} onClick={() => void createCheck()}>
+                    {creatingCheck ? "ADDING…" : "ADD CHECK"}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </Panel>
+
+        <Panel title="DECISION GRAPH · TRACEABILITY" index="04" scroll className="workshop-trace-panel">
+          {!selected && <p className="dim pad">Select a project to see how discovery, decisions, delivery, and verification connect.</p>}
+          {selected && (
+            <div className="workshop-trace pad">
+              <div className="workshop-trace-summary">
+                <div><span className="tag-lo">TRACE COVERAGE</span><strong>{traceCoverage === null ? "—" : `${traceCoverage}%`}</strong></div>
+                <div><span className="tag-lo">CURRENT / TOTAL LINKS</span><strong>{traceDataAvailable ? `${currentTraceLinks.length}/${traceLinks.length}` : "—"}</strong></div>
+                <div><span className="tag-lo">ORPHAN WARNINGS</span><strong className={traceDataAvailable && orphanCount > 0 ? "warn-text" : "ok-text"}>{traceDataAvailable ? orphanCount : "—"}</strong></div>
+              </div>
+              <div className="workshop-next-card">
+                <span className="tag-lo">NEXT MOVE</span>
+                <strong>{nextMove}</strong>
+                <span className="dim">Readiness is advisory and human-reviewable; it does not replace the project’s earned verify gates.</span>
+              </div>
+              <ul className="workshop-readiness-list" aria-label="Advisory delivery readiness">
+                {readiness.map((item) => (
+                  <li key={item.label}>
+                    <span className={item.ready === null ? "cov-mark" : item.ready ? "cov-mark cov-ok" : "cov-mark cov-missing"}>
+                      {item.ready === null ? "?" : item.ready ? "✓" : "○"}
                     </span>
+                    <span>{item.label}</span>
+                    <span className="tag-lo">{item.ready === null ? "UNKNOWN" : item.ready ? "READY" : "OPEN"}</span>
+                  </li>
+                ))}
+              </ul>
+
+              <div>
+                <span className="tag-lo">ORPHAN WATCH</span>
+                <ul className="workshop-warning-list">
+                  {!traceDataAvailable && <li>Trace links are unavailable; retry before treating any orphan count as evidence.</li>}
+                  {traceDataAvailable && !planHasUpstream && latestPlan && <li>Current plan is not linked back to the current spec.</li>}
+                  {traceDataAvailable && orphanTodos.map((todo) => <li key={todo.id}>TODO · {todo.title} has no upstream spec/plan context.</li>)}
+                  {traceDataAvailable && unlinkedChecks.map((check) => <li key={check.id}>CHECK · {check.name} is enabled but not linked to what it verifies.</li>)}
+                  {traceDataAvailable && unrunnableChecks.map((check) => (
+                    <li key={`config-${check.id}`}>CHECK · {check.name} cannot run: {checkConfigurationIssue(check.name, check.command)}.</li>
+                  ))}
+                  {traceDataAvailable && orphanCount === 0 && traceSubjects.length > 0 && <li className="ok-text">No delivery or verification orphans detected.</li>}
+                  {traceDataAvailable && traceSubjects.length === 0 && <li>Record a spec, plan, todo, or enabled check to start the decision graph.</li>}
+                </ul>
+              </div>
+
+              <div>
+                <span className="tag-lo">CONFIRMED REASONING CHAIN</span>
+                <ul className="workshop-link-list">
+                  {traceLinks.map((link) => {
+                    const isCurrent = currentTraceLinks.some((candidate) => candidate.id === link.id);
+                    const sourceLabel = refLabel(link.sourceType, link.sourceId);
+                    const targetLabel = refLabel(link.targetType, link.targetId);
+                    return (
+                      <li key={link.id} className={isCurrent ? "" : "historical"}>
+                        <div className="workshop-link-path">
+                          <span>{sourceLabel}</span>
+                          <b>{link.relation.toUpperCase()} →</b>
+                          <span>{targetLabel}</span>
+                        </div>
+                        <span className="tag-lo">{isCurrent ? "CURRENT" : "HISTORICAL · EXCLUDED FROM READINESS"}</span>
+                        <p>{link.rationale}</p>
+                        {props.canBuild && confirmDeleteLinkId !== link.id && (
+                          <button
+                            className="chip tiny"
+                            aria-label={`Remove trace link from ${sourceLabel} to ${targetLabel}`}
+                            onClick={() => setConfirmDeleteLinkId(link.id)}
+                          >
+                            REMOVE LINK
+                          </button>
+                        )}
+                        {props.canBuild && confirmDeleteLinkId === link.id && (
+                          <div className="workshop-confirm-remove" role="group" aria-label={`Confirm removal of trace link from ${sourceLabel} to ${targetLabel}`}>
+                            <span className="warn-text">This removes rationale-bearing history.</span>
+                            <button className="chip tiny" onClick={() => void deleteTraceLink(link.id)}>CONFIRM REMOVE</button>
+                            <button className="chip tiny" onClick={() => setConfirmDeleteLinkId(null)}>CANCEL</button>
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                  {traceDataAvailable && traceLinks.length === 0 && <li className="dim">No confirmed links yet. Flat artifacts lose the reasoning that produced them.</li>}
+                  {!traceDataAvailable && <li className="dim">Confirmed links could not be loaded.</li>}
+                </ul>
+              </div>
+
+              {props.canBuild && traceDataAvailable && (
+                <div className="inspector-grid workshop-compose workshop-trace-compose">
+                  <div>
+                    <span className="tag-lo">CONFIRM A TRACE LINK</span>
+                    <p className="dim">Link current artifacts and checks. A rationale is required so the edge remains reviewable.</p>
                   </div>
-                  {c.earnedNote && <p className="tool-desc">earned: {c.earnedNote}</p>}
-                  {props.isAdmin && (
-                    <p className="tool-desc">
-                      <button className="chip tiny" onClick={() => toggleCheck(c)}>
-                        {c.enabled ? "DISABLE" : "ENABLE (EARN)"}
-                      </button>
-                    </p>
-                  )}
-                </li>
-              ))}
-              {checks.length === 0 && <li className="dim pad">No checks configured. Gated mode refuses to run without one.</li>}
-            </ul>
+                  <div className="ins-row">
+                    <label className="ins-field"><span>Source</span>
+                      <select value={traceSource} onChange={(e) => setTraceSource(e.target.value)}>
+                        <option value="">— select artifact or check —</option>
+                        {traceSourceOptions.map((option) => <option key={`source-${option.value}`} value={option.value}>{option.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="ins-field"><span>Relationship</span>
+                      <select
+                        value={traceRelation}
+                        onChange={(e) => {
+                          setTraceRelation(e.target.value as TraceRelation);
+                          setTraceSource("");
+                          setTraceTarget("");
+                        }}
+                      >
+                        <option value="informs">informs</option>
+                        <option value="derives">derives</option>
+                        <option value="verifies">verifies</option>
+                        <option value="mitigates">mitigates</option>
+                      </select>
+                    </label>
+                    <label className="ins-field"><span>Target</span>
+                      <select value={traceTarget} onChange={(e) => setTraceTarget(e.target.value)}>
+                        <option value="">— select artifact or check —</option>
+                        {traceTargetOptions.map((option) => <option key={`target-${option.value}`} value={option.value}>{option.label}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <label className="ins-field"><span>Rationale / evidence for this link</span>
+                    <input value={traceRationale} onChange={(e) => setTraceRationale(e.target.value)} />
+                  </label>
+                  <button
+                    className="chip"
+                    disabled={
+                      writingTrace ||
+                      !traceSource ||
+                      !traceTarget ||
+                      traceSource === traceTarget ||
+                      !traceRationale.trim()
+                    }
+                    onClick={() => void createTraceLink()}
+                  >
+                    {writingTrace ? "CONFIRMING…" : "CONFIRM LINK"}
+                  </button>
+                </div>
+              )}
+            </div>
           )}
         </Panel>
       </div>
+      {notice && <p className="workshop-notice" role="status">{notice}</p>}
     </div>
   );
 }

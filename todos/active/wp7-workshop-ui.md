@@ -22,6 +22,15 @@
       spec artifact (REST-path KB mirror confirmed) → check created disabled →
       enable-with-note → gated lint fires both rules
 
+- [x] Research-led **Decision Graph / traceability** increment (2026-07-10):
+      durable rationale-bearing artifact/check links, trace-coverage and orphan
+      warnings over current artifact versions, advisory next-move/readiness panel,
+      in-dossier artifact authoring, admin check creation, accessible project/artifact
+      buttons, race-safe project loads, and visible partial-load errors. The graph
+      deliberately does not auto-inherit links across spec/plan revisions. Research
+      synthesis and deferred discovery-node scope live in
+      `docs/WORKSHOP-DECISION-GRAPH.md`.
+
 ## Remaining
 
 - [x] Canvas verify-node skin + config inspector: `verify` added to the frontend

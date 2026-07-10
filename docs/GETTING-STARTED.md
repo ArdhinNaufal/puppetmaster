@@ -244,6 +244,12 @@ The dossier shows a **spec-coverage meter** that insists your spec actually fill
 required section (in the screenshot it's flagging the missing ones — this is the "no
 architecture theater" rule made mechanical), a **todo board**, and the artifact reader.
 
+The **Decision Graph** below the dossier preserves why those artifacts exist. Link a spec to
+its plan, a plan to the todos derived from it, and a todo to the check that verifies it; each
+link requires a human-readable rationale. Trace coverage, orphan warnings, and the suggested
+next move are advisory signals. They help find lost context after hand-offs or revisions but
+never replace the deterministic gates.
+
 **Verify checks** are the gates. They run a named check and return *evidence*, never a bare
 "pass": `test`, `arch`, `refactor-gate` (blocks quietly editing test expectations during a
 refactor), `todo-sync`, `spec-sections`, `load` (refuses to run without declared

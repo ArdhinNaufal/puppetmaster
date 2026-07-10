@@ -56,6 +56,7 @@ import {
   type KbDeps,
   type MissionDispatcher,
 } from "@puppetmaster/kernel";
+import { sql } from "drizzle-orm";
 import { hashPassword } from "./auth.js";
 import { createAuditSink } from "./audit.js";
 import { BUILTIN_TEMPLATES } from "./seeds.js";
@@ -329,10 +330,35 @@ const WORKFLOWS: { name: string; graph: unknown }[] = [
   },
 ];
 
+async function clearPublicTables(db: Db): Promise<void> {
+  await db.execute(sql.raw(`
+    DO $$
+    DECLARE stmt text;
+    BEGIN
+      SELECT
+        CASE
+          WHEN COUNT(*) = 0 THEN NULL
+          ELSE 'TRUNCATE TABLE ' ||
+            string_agg(format('%I.%I', schemaname, tablename), ', ') ||
+            ' RESTART IDENTITY CASCADE'
+        END
+      INTO stmt
+      FROM pg_tables
+      WHERE schemaname = 'public';
+
+      IF stmt IS NOT NULL THEN
+        EXECUTE stmt;
+      END IF;
+    END $$;
+  `));
+}
+
 async function main(): Promise<void> {
   const handle = await createDb();
   await migrate(handle);
   const db: Db = handle.db;
+
+  await clearPublicTables(db);
 
   const workspaceId = await ensureDefaultWorkspace(db);
   await updateWorkspace(db, workspaceId, {

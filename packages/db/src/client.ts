@@ -363,6 +363,20 @@ const DDL: string[] = [
      earned_note text NOT NULL DEFAULT '',
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `CREATE TABLE IF NOT EXISTS project_trace_links (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     source_type text NOT NULL CHECK (source_type IN ('artifact', 'check')),
+     source_id uuid NOT NULL,
+     target_type text NOT NULL CHECK (target_type IN ('artifact', 'check')),
+     target_id uuid NOT NULL,
+     relation text NOT NULL CHECK (relation IN ('informs', 'derives', 'verifies', 'mitigates')),
+     rationale text NOT NULL CHECK (length(trim(rationale)) > 0),
+     created_at timestamptz NOT NULL DEFAULT now(),
+     CHECK (source_type <> target_type OR source_id <> target_id),
+     CHECK (relation <> 'derives' OR (source_type = 'artifact' AND target_type = 'artifact')),
+     CHECK (relation <> 'verifies' OR (source_type = 'artifact' AND target_type = 'check'))
+   )`,
   `CREATE TABLE IF NOT EXISTS evidence (
      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
      step_id uuid REFERENCES mission_steps(id) ON DELETE CASCADE,
@@ -376,6 +390,9 @@ const DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS projects_workspace_idx ON projects(workspace_id)`,
   `CREATE INDEX IF NOT EXISTS project_artifacts_project_idx ON project_artifacts(project_id, kind, status)`,
   `CREATE INDEX IF NOT EXISTS verify_checks_project_idx ON verify_checks(project_id)`,
+  `CREATE INDEX IF NOT EXISTS project_trace_links_project_idx ON project_trace_links(project_id, created_at)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS project_trace_links_unique_idx
+     ON project_trace_links(project_id, source_type, source_id, target_type, target_id, relation)`,
 ];
 
 export async function migrate(handle: DbHandle): Promise<void> {

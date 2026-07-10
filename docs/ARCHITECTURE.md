@@ -254,11 +254,19 @@ shipped; the full phase orchestration (EXECUTE via a headless CLI) is in progres
 - **Knowledge mirror** (ADR-004): accepted `spec`/`learning` artifacts mirror into the KB on
   write (one live document per project+kind+title, replaced each version) so `kb.search` and
   citations work over them; a mirror failure never loses the artifact write.
+- **Decision graph** (research-led WP7 increment): `project_trace_links` preserves a
+  directional, rationale-bearing reasoning edge (`informs`|`derives`|`verifies`|`mitigates`)
+  between durable project artifacts and checks. Both endpoints are revalidated against the
+  project in the repo layer; cross-project/self/duplicate links fail closed and every change
+  is audited. Readiness/orphan signals use current artifact versions only, so a revision must
+  be re-confirmed rather than silently inheriting stale trust. See
+  `docs/WORKSHOP-DECISION-GRAPH.md`.
 - **UI**: the WORKSHOP view (project list, dossier with phase strip + todo board + artifact
   reader + the **forcing-section coverage meter** reading the same required list the
-  spec-sections gate uses, + the earned-policy check panel); the Canvas `verify` node skin and
-  its structured config inspector (check picker, retries-before-escalate); the approval inbox's
-  evidence panel.
+  spec-sections gate uses, + artifact/check authoring, the earned-policy check panel, and the
+  advisory Decision Graph with trace coverage, orphan warnings, and next-move guidance); the
+  Canvas `verify` node skin and its structured config inspector (check picker,
+  retries-before-escalate); the approval inbox's evidence panel.
 
 ## 4. Data model (core tables)
 
@@ -266,7 +274,7 @@ shipped; the full phase orchestration (EXECUTE via a headless CLI) is in progres
 `workflow_versions`, `missions`, `mission_steps`, `approvals`, `tools(mcp_servers)`,
 `tool_grants`, `credentials`, `templates`, `audit_log`, `ui_preferences(user layouts/themes)`,
 `branding(workspace)`. Workshop (§3.11): `projects`, `project_artifacts`, `verify_checks`,
-`evidence`.
+`project_trace_links`, `evidence`.
 
 ## 5. Frontend architecture
 
