@@ -1100,6 +1100,55 @@ input[type="color"] { background: #0d0d0f; border: 1px solid var(--stroke-hi); b
   color: var(--text-hi);
   font-size: 0.66rem;
 }
+.knowledge-upload-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--stroke);
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+}
+.knowledge-upload-status,
+.knowledge-upload-hint,
+.knowledge-upload-file {
+  margin: 0;
+  line-height: 1.45;
+}
+.knowledge-upload-status {
+  font-size: 0.66rem;
+  color: var(--text-lo);
+}
+.knowledge-upload-status.ok { color: var(--ok); }
+.knowledge-upload-status.error { color: var(--danger); }
+.knowledge-upload-status.progress { color: var(--accent); }
+.knowledge-upload-hint,
+.knowledge-upload-file {
+  font-size: 0.62rem;
+  color: var(--text-lo);
+}
+.knowledge-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.45rem;
+}
+.knowledge-progress-track {
+  height: 6px;
+  border: 1px solid var(--stroke);
+  background: var(--panel-hi);
+  overflow: hidden;
+}
+.knowledge-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 55%, white));
+  transition: width 120ms linear;
+}
+.knowledge-progress-text {
+  font-size: 0.58rem;
+  letter-spacing: 0.12em;
+  font-family: var(--font-data);
+  color: var(--text-lo);
+}
 .warn-text { color: var(--warn) !important; }
 .ok-text { color: var(--ok) !important; }
 

@@ -7,6 +7,7 @@ import {
   templateApi,
   type Agent,
   type Approval,
+  type KbDocument,
   type KbSearchHit,
   type Mission,
   type MissionStep,
@@ -64,6 +65,8 @@ export interface NX {
   isAdmin: boolean;
   agents: Agent[];
   workflows: Workflow[];
+  docs: KbDocument[];
+  toolServers: { server: string; tools: number }[];
   approvals: Approval[];
   signals: SignalEntry[];
   connected: boolean;
@@ -368,12 +371,8 @@ function SignalFeedBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
 
 function SnapshotBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
   const [tokens, setTokens] = useState<number | null>(null);
-  const [docs, setDocs] = useState<number | null>(null);
-  const [tools, setTools] = useState<number | null>(null);
   useEffect(() => {
     opsApi.usage().then((u) => setTokens(u.monthTokens)).catch(() => setTokens(null));
-    kbApi.list().then((d) => setDocs(d.length)).catch(() => setDocs(null));
-    api.tools().then((t) => setTools(t.length)).catch(() => setTools(null));
   }, []);
   const row = (k: string, v: string, tone?: string) => (
     <div className="nx-snap-row">
@@ -386,8 +385,8 @@ function SnapshotBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
       {row("LINK // BUS", nx.connected ? "ONLINE" : "DOWN", nx.connected ? "ok" : "err")}
       {row("AGENTS", String(nx.agents.length))}
       {row("WORKFLOWS", String(nx.workflows.length))}
-      {row("KNOWLEDGE DOCS", docs === null ? "—" : String(docs))}
-      {row("TOOLS IN CATALOG", tools === null ? "—" : String(tools))}
+      {row("KNOWLEDGE DOCS", String(nx.docs.length))}
+      {row("TOOLS IN CATALOG", String(nx.toolServers.reduce((sum, row) => sum + row.tools, 0)))}
       {row("AUTHORIZATIONS PENDING", String(nx.approvals.length), nx.approvals.length ? "warn" : undefined)}
       {row("RX THIS SESSION", String(nx.rxTotal))}
       {row("TOKENS THIS MONTH", tokens === null ? "—" : tokens.toLocaleString())}
@@ -461,7 +460,6 @@ function DiscoveryBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
   useEffect(() => setSel(0), [needle, scope, c.active]);
 
   const choose = (h: DiscoveryItem) => {
-    nx.closeTask("construct.discovery");
     if (h.kind === "task") {
       nx.openPane(h.id);
       return;

@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, kbApi, prefsApi, type Mission } from "../api.js";
+import { api, prefsApi, type Mission } from "../api.js";
 import {
   buildLayers,
   Construct,
   type ConstructApi,
   type ConstructData,
-  type ConstructDoc,
   type ConstructWorkflow,
 } from "./Construct.js";
 import { ROLE_RANK, TASKS, taskById, type DiscoveryItem, type NX } from "./registry.js";
@@ -51,8 +50,6 @@ export function Nexus(props: {
 
   // --- Construct data (page-owned fetches; bus signals drive refresh) --------
   const [missions, setMissions] = useState<Mission[]>([]);
-  const [docs, setDocs] = useState<ConstructDoc[]>([]);
-  const [toolServers, setToolServers] = useState<{ server: string; tools: number }[]>([]);
   const [wfNodes, setWfNodes] = useState<Record<string, number>>({});
   const missionEvents = useMemo(
     () => props.nx.signals.filter((s) => s.type.startsWith("mission")).length,
@@ -62,18 +59,6 @@ export function Nexus(props: {
   useEffect(() => {
     api.listMissions().then(setMissions).catch(() => {});
   }, [missionEvents]);
-
-  useEffect(() => {
-    kbApi
-      .list()
-      .then((d) => setDocs(d.map((x) => ({ id: x.id, title: x.title, chunkCount: x.chunkCount, createdAt: x.createdAt }))))
-      .catch(() => {});
-    api.tools().then((t) => {
-      const by = new Map<string, number>();
-      for (const row of t as { server: string }[]) by.set(row.server, (by.get(row.server) ?? 0) + 1);
-      setToolServers([...by.entries()].map(([server, tools]) => ({ server, tools })));
-    }).catch(() => {});
-  }, []);
 
   // True graph node counts for the lattice (bounded, once per workflow set).
   useEffect(() => {
@@ -112,15 +97,15 @@ export function Nexus(props: {
     () => ({
       agents: props.nx.agents,
       workflows: constructWorkflows,
-      docs,
-      toolServers,
+      docs: props.nx.docs,
+      toolServers: props.nx.toolServers,
       missions,
       approvals: props.nx.approvals,
       signals: props.nx.signals,
       connected: props.nx.connected,
       rxTotal: props.nx.rxTotal,
     }),
-    [props.nx.agents, constructWorkflows, docs, toolServers, missions, props.nx.approvals, props.nx.signals, props.nx.connected, props.nx.rxTotal],
+    [props.nx.agents, constructWorkflows, props.nx.docs, props.nx.toolServers, missions, props.nx.approvals, props.nx.signals, props.nx.connected, props.nx.rxTotal],
   );
 
   // --- strata: the Construct stacked by creation year -------------------------

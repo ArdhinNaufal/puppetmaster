@@ -395,6 +395,11 @@ export interface KbDocument {
   createdAt: string;
 }
 
+export interface ToolRow {
+  server: string;
+  tool: string;
+}
+
 export interface KbSearchHit {
   chunkId: string;
   documentId: string;

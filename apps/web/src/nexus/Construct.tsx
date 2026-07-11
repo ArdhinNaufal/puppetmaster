@@ -9,7 +9,7 @@ import type { SignalEntry } from "../Signal.js";
  * continuously — hovering an orbit (or a DISCOVERY locate) halts the motion,
  * dwells, auto-opens the destination pane, then the rotation resumes. The
  * kernel is a wandering pixel wave at rest (it leans toward the cursor) and
- * an aggressive signal-line burst while missions run. Running missions cast
+ * an aggressive random pixel flicker while missions run. Running missions cast
  * dashed threads from the kernel circle to their bars; gated missions pulse
  * their bar scale instead. Wheel (or the +/− buttons) zooms the instrument —
  * zoomed in, the figure locks to the left half of the stage and the hovered
@@ -249,7 +249,7 @@ export function Construct(props: {
   /** Idle kernel wave direction (random walk; leans toward the cursor). */
   const waveDir = useRef(0);
   /** Hover-dwell auto-open bookkeeping. */
-  const dwell = useRef<{ firedKey: string | null; cooldownUntil: number }>({ firedKey: null, cooldownUntil: 0 });
+  const dwell = useRef<{ firedKey: string | null; cooldownUntil: number; lockedKey: string | null }>({ firedKey: null, cooldownUntil: 0, lockedKey: null });
   const [zoom, setZoom] = useState(1);
   const zoomRef = useRef(1);
   zoomRef.current = zoom;
@@ -756,26 +756,36 @@ export function Construct(props: {
     const kR = R * 0.15;
     const blink = motion && Math.sin(time * 2.1) > 0.55;
     if (running > 0 && motion) {
-      // WORKING: aggressive random signal lines — the kernel is transmitting
-      const rows = 5;
-      const amp = Math.min(3 + running * 1.6, 8) * (kR / 45);
-      for (let j = 0; j < rows; j++) {
-        const dy = ((j + 0.5) / rows - 0.5) * 2 * kR * 0.78;
-        const half = Math.sqrt(Math.max(kR * kR - dy * dy, 0)) * 0.92;
-        ctx.strokeStyle = gated && blink && j === 0 ? C.warn : C.accent;
-        ctx.globalAlpha = dim * (j === Math.floor(rows / 2) ? 0.95 : 0.55);
-        ctx.lineWidth = j === Math.floor(rows / 2) ? 1.4 : 1;
-        ctx.beginPath();
-        const tick = Math.floor(time * 9);
-        for (let x = -half; x <= half; x += 4) {
-          const spike = (((hash(`${j}:${Math.floor(x / 4)}:${tick}`) % 1000) / 1000) - 0.5) * 2;
-          const yy = dy + (Math.sin(x * 0.55 + time * 14 + j * 5) * 0.35 + spike * 0.65) * amp;
-          if (x === -half) ctx.moveTo(kcx + x, kcy + yy);
-          else ctx.lineTo(kcx + x, kcy + yy);
+      // WORKING: aggressive random pixel flicker � the kernel is emitting
+      // unstable light instead of holding a clean transmission shape.
+      const pulseSeed = Math.floor(time * 42);
+      const density = Math.min(0.45 + running * 0.08, 0.82);
+      const jitter = Math.min(2.2 + running * 0.55, 6.2) * (kR / 45);
+      const cursorPull = cursor.current.inside ? 0.65 : 0.2;
+      for (const px of pixels.current) {
+        const gate = (hash(`${pulseSeed}:${Math.round(px.dx)}:${Math.round(px.dy)}:${running}`) % 1000) / 1000;
+        if (gate > density) continue;
+        const twinkle = (hash(`${pulseSeed + 1}:${Math.round(px.dx * 2)}:${Math.round(px.dy * 2)}:${running}`) % 1000) / 1000;
+        const flare = (hash(`${pulseSeed + 2}:${Math.round(px.dy)}:${Math.round(px.dx)}:${running}`) % 1000) / 1000;
+        const size = 1.4 + twinkle * 2.4 + flare * 0.8;
+        const driftX = (flare - 0.5) * jitter * cursorPull;
+        const driftY = (twinkle - 0.5) * jitter * (0.55 + cursorPull * 0.2);
+        const x = kcx + px.dx + driftX;
+        const y = kcy + px.dy + driftY;
+        ctx.fillStyle = gated && flare > 0.72 ? C.warn : twinkle > 0.8 ? C.hi : C.accent;
+        ctx.globalAlpha = dim * (0.3 + twinkle * 0.9);
+        ctx.fillRect(x - size / 2, y - size / 2, size, size);
+        if (twinkle > 0.88) {
+          ctx.globalAlpha = dim * 0.75;
+          ctx.fillRect(x - 0.7, y - 0.7, 1.4, 1.4);
         }
-        ctx.stroke();
       }
-      ctx.lineWidth = 1;
+      if (cursor.current.inside) {
+        const pull = Math.min(1, Math.hypot(cursor.current.x - kcx, cursor.current.y - kcy) / kR);
+        ctx.fillStyle = gated && blink ? C.warn : C.hi;
+        ctx.globalAlpha = dim * (0.18 + (1 - pull) * 0.28);
+        ctx.fillRect(kcx - 1, kcy - 1, 2, 2);
+      }
     } else {
       // IDLE: constant pixel wave with a wandering direction that leans
       // toward the operator's cursor
@@ -911,6 +921,8 @@ export function Construct(props: {
           else requestAnimationFrame(() => requestPaintRef.current());
         } else if (reducedRef.current) {
           setFocus(n, false);
+          dwell.current.lockedKey = `${n.kind}:${n.id}`;
+          dwell.current.firedKey = dwell.current.lockedKey;
           locate.current = null;
           activate(n); // pointed out → open the destination
         } else {
@@ -979,6 +991,8 @@ export function Construct(props: {
           if (p >= 1) {
             setFocus(n, false);
             locate.current = null;
+            dwell.current.lockedKey = `${n.kind}:${n.id}`;
+            dwell.current.firedKey = dwell.current.lockedKey;
             pulses.current.push({ t0: now, tone: n.gated ? "warn" : "accent", alarm: false });
             activate(n); // pointed out → auto-open the destination pane
           }
@@ -1180,7 +1194,7 @@ export function Construct(props: {
       // --- hover dwell: the pointed-at bar opens its own pane -----------------
       if (f && !f.keyboard && f.node.kind !== "kernel" && f.node.kind !== "layer" && !busy) {
         const key = `${f.node.kind}:${f.node.id}`;
-        if (key !== dwell.current.firedKey) {
+        if (dwell.current.lockedKey !== key && key !== dwell.current.firedKey) {
           const start = Math.max(f.since, dwell.current.cooldownUntil);
           if (now - start > DWELL_MS) {
             dwell.current.firedKey = key;
@@ -1251,6 +1265,7 @@ export function Construct(props: {
         onPointerMove={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           cursor.current = { x: e.clientX - rect.left, y: e.clientY - rect.top, inside: true };
+          dwell.current.lockedKey = null;
           setFocus(findNode(cursor.current.x, cursor.current.y), false);
           if (props.reducedMotion) requestPaint();
         }}
@@ -1340,3 +1355,4 @@ export function Construct(props: {
     </div>
   );
 }
+

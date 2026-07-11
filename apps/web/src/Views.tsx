@@ -39,6 +39,7 @@ import {
   type Workflow,
   type Workspace,
 } from "./api.js";
+import { pdfToText, type PdfTextFormat } from "./pdf.js";
 
 /* ---------------------------------------------------------------- Missions */
 
@@ -144,20 +145,27 @@ export function MissionsView(props: {
 
 /* ------------------------------------------------------------------ Agents */
 
-export function AgentsView(props: { onOpenChat: (agentId: string) => void; readOnly?: boolean }) {
-  const [agents, setAgents] = useState<Agent[]>([]);
+export function AgentsView(props: {
+  agents: Agent[];
+  onOpenChat: (agentId: string) => void;
+  onRemoved?: (agentId: string) => void;
+  onUpdated?: () => void;
+  readOnly?: boolean;
+}) {
   const [selected, setSelected] = useState<string | null>(null);
   const [memories, setMemories] = useState<AgentMemory[]>([]);
   const [memQuery, setMemQuery] = useState("");
   const [memHits, setMemHits] = useState<MemoryHit[] | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const refresh = () => agentApi.list().then(setAgents).catch(() => {});
-  useEffect(() => {
-    refresh();
-  }, []);
+  const agent = props.agents.find((a) => a.id === selected) ?? null;
 
-  const agent = agents.find((a) => a.id === selected) ?? null;
+  useEffect(() => {
+    if (selected && !props.agents.some((a) => a.id === selected)) {
+      setSelected(null);
+      setMemories([]);
+    }
+  }, [props.agents, selected]);
 
   useEffect(() => {
     setMemQuery("");
@@ -183,15 +191,30 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
       headers: { "content-type": "application/json" },
       body: JSON.stringify(p),
     });
-    await refresh();
+    props.onUpdated?.();
     setSaving(false);
+  };
+
+  const remove = async () => {
+    if (!agent || props.readOnly) return;
+    if (!confirm(`Delete agent "${agent.name}"?`)) return;
+    setSaving(true);
+    try {
+      await agentApi.remove(agent.id);
+      if (props.onRemoved) props.onRemoved(agent.id);
+      else props.onUpdated?.();
+      setSelected(null);
+      setMemories([]);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
     <div className="view-wrap cols">
       <Panel title="AGENT ROSTER" index="01" className="w-roster" scroll>
         <div className="agent-cards">
-          {agents.map((a) => (
+          {props.agents.map((a) => (
             <button key={a.id} className={`agent-card ${selected === a.id ? "sel" : ""}`} onClick={() => setSelected(a.id)}>
               <span className="agent-ring">◉</span>
               <span className="agent-card-name">{a.name}</span>
@@ -199,11 +222,16 @@ export function AgentsView(props: { onOpenChat: (agentId: string) => void; readO
               <TierBadge tier={a.autonomy} />
             </button>
           ))}
-          {agents.length === 0 && <p className="dim pad">No agents. Create one from the Command view.</p>}
+          {props.agents.length === 0 && <p className="dim pad">No agents. Create one from the Command view.</p>}
         </div>
       </Panel>
       <Panel title={agent ? `INSPECTOR · ${agent.name.toUpperCase()}` : "INSPECTOR"} index="02" className="grow" scroll
-        actions={agent ? <Chip tiny tone="accent" onClick={() => props.onOpenChat(agent.id)}>OPEN CHANNEL</Chip> : undefined}
+        actions={agent ? (
+          <>
+            <Chip tiny tone="accent" onClick={() => props.onOpenChat(agent.id)}>OPEN CHANNEL</Chip>
+            {!props.readOnly && <Chip tiny tone="danger" onClick={() => void remove()}>DELETE</Chip>}
+          </>
+        ) : undefined}
       >
         {!agent && <p className="dim pad">Select an agent to inspect its definition, scratchpad, and memory.</p>}
         {agent && props.readOnly && (
@@ -361,7 +389,7 @@ interface ToolInfo {
   tier: string;
 }
 
-export function ToolsView(props: { isAdmin?: boolean }) {
+export function ToolsView(props: { isAdmin?: boolean; onChanged?: () => void }) {
   const [toolsList, setToolsList] = useState<ToolInfo[]>([]);
   const [mcpRows, setMcpRows] = useState<McpServerRow[]>([]);
   const [regQuery, setRegQuery] = useState("");
@@ -382,6 +410,7 @@ export function ToolsView(props: { isAdmin?: boolean }) {
     const res = await mcpApi.add({ name: name.trim().replace(/[^\w-]+/g, "-").slice(0, 40), url: url.trim() }).catch((e) => ({ connected: false, error: String(e) }) as { connected: boolean; error?: string });
     setNotice(res.connected ? `connected (${(res as { toolCount?: number }).toolCount ?? 0} tools)` : `saved but not connected: ${res.error ?? "connect failed"}`);
     refresh();
+    props.onChanged?.();
   };
 
   const searchRegistry = async () => {
@@ -423,7 +452,7 @@ export function ToolsView(props: { isAdmin?: boolean }) {
                   </div>
                   <p className="tool-desc">
                     {r.url ?? r.command}{" "}
-                    <button className="chip tiny" onClick={() => mcpApi.remove(r.id).then(refresh)}>REMOVE</button>
+                    <button className="chip tiny" onClick={() => mcpApi.remove(r.id).then(() => { refresh(); props.onChanged?.(); })}>REMOVE</button>
                   </p>
                 </li>
               ))}
@@ -487,11 +516,11 @@ export function ToolsView(props: { isAdmin?: boolean }) {
 
 export function TemplatesView(props: {
   canBuild: boolean;
+  agents: Agent[];
+  workflows: Workflow[];
   onInstantiated: (kind: "workflow" | "agent", id: string) => void;
 }) {
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [wfs, setWfs] = useState<Workflow[]>([]);
-  const [ags, setAgs] = useState<Agent[]>([]);
   const [pubRef, setPubRef] = useState("");
   const [pubName, setPubName] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
@@ -499,10 +528,6 @@ export function TemplatesView(props: {
   const refresh = () => templateApi.list().then(setTemplates).catch(() => {});
   useEffect(() => {
     refresh();
-    if (props.canBuild) {
-      api.listWorkflows().then(setWfs).catch(() => {});
-      agentApi.list().then(setAgs).catch(() => {});
-    }
   }, [props.canBuild]);
 
   const flash = (m: string) => {
@@ -560,14 +585,14 @@ export function TemplatesView(props: {
               <span>Source workflow or agent</span>
               <select value={pubRef} onChange={(e) => setPubRef(e.target.value)}>
                 <option value="">— select —</option>
-                {wfs.length > 0 && (
+                {props.workflows.length > 0 && (
                   <optgroup label="Workflows">
-                    {wfs.map((w) => <option key={w.id} value={`workflow:${w.id}`}>{w.name}</option>)}
+                    {props.workflows.map((w) => <option key={w.id} value={`workflow:${w.id}`}>{w.name}</option>)}
                   </optgroup>
                 )}
-                {ags.length > 0 && (
+                {props.agents.length > 0 && (
                   <optgroup label="Agents">
-                    {ags.map((a) => <option key={a.id} value={`agent:${a.id}`}>{a.name}</option>)}
+                    {props.agents.map((a) => <option key={a.id} value={`agent:${a.id}`}>{a.name}</option>)}
                   </optgroup>
                 )}
               </select>
@@ -826,16 +851,89 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
 
 /* --------------------------------------------------------------- Knowledge */
 
-/** KNOWLEDGE view (Stage 3): upload md/txt documents, browse them, and
+/** KNOWLEDGE view (Stage 3): upload md/txt/PDF documents, browse them, and
  *  search-test the same hybrid retrieval the kb.search tool uses. */
-export function KnowledgeView(props: { canBuild: boolean }) {
+type KnowledgeUploadStatus =
+  | { kind: "idle"; message: string }
+  | { kind: "ok"; message: string }
+  | { kind: "error"; message: string }
+  | { kind: "progress"; message: string; progress: number };
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function validateKnowledgeFile(file: File): string | null {
+  if (!file.name.trim()) return "The selected file needs a filename.";
+  if (file.size <= 0) return "The selected file is empty.";
+  const name = file.name.toLowerCase();
+  const supportedByName = /\.(md|txt|markdown|pdf)$/i.test(name);
+  const supportedByMime = file.type === "application/pdf" || file.type === "text/plain" || file.type === "text/markdown";
+  if (!supportedByName && !supportedByMime) {
+    return "Unsupported file type. Use .md, .txt, .markdown, or .pdf.";
+  }
+  return null;
+}
+
+function readTextFile(file: File, onProgress?: (loaded: number, total: number) => void): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read this file."));
+    reader.onabort = () => reject(new Error("File read was cancelled."));
+    reader.onprogress = (event) => {
+      const total = event.total || file.size;
+      if (event.lengthComputable || total > 0) onProgress?.(event.loaded, total);
+    };
+    reader.onload = () => {
+      if (typeof reader.result === "string") resolve(reader.result);
+      else reject(new Error("Could not read this file."));
+    };
+    reader.readAsText(file);
+  });
+}
+
+function readArrayBufferFile(file: File, onProgress?: (loaded: number, total: number) => void): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read this file."));
+    reader.onabort = () => reject(new Error("File read was cancelled."));
+    reader.onprogress = (event) => {
+      const total = event.total || file.size;
+      if (event.lengthComputable || total > 0) onProgress?.(event.loaded, total);
+    };
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+      else reject(new Error("Could not read this file."));
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function progressPercent(loaded: number, total: number, start = 0, end = 100): number {
+  if (total <= 0) return end;
+  const pct = start + Math.round((loaded / total) * (end - start));
+  return Math.max(start, Math.min(end, pct));
+}
+
+export function KnowledgeView(props: { canBuild: boolean; onChanged?: () => void }) {
   const [docs, setDocs] = useState<KbDocument[]>([]);
   const [hits, setHits] = useState<KbSearchHit[]>([]);
   const [query, setQuery] = useState("");
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
+  const [source, setSource] = useState("");
+  const [mime, setMime] = useState("text/markdown");
+  const [pdfFormat, setPdfFormat] = useState<PdfTextFormat>("markdown");
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [fileStatus, setFileStatus] = useState<KnowledgeUploadStatus>({
+    kind: "idle",
+    message: "Accepted: .md, .txt, .markdown, or .pdf. PDFs are parsed locally before ingest.",
+  });
 
   const refresh = () => kbApi.list().then(setDocs).catch(() => {});
   useEffect(() => {
@@ -845,12 +943,27 @@ export function KnowledgeView(props: { canBuild: boolean }) {
   const upload = async () => {
     if (!title.trim() || !content.trim()) return;
     setBusy(true);
+    setNotice("");
     try {
-      const res = await kbApi.upload({ title: title.trim(), content });
+      const res = await kbApi.upload({
+        title: title.trim(),
+        content,
+        source: source || undefined,
+        mime,
+      });
       setNotice(`Ingested "${res.document.title}" — ${res.chunkCount} chunks, ${res.embedded} embedded.`);
       setTitle("");
       setContent("");
+      setSource("");
+      setMime("text/markdown");
+      setPdfFile(null);
+      setSelectedFile(null);
+      setFileStatus({
+        kind: "ok",
+        message: `Document "${res.document.title}" is saved and ready for search.`,
+      });
       refresh();
+      props.onChanged?.();
     } catch {
       setNotice("Upload failed.");
     } finally {
@@ -858,11 +971,116 @@ export function KnowledgeView(props: { canBuild: boolean }) {
     }
   };
 
-  const onFile = (file: File) => {
-    file.text().then((text) => {
+  const onFile = async (file: File) => {
+    setBusy(true);
+    setNotice("");
+    const validationError = validateKnowledgeFile(file);
+    if (validationError) {
+      setBusy(false);
+      setPdfFile(null);
+      setSelectedFile(null);
+      setContent("");
+      setSource("");
+      setFileStatus({ kind: "error", message: validationError });
+      return;
+    }
+
+    setSource(file.name);
+    setSelectedFile(file);
+    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+    setPdfFile(isPdf ? file : null);
+    try {
+      setFileStatus({
+        kind: "progress",
+        message: isPdf ? `Reading ${file.name}...` : `Reading ${file.name}...`,
+        progress: 0,
+      });
+      const text = isPdf
+        ? await (async () => {
+            const buffer = await readArrayBufferFile(file, (loaded, total) => {
+              setFileStatus({
+                kind: "progress",
+                message: `Reading ${file.name}...`,
+                progress: progressPercent(loaded, total, 0, 45),
+              });
+            });
+            setFileStatus({
+              kind: "progress",
+              message: `Parsing ${file.name} as ${pdfFormat}...`,
+              progress: 45,
+            });
+            return pdfToText(buffer, pdfFormat, (page, totalPages) => {
+              const parsed = totalPages > 0 ? page / totalPages : 1;
+              setFileStatus({
+                kind: "progress",
+                message: totalPages > 0
+                  ? `Parsing ${file.name} as ${pdfFormat}... (${page}/${totalPages} pages)`
+                  : `Parsing ${file.name} as ${pdfFormat}...`,
+                progress: 45 + Math.round(parsed * 55),
+              });
+            });
+          })()
+        : await readTextFile(file, (loaded, total) => {
+            setFileStatus({
+              kind: "progress",
+              message: `Reading ${file.name}...`,
+              progress: progressPercent(loaded, total, 0, 100),
+            });
+          });
       setContent(text);
-      if (!title.trim()) setTitle(file.name.replace(/\.(md|txt|markdown)$/i, ""));
-    });
+      setMime(isPdf ? (pdfFormat === "markdown" ? "text/markdown" : "text/plain") : (file.type || "text/plain"));
+      if (!title.trim()) setTitle(file.name.replace(/\.(md|txt|markdown|pdf)$/i, ""));
+      setFileStatus({
+        kind: "ok",
+        message: isPdf
+          ? `Parsed ${file.name} as ${pdfFormat}. Review the extracted text, then ingest it.`
+          : `Loaded ${file.name}. Review the content, then ingest it.`,
+      });
+    } catch (error) {
+      setContent("");
+      setPdfFile(null);
+      setFileStatus({
+        kind: "error",
+        message: error instanceof Error ? error.message : "Could not parse this file.",
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changePdfFormat = async (format: PdfTextFormat) => {
+    setPdfFormat(format);
+    if (!pdfFile) return;
+    setBusy(true);
+    try {
+      setFileStatus({
+        kind: "progress",
+        message: `Re-parsing ${pdfFile.name} as ${format}...`,
+        progress: 0,
+      });
+      setContent(await pdfToText(pdfFile, format, (page, totalPages) => {
+        const parsed = totalPages > 0 ? page / totalPages : 1;
+        setFileStatus({
+          kind: "progress",
+          message: totalPages > 0
+            ? `Re-parsing ${pdfFile.name} as ${format}... (${page}/${totalPages} pages)`
+            : `Re-parsing ${pdfFile.name} as ${format}...`,
+          progress: Math.round(parsed * 100),
+        });
+      }));
+      setMime(format === "markdown" ? "text/markdown" : "text/plain");
+      setFileStatus({
+        kind: "ok",
+        message: `Parsed ${pdfFile.name} as ${format}. Review the extracted text, then ingest it.`,
+      });
+    } catch (error) {
+      setFileStatus({
+        kind: "error",
+        message: error instanceof Error ? error.message : "Could not parse this PDF.",
+      });
+    } finally {
+      setBusy(false);
+    }
   };
 
   const search = () => {
@@ -919,7 +1137,7 @@ export function KnowledgeView(props: { canBuild: boolean }) {
                       {" "}
                       <button
                         className="chip tiny"
-                        onClick={() => kbApi.remove(d.id).then(refresh)}
+                        onClick={() => kbApi.remove(d.id).then(() => { refresh(); props.onChanged?.(); })}
                       >
                         DELETE
                       </button>
@@ -943,9 +1161,41 @@ export function KnowledgeView(props: { canBuild: boolean }) {
               />
               <input
                 type="file"
-                accept=".md,.txt,.markdown,text/plain,text/markdown"
+                accept=".md,.txt,.markdown,.pdf,application/pdf,text/plain,text/markdown"
                 onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])}
               />
+              <div className="knowledge-upload-meta" aria-live="polite">
+                <p className={`knowledge-upload-status ${fileStatus.kind}`}>
+                  {fileStatus.kind === "error" ? "▲ " : fileStatus.kind === "ok" ? "● " : fileStatus.kind === "progress" ? "… " : ""}
+                  {fileStatus.message}
+                </p>
+                {fileStatus.kind === "progress" && (
+                  <div className="knowledge-progress" aria-label={fileStatus.message}>
+                    <div className="knowledge-progress-track">
+                      <div className="knowledge-progress-fill" style={{ width: `${fileStatus.progress}%` }} />
+                    </div>
+                    <span className="knowledge-progress-text">{fileStatus.progress}%</span>
+                  </div>
+                )}
+                <p className="knowledge-upload-hint">
+                  Accepted file types: .md, .txt, .markdown, .pdf. {fileStatus.kind === "ok" ? "Your text is ready to ingest." : "We validate the file before parsing."}
+                </p>
+                {source && (
+                  <p className="knowledge-upload-file">
+                    {source} · {selectedFile ? formatBytes(selectedFile.size) : "selected"} · {content.length.toLocaleString()} extracted characters
+                  </p>
+                )}
+              </div>
+              <label className="dim" htmlFor="knowledge-pdf-format">PDF extraction format</label>
+              <select
+                id="knowledge-pdf-format"
+                className="text-input"
+                value={pdfFormat}
+                onChange={(e) => changePdfFormat(e.target.value as PdfTextFormat)}
+              >
+                <option value="markdown">Markdown (adds page headings)</option>
+                <option value="text">Plain text</option>
+              </select>
               <textarea
                 className="text-input"
                 rows={10}

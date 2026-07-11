@@ -4,12 +4,14 @@ import {
   agentApi,
   api,
   authApi,
+  kbApi,
   prefsApi,
   suggestionApi,
   watchApi,
   type OpsVitals,
   type Agent,
   type Approval,
+  type KbDocument,
   type Me,
   type Mission,
   type MissionStep,
@@ -123,6 +125,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [docs, setDocs] = useState<KbDocument[]>([]);
+  const [toolServers, setToolServers] = useState<{ server: string; tools: number }[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [chatRefresh, setChatRefresh] = useState(0);
@@ -168,6 +172,16 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
 
   const refreshWorkflows = useCallback(() => api.listWorkflows().then(setWorkflows), []);
   const refreshAgents = useCallback(() => agentApi.list().then(setAgents), []);
+  const refreshDocs = useCallback(() => kbApi.list().then(setDocs), []);
+  const refreshToolServers = useCallback(
+    () =>
+      api.tools().then((rows) => {
+        const by = new Map<string, number>();
+        for (const row of rows) by.set(row.server, (by.get(row.server) ?? 0) + 1);
+        setToolServers([...by.entries()].map(([server, tools]) => ({ server, tools })));
+      }),
+    [],
+  );
   const refreshApprovals = useCallback(() => api.listApprovals("pending").then(setApprovals), []);
   const refreshSuggestions = useCallback(
     () => suggestionApi.get().then(setSuggestions).catch(() => {}),
@@ -191,6 +205,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       .catch(() => {});
     refreshWorkflows();
     refreshAgents();
+    refreshDocs();
+    refreshToolServers();
     refreshApprovals();
     refreshSuggestions();
     prefsApi
@@ -214,7 +230,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       .vitals()
       .then(({ samples }) => setVitals((v) => (v.length ? v : samples.slice(-120))))
       .catch(() => {});
-  }, [refreshWorkflows, refreshAgents, refreshApprovals, refreshSuggestions]);
+  }, [refreshWorkflows, refreshAgents, refreshDocs, refreshToolServers, refreshApprovals, refreshSuggestions]);
 
   // Debounced save of the panel arrangement, once initial prefs have loaded.
   useEffect(() => {
@@ -648,6 +664,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                   isAdmin: RANK[me.role] >= RANK.admin,
                   agents,
                   workflows,
+                  docs,
+                  toolServers,
                   approvals,
                   signals,
                   connected,
@@ -677,6 +695,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             {view === "templates" && (
               <TemplatesView
                 canBuild={canBuild}
+                agents={agents}
+                workflows={workflows}
                 onInstantiated={(kind, id) => {
                   if (kind === "workflow") {
                     refreshWorkflows();
@@ -691,12 +711,18 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               />
             )}
             {view === "workshop" && <WorkshopView canBuild={canBuild} isAdmin={RANK[me.role] >= RANK.admin} />}
-            {view === "knowledge" && <KnowledgeView canBuild={canBuild} />}
+            {view === "knowledge" && <KnowledgeView canBuild={canBuild} onChanged={refreshDocs} />}
             {view === "missions" && (
               <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />
             )}
             {view === "agents" && (
               <AgentsView
+                agents={agents}
+                onUpdated={refreshAgents}
+                onRemoved={(agentId) => {
+                  setSelectedAgent((current) => (current === agentId ? null : current));
+                  refreshAgents();
+                }}
                 readOnly={!canBuild}
                 onOpenChat={(id) => {
                   setSelectedAgent(id);
@@ -704,7 +730,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 }}
               />
             )}
-            {view === "tools" && <ToolsView isAdmin={RANK[me.role] >= RANK.admin} />}
+            {view === "tools" && <ToolsView isAdmin={RANK[me.role] >= RANK.admin} onChanged={refreshToolServers} />}
             {view === "evals" && RANK[me.role] >= RANK.admin && <EvalsView agents={agents} />}
             {view === "admin" && RANK[me.role] >= RANK.admin && (
               <AdminView

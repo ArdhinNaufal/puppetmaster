@@ -286,6 +286,12 @@ a **hybrid** of meaning-based and keyword search — and shows you the matching 
 **citations** (`Title#chunk (breadcrumb)`) and scores. Agents reach the same library through
 the `kb.search` and `kb.read` tools, so their answers can cite your real documents.
 
+The upload panel also accepts selectable-text PDFs. Choose **Markdown** to add a `## Page N`
+heading for each PDF page (useful for citations), or **Plain text** for a simpler export. The
+extracted content is shown in the editor before ingestion, so you can correct it or remove
+headers. Scanned/image-only PDFs are not OCR'd; run OCR first when the parser reports that the
+PDF contains no selectable text.
+
 ## 7. MISSIONS — the complete history
 
 ![The Missions screen showing the log of every run with statuses and durations](img/getting-started/11-missions-log.png)
