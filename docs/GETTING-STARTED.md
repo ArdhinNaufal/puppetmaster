@@ -250,6 +250,10 @@ link requires a human-readable rationale. Trace coverage, orphan warnings, and t
 next move are advisory signals. They help find lost context after hand-offs or revisions but
 never replace the deterministic gates.
 
+For a complete beginner walkthrough with prompts, artifact examples, check configuration,
+traceability, troubleshooting, and a full sample project, continue with the
+[WORKSHOP Manual](./WORKSHOP.md).
+
 **Verify checks** are the gates. They run a named check and return *evidence*, never a bare
 "pass": `test`, `arch`, `refactor-gate` (blocks quietly editing test expectations during a
 refactor), `todo-sync`, `spec-sections`, `load` (refuses to run without declared

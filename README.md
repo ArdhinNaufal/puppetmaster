@@ -11,6 +11,7 @@ Built for small teams running it on their own server.
 📐 Specification phase. Read the docs:
 
 - [The Complete Guide (non-technical setup + every feature)](docs/GETTING-STARTED.md)
+- [WORKSHOP Manual (beginner software-building walkthrough)](docs/WORKSHOP.md)
 - [Installing Puppetmaster (technical reference)](docs/INSTALL.md)
 - [Product Requirements (PRD)](docs/PRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
