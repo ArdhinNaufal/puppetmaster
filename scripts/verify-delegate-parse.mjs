@@ -8,7 +8,12 @@
 // Run:  pnpm --filter "@puppetmaster/kernel..." build && node scripts/verify-delegate-parse.mjs
 // Exit 0 = all cases hold; 1 = a failure.
 
-import { parseClaudeStream, parseAiderOutput } from "../packages/kernel/dist/coding-cli.js";
+import {
+  aiderAdapter,
+  isolateAiderRepositoryCommand,
+  parseClaudeStream,
+  parseAiderOutput,
+} from "../packages/kernel/dist/coding-cli.js";
 
 let fails = 0;
 const ok = (m) => console.log(`  ok — ${m}`);
@@ -167,10 +172,138 @@ console.log("== [aider] a clean exit with no footer still succeeds (edits not al
   eq(r.filesChanged, undefined, "filesChanged (none)");
 }
 
+console.log("== [aider] exit zero without a model response is still a failure ==");
+{
+  const r = parseAiderOutput("", { code: 0, stderr: "Warning: Input is not a terminal" });
+  eq(r.ok, false, "ok");
+  (r.reason ?? "").includes("without a model response")
+    ? ok(`reason = ${JSON.stringify(r.reason)}`)
+    : bad(`reason: ${JSON.stringify(r.reason)}`);
+}
+
+console.log("== [aider] an explicit CLI error cannot succeed even when Aider exits zero ==");
+{
+  const r = parseAiderOutput("", {
+    code: 0,
+    stderr: "usage: aider [-h]\naider: error: invalid configuration",
+  });
+  eq(r.ok, false, "ok");
+  (r.reason ?? "").includes("rejected the command")
+    ? ok(`reason = ${JSON.stringify(r.reason)}`)
+    : bad(`reason: ${JSON.stringify(r.reason)}`);
+}
+
+console.log("== [aider] command assembly selects OpenAI model, plan mode, and effort ==");
+{
+  const command = aiderAdapter.buildCommand("Inspect only", {
+    maxTurns: 12,
+    model: "openai/gpt-5",
+    permissionMode: "plan",
+    effort: "high",
+  });
+  command.includes("--model 'openai/gpt-5'")
+    ? ok("explicit OpenAI model is safely quoted")
+    : bad(`explicit model missing: ${command}`);
+  command.includes("--chat-mode ask")
+    ? ok("plan permission maps to ask chat mode")
+    : bad(`plan chat mode missing: ${command}`);
+  command.includes("--reasoning-effort 'high'")
+    ? ok("reasoning effort is forwarded")
+    : bad(`reasoning effort missing: ${command}`);
+  for (const flag of [
+    "--dry-run",
+    '--config "$aider_config"',
+    "--env-file /dev/null",
+    '--model-settings-file "$aider_model_settings"',
+    '--model-metadata-file "$aider_model_metadata"',
+    "--aiderignore /dev/null",
+    "--no-gitignore",
+    "--no-dirty-commits",
+    "--no-auto-lint",
+    "--no-auto-test",
+    "--no-watch-files",
+    "--no-suggest-shell-commands",
+    "--no-analytics",
+    "--no-check-update",
+    "env -i",
+    "GIT_CONFIG_NOSYSTEM=1",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "GIT_CONFIG_KEY_0=core.hooksPath",
+    "GIT_CONFIG_VALUE_0=/dev/null",
+    "GIT_CONFIG_KEY_1=core.fsmonitor",
+  ]) {
+    command.includes(flag)
+      ? ok(`plan command includes ${flag}`)
+      : bad(`plan hardening flag missing (${flag}): ${command}`);
+  }
+  command.includes("printf '%s\\n' '{}' > \"$aider_config\"")
+    ? ok("plan command creates a process-private empty YAML mapping")
+    : bad(`isolated config initialization missing: ${command}`);
+  command.includes("printf '%s\\n' '[]' > \"$aider_model_settings\"") &&
+  command.includes("printf '%s\\n' '{}' > \"$aider_model_metadata\"")
+    ? ok("repository model settings and metadata are replaced with private empty files")
+    : bad(`isolated model metadata initialization missing: ${command}`);
+  command.includes('aider_stdout="$aider_tmp-stdout"') &&
+  command.includes("grep -Eqi 'aider:[[:space:]]*error:'")
+    ? ok("exit-zero CLI errors and empty responses are converted to shell failure")
+    : bad(`semantic exit-code guard missing: ${command}`);
+}
+
+console.log("== [aider] non-plan command uses code mode and environment model fallback ==");
+{
+  const command = aiderAdapter.buildCommand("Implement it", {
+    maxTurns: 12,
+    permissionMode: "acceptEdits",
+  });
+  command.includes('--model "${DELEGATE_MODEL:-ollama/llama3}"')
+    ? ok("absent model falls back to DELEGATE_MODEL")
+    : bad(`environment model fallback missing: ${command}`);
+  command.includes("--chat-mode code")
+    ? ok("non-plan permission maps to code chat mode")
+    : bad(`code chat mode missing: ${command}`);
+  command.includes("--no-dry-run")
+    ? ok("approved code mode explicitly disables dry-run")
+    : bad(`code-mode dry-run setting missing: ${command}`);
+  !command.includes("--reasoning-effort")
+    ? ok("unset effort does not emit a reasoning flag")
+    : bad(`unexpected reasoning effort: ${command}`);
+}
+
+console.log("== [aider] disposable repository wrapper applies only approved Execute scratch ==");
+{
+  const inner = aiderAdapter.buildCommand("Inspect", { maxTurns: 1, permissionMode: "plan" });
+  const plan = isolateAiderRepositoryCommand(inner, "plan-id", "plan");
+  const execute = isolateAiderRepositoryCommand(inner, "execute-id", "execute");
+  !plan.includes("puppetmaster-sync apply") && execute.includes("puppetmaster-sync apply")
+    ? ok("Plan discards scratch while Execute stages a guarded scratch apply")
+    : bad("Aider repository wrapper mode boundary is missing");
+  execute.includes("puppetmaster-sync recover /workbench") && execute.includes("rm -rf -- '.env'")
+    ? ok("wrapper recovers journals and removes repository control files")
+    : bad("Aider repository cleanup/recovery guard is missing");
+  execute.includes(" - 'scratch-executeid'") && execute.includes("recover /workbench 'executeid' 'scratch-executeid'")
+    ? ok("disposable apply/recovery uses an exact token and per-turn journal key")
+    : bad(`Aider scratch journal authentication is missing: ${execute}`);
+}
+
+console.log("== [aider] model and prompt shell metacharacters remain quoted data ==");
+{
+  const command = aiderAdapter.buildCommand("fix 'quoted'; touch /tmp/prompt-pwn", {
+    maxTurns: 12,
+    model: "openai/gpt-5'; touch /tmp/model-pwn; #",
+    permissionMode: "acceptEdits",
+  });
+  command.includes(String.raw`--model 'openai/gpt-5'\''; touch /tmp/model-pwn; #'`)
+    ? ok("model apostrophe and shell operators are POSIX quoted")
+    : bad(`model was not safely quoted: ${command}`);
+  command.includes(String.raw`--message 'fix '\''quoted'\''; touch /tmp/prompt-pwn'`)
+    ? ok("prompt apostrophe and shell operators are POSIX quoted")
+    : bad(`prompt was not safely quoted: ${command}`);
+}
+
 if (fails > 0) {
   console.error(`\nDELEGATE PARSE: FAIL (${fails})`);
   process.exit(1);
 }
 console.log(
-  "\nDELEGATE PARSE PASS: claude(success/noise/max-turns/last-wins/no-result/empty) + aider(success/multi-edit/nonzero-exit/no-footer)",
+  "\nDELEGATE PARSE PASS: claude parsing + aider parsing/command assembly (model/mode/effort/quoting)",
 );

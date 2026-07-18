@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { Decode, HoldButton } from "@puppetmaster/ui";
 import {
   agentApi,
@@ -33,15 +33,19 @@ import { AdminView, AgentsView, EvalsView, KnowledgeView, MissionsView, Template
 import { workspaceApi, type Workspace } from "./api.js";
 import { useEventStream } from "./useEventStream.js";
 
-const VIEWS = ["nexus", "command", "canvas", "workshop", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
+const ClaudeCodeView = lazy(() =>
+  import("./claude/ClaudeCodeView.js").then((module) => ({ default: module.ClaudeCodeView })),
+);
+
+const VIEWS = ["nexus", "command", "canvas", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
 type View = (typeof VIEWS)[number];
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
 
 /** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
 const ROLE_VIEWS: Record<Role, View[]> = {
-  member: ["nexus", "command", "workshop", "templates", "knowledge", "missions", "agents", "tools"],
-  builder: ["nexus", "command", "canvas", "workshop", "templates", "knowledge", "missions", "agents", "tools"],
+  member: ["nexus", "command", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools"],
+  builder: ["nexus", "command", "canvas", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools"],
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
@@ -130,6 +134,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [chatRefresh, setChatRefresh] = useState(0);
+  const [claudeRefresh, setClaudeRefresh] = useState(0);
   const [tracked, setTracked] = useState<string | null>(null);
   const [nodeStatus, setNodeStatus] = useState<Record<string, StepStatus>>({});
   const [mission, setMission] = useState<Mission | null>(null);
@@ -270,7 +275,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           else if (event.status !== "pending") t.end = at;
         }
         if (event.type === "mission.started") timingRef.current[event.missionId] = {};
-        if (event.type !== "agent.message.delta") {
+        if (event.type === "claude.event" || event.type === "claude.run.started" || event.type === "claude.run.finished") {
+          setClaudeRefresh((n) => n + 1);
+        }
+        if (event.type !== "agent.message.delta" && event.type !== "claude.event") {
           const entry = toSignal(event);
           setSignals((s) => [entry, ...s].slice(0, 60));
           setProcRows((r) => [rowFromSignal(entry), ...r].slice(0, 200));
@@ -615,7 +623,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const nexusSolo = view === "nexus";
 
   return (
-    <div className="app">
+    <div className={`app app-view-${view}`}>
       <header className="rail">
         <span className="brand">
           {workspace?.branding?.brandName || "PUPPETMASTER"}
@@ -652,7 +660,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               <Decode text={view.toUpperCase()} />
             </span>
             <span className="stage-hint">
-              <kbd>⌘K</kbd> COMMAND · <kbd>1–{roleViews.length}</kbd> VIEWS
+              <kbd>⌘K</kbd> COMMAND · <kbd>1–9</kbd> QUICK VIEWS
             </span>
           </div>
           <div className="stage-body">
@@ -711,6 +719,11 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               />
             )}
             {view === "workshop" && <WorkshopView canBuild={canBuild} isAdmin={RANK[me.role] >= RANK.admin} />}
+            {view === "claude" && (
+              <Suspense fallback={<div className="canvas-empty">LOADING CLAUDE CONTROL PLANE...</div>}>
+                <ClaudeCodeView canBuild={canBuild} refreshKey={claudeRefresh} onTrack={track} />
+              </Suspense>
+            )}
             {view === "knowledge" && <KnowledgeView canBuild={canBuild} onChanged={refreshDocs} />}
             {view === "missions" && (
               <MissionsView selected={tracked} onSelect={track} refreshKey={missionsRefresh} />

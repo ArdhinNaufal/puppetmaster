@@ -1,4 +1,4 @@
-import type { MissionStatus, StepStatus, WorkflowNodeKind } from "@puppetmaster/shared";
+import type { CodingBackend, CodingProvider, MissionStatus, StepStatus, WorkflowNodeKind } from "@puppetmaster/shared";
 
 /**
  * Typed events flowing on the kernel bus (Redis streams in production, in-memory
@@ -38,10 +38,49 @@ export type BusEvent =
   /** Streaming assistant text (Stage 6): progressive chunks of the reply
    *  being generated; the persisted agent.message follows when the turn ends. */
   | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string }
+  | {
+      type: "claude.run.started";
+      sessionId: string;
+      runId: string;
+      missionId: string;
+      provider: CodingProvider;
+      backend: CodingBackend;
+      model: string;
+      mode: "plan" | "execute";
+      at: string;
+    }
+  | {
+      /** Raw Claude stream events are persisted first, then projected here so
+       *  the UI can render current and future CLI schemas without data loss. */
+      type: "claude.event";
+      sessionId: string;
+      runId: string;
+      missionId: string;
+      provider: CodingProvider;
+      backend: CodingBackend;
+      seq: number;
+      stream: "stdout" | "stderr" | "system";
+      eventType: string;
+      text?: string;
+      payload?: unknown;
+      at: string;
+    }
+  | {
+      type: "claude.run.finished";
+      sessionId: string;
+      runId: string;
+      missionId: string;
+      provider: CodingProvider;
+      backend: CodingBackend;
+      status: "succeeded" | "failed" | "cancelled";
+      costUsd?: number;
+      at: string;
+    }
   /** Kernel resource sample (docs/PROCESS-WATCH.md): published ~2.5s while
    *  operators are connected. Real process measurements only. */
   | {
       type: "ops.vitals";
+      workspaceId: string;
       at: string;
       cpuPct: number;
       rssMb: number;
@@ -58,6 +97,7 @@ export type BusEvent =
    *  arguments, or results (full detail stays in the audit table). */
   | {
       type: "audit.appended";
+      workspaceId: string;
       at: string;
       action: string;
       actorKind: "user" | "agent" | "system";

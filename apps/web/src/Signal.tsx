@@ -10,11 +10,15 @@ import type { BusEvent } from "./api.js";
 
 /** Operator-facing events (vitals + audit summaries feed the WATCH, not the ticker). */
 export type OperationalEvent = Exclude<BusEvent, { type: "ops.vitals" } | { type: "audit.appended" }>;
+export type SignalEvent = Exclude<
+  OperationalEvent,
+  { type: "agent.message.delta" } | { type: "claude.event" }
+>;
 
 export interface SignalEntry {
   seq: number;
   at: number;
-  type: OperationalEvent["type"];
+  type: SignalEvent["type"];
   label: string;
   tone: "default" | "accent" | "warn" | "danger" | "ok";
   /** Stable subject (mission/agent id) — anchors the radar bearing. */
@@ -24,7 +28,7 @@ export interface SignalEntry {
 let seq = 0;
 
 /** Map an operational bus event to a ticker/radar entry. */
-export function toSignal(e: OperationalEvent): SignalEntry {
+export function toSignal(e: SignalEvent): SignalEntry {
   const at = Date.parse(e.at) || Date.now();
   const short = (id: string) => id.slice(0, 8);
   switch (e.type) {
@@ -61,8 +65,24 @@ export function toSignal(e: OperationalEvent): SignalEntry {
       };
     case "agent.message":
       return { seq: ++seq, at, type: e.type, subject: e.agentId, tone: "accent", label: `AGENT ${short(e.agentId)} ${e.role.toUpperCase()} MSG` };
-    case "agent.message.delta":
-      return { seq: ++seq, at, type: e.type, subject: e.agentId, tone: "default", label: `AGENT ${short(e.agentId)} STREAMING` };
+    case "claude.run.started":
+      return {
+        seq: ++seq,
+        at,
+        type: e.type,
+        subject: e.missionId,
+        tone: "accent",
+        label: `${e.provider === "openai" ? "OPENAI/AIDER" : "CLAUDE"} ${e.mode.toUpperCase()} ${short(e.runId)} STARTED`,
+      };
+    case "claude.run.finished":
+      return {
+        seq: ++seq,
+        at,
+        type: e.type,
+        subject: e.missionId,
+        tone: e.status === "succeeded" ? "ok" : e.status === "failed" ? "danger" : "default",
+        label: `${e.provider === "openai" ? "OPENAI/AIDER" : "CLAUDE"} ${short(e.runId)} ${e.status.toUpperCase()}`,
+      };
   }
 }
 

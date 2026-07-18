@@ -6,12 +6,15 @@
 
 - **TypeScript full-stack**, pnpm monorepo.
 - **Server:** Node.js (Fastify) + WebSocket for live mission/trace streaming.
-- **Web app:** React + Vite; **React Flow** for the canvas; Tailwind for the FUI design system.
+- **Web app:** React + Vite; **React Flow** for the canvas; repository CSS for the FUI design system.
 - **Persistence:** PostgreSQL (+ pgvector for RAG). SQLite adapter later for single-user/desktop mode.
 - **Queue/scheduler:** BullMQ on Redis (workflow steps, agent ticks, cron triggers).
 - **Model providers:** one abstraction over Anthropic, OpenAI, and local runtimes (Ollama, vLLM).
 - **Tools:** MCP client in the runtime; connectors ship as bundled MCP servers.
-- **Deploy:** Docker Compose (server, web, postgres, redis, connector sidecars). Tauri desktop client in phase 2.
+- **Current deploy substrate:** Docker Compose packages the API, Postgres, and Redis. The Vite web
+  app runs separately, and Docker workbenches currently require the API server to run on the host
+  with Docker access. A production web image/reverse proxy and a deliberately privileged remote
+  workbench executor remain deployment work; Tauri is a later client target.
 
 ## 2. System overview
 
@@ -237,20 +240,23 @@ shipped; the full phase orchestration (EXECUTE via a headless CLI) is in progres
   failure that earned it.
 - **Workbench executor** (WP3, ADR-002/005): the `CommandExecutor.run()` seam is where the
   isolation boundary lives. `LocalCommandExecutor` runs on the host (trusted-local, and the way
-  the checks are proven in evals); `DockerCommandExecutor` (`WORKBENCH_MODE=docker`) execs into
-  a per-project container — non-root, `--network none`, resource caps, a named volume at
-  `/workbench` — host-verified via `scripts/verify-workbench.mjs`.
+  the checks are proven in evals). `DockerCommandExecutor` (`WORKBENCH_MODE=docker`) keeps a
+  capped, non-root base container and named `/workbench` volume for ordinary checks. Its default
+  network is `none`; configured provider egress uses an internal project network plus an
+  allowlisting proxy. Coding-provider turns use disposable profile containers rather than
+  `docker exec` into the base container. These boundaries are host-verified by the Docker suite.
 - **`bench.*` tools** (WP3b.3): `bench.read` (read), `bench.exec`/`bench.write`/`bench.git.commit`
   (write, gated), `bench.git.status`/`.diff` (read), `bench.git.push` (destructive) — a tiered,
   workspace-scoped surface over the same executor; results inherit the untrusted-data envelope
   and Stage 9C compaction like any catalog tool. Absent an executor, every call refuses by name.
 - **`bench.delegate`** (WP3b.4, ADR-002 + **ADR-008**): delegates a coding task to a headless
-  coding CLI running inside the workbench (write-tier, turn + wall-clock budget). The CLI is
-  **pluggable** via a `CodingCliAdapter` (`coding-cli.ts`) — ships `claude` (Anthropic,
-  stream-json) and `aider` (provider-agnostic: OpenAI/Anthropic/Gemini/Ollama/local, model via
-  `DELEGATE_MODEL`), selected per call (`cli`) or per deployment (`DELEGATE_CLI`). This is the
-  EXECUTE-phase complement to §3.5's already-multi-provider Model Router — together they mean no
-  Workshop surface is locked to a single AI provider.
+  coding CLI running in a disposable provider profile (write-tier, turn + wall-clock budget). The
+  `CodingCliAdapter` seam (`coding-cli.ts`) ships Claude stream-json and Aider plain-output parsers.
+  Claude remains the supported mutating tool path. Mutating `bench.delegate(aider)` fails closed
+  because workflow nodes do not yet supply the durable run ID/generation required by the signed
+  copy-back ledger; Aider Plan remains available, and OpenAI mutation is supported through the
+  CLAUDE page Execute path. This restriction prevents a provider choice from bypassing durable
+  ownership rather than weakening the boundary to preserve the original adapter promise.
 - **Knowledge mirror** (ADR-004): accepted `spec`/`learning` artifacts mirror into the KB on
   write (one live document per project+kind+title, replaced each version) so `kb.search` and
   citations work over them; a mirror failure never loses the artifact write.
@@ -268,13 +274,78 @@ shipped; the full phase orchestration (EXECUTE via a headless CLI) is in progres
   Canvas `verify` node skin and its structured config inspector (check picker,
   retries-before-escalate); the approval inbox's evidence panel.
 
+### 3.12 Claude Code control plane
+
+Claude Code is a parallel mission runtime over the Workshop isolation boundary, not a second
+orchestrator. Its implementation is split deliberately between planning and execution:
+
+- **Plan** is read-only: Anthropic gets a read-only project-volume mount and Claude `plan`; OpenAI
+  gets a sanitized disposable copy and Aider `ask`. **Execute** is write-tier and always creates a
+  pending approval before Claude `acceptEdits` or Aider `code`; the dedicated API exposes no bypass.
+- Runs are Docker-only, serialized to one active run per project, and refuse a missing or
+  ambiguous repository. An empty workbench is populated from the project's `repoRef`.
+- Each project receives separate `/workbench`, persistent Claude configuration, and named lock
+  volumes. Coding turns run in disposable provider-profile containers. Anthropic mounts its
+  companion configuration volume; OpenAI never does. Both approved Execute providers edit an
+  attempt-owned scratch-volume copy, while secret-free trusted holders perform HMAC-signed v3
+  snapshot/apply/status/ack operations. The durable journal is commit-wins: rollback is possible
+  only before the signed committed marker; a later cancel cannot undo committed files. A database
+  `workbench_copybacks` ledger atomically couples that receipt to run/session/mission completion,
+  resumes cleanup after restart, and quarantines malformed or tampered evidence. The isolated
+  holder owns cancellation independently of the local `docker exec` client; normal cleanup proves
+  exact run ID/generation holder removal before removing scratch/state volumes.
+- Run state, stream events, usage, mission state, and terminal audit evidence are durable.
+  Workspace-scoped WebSocket updates are best-effort accelerators over polling and paged event
+  recovery, not the source of truth.
+- Startup reconciliation runs before queue intake. It handles ledger rows and also enumerates
+  pre-intent `running` claims, proves exact-generation (or legacy generation-zero) termination,
+  removes disposable artifacts, and terminalizes the guarded run/mission. Shutdown rejects new
+  mutations, stops queue/HTTP intake, aborts active provider attempts, and drains them while the
+  database, bus, and MCP dependencies remain alive. Shared `flock` guards Plan/status/diff reads;
+  exclusive `flock` guards Execute copy-back and other project mutations.
+- The CLAUDE UI exposes sessions, transcript, tool/task traces, diffs, models, permissions, and
+  provenance. Official Anthropic documentation is the behavior authority; the referenced
+  third-party corpus is retained only as untrusted provenance metadata.
+- Sessions also carry immutable `provider` and `backend` snapshots. Existing and omitted values
+  default to `anthropic` / `claude`, preserving the original Claude Code path. Selecting OpenAI
+  creates an `openai` / `aider` session that reads `OPENAI_API_KEY` (and an optional
+  `OPENAI_API_BASE` / `OPENAI_BASE_URL`) from the server's secret map. Provider credentials are
+  made available only to that disposable provider process. Values exist solely in the Docker CLI
+  child environment and `docker exec` receives names (`-e NAME`), so persistent holder
+  `Config.Env`/`Config.Cmd` contains neither configured secret values nor provider commands. Claude
+  and Aider cannot see each other's environment or companion configuration, and neither Execute
+  backend sees the durable project writable.
+  Readiness validates credentials for the selected Anthropic transport (direct, Bedrock, or
+  Foundry), rejects ambiguous multiple-cloud selection, and deliberately leaves Vertex unavailable
+  until container ADC can be provisioned and proven. It also probes the configured workbench image
+  for the pinned CLI/helper versions and verifies that the local proxy image exists instead of
+  inferring runtime availability from credentials alone. OpenAI custom endpoints reject literal
+  loopback/unspecified hosts because those resolve inside the disposable container. Neither image
+  is built, pulled, or replaced by server startup; building both and passing the Docker
+  verification suite are deployment prerequisites.
+- OpenAI Plan maps to Aider's non-editing `ask` mode; Execute maps to `code` mode behind the same
+  write approval and Docker boundary. Both Aider modes run from a sanitized disposable repository copy;
+  repository Aider config/model metadata and dotenv discovery are removed, ambient `AIDER_*`
+  variables are scrubbed, and automatic lint/test or shell suggestions are disabled. Plan discards
+  the copy; a successful approved Execute copies code back while preserving Git metadata and the
+  repository's protected control files. Managed Claude turns similarly exclude project/local
+  setting sources, disable hooks, and use a strict empty MCP configuration. The UI
+  discloses the backend's narrower telemetry: Aider emits plain output rather than Claude
+  stream-json tool events and does not enforce Claude's CLI turn/spend caps or resume Claude
+  sessions.
+- The current recovery owner is intentionally single-host: database run claims are durable, but
+  startup reconciliation has no distributed lease/fencing and named filesystem locks are scoped to
+  one Docker daemon. Active-active CLAUDE execution across servers/hosts is unsupported.
+
 ## 4. Data model (core tables)
 
 `users`, `workspaces`, `memberships(role)`, `agents`, `agent_memories`, `workflows`,
 `workflow_versions`, `missions`, `mission_steps`, `approvals`, `tools(mcp_servers)`,
 `tool_grants`, `credentials`, `templates`, `audit_log`, `ui_preferences(user layouts/themes)`,
 `branding(workspace)`. Workshop (§3.11): `projects`, `project_artifacts`, `verify_checks`,
-`project_trace_links`, `evidence`.
+`project_trace_links`, `evidence`. Claude Code (§3.12): `claude_sessions(provider, backend)`,
+`claude_runs(provider, backend, execution_generation)`, `claude_events`,
+`workbench_copybacks(execution_id, execution_generation, state)`.
 
 ## 5. Frontend architecture
 

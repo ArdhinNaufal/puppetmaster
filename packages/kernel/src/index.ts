@@ -27,6 +27,8 @@ export * from "./compaction.js";
 export * from "./project-tools.js";
 export * from "./bench-tools.js";
 export * from "./coding-cli.js";
+export * from "./claude-stream.js";
+export * from "./claude-runtime.js";
 export * from "./verify.js";
 export * from "./command-runner.js";
 export * from "./workbench.js";

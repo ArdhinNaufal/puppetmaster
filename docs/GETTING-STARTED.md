@@ -263,8 +263,9 @@ refuses to run at all until at least one check is enabled.
 
 For the actual coding, agents get a **workbench** (an isolated container per project) and a
 set of `bench.*` tools — read files, run commands, write files, commit, push — each labeled
-by how much it can break. `bench.delegate` hands a coding task to a pluggable headless coding
-CLI (Claude or Aider ship built-in) running inside that sandbox.
+by how much it can break. `bench.delegate` hands a coding task to a headless coding CLI inside
+that sandbox. Claude is the supported mutating delegate; Aider parsing/read-only planning ships,
+while OpenAI/Aider edits use the CLAUDE page's approval and durable copy-back flow.
 
 ## 5. TEMPLATES — start from a ready-made helper
 
@@ -472,7 +473,7 @@ to the top.
 
 Covered in the WORKSHOP section: projects, versioned artifacts (spec/plan/todo/learning/adr),
 the spec-coverage meter, verify gates and earned-policy checks, the isolated per-project
-workbench, tiered `bench.*` tools, and `bench.delegate` to a pluggable coding CLI. Accepted
+workbench, tiered `bench.*` tools, and the guarded `bench.delegate` coding seam. Accepted
 specs and learnings also **mirror into the knowledge base**, so search and citations work
 over a project's own documents.
 
@@ -611,17 +612,23 @@ them in a self-contained box.
    docker compose -f docker/docker-compose.yml up postgres redis
    ```
 
-3. Stop your server (**Ctrl+C**) and restart it pointed at the permanent database:
+3. Stop your server (**Ctrl+C**) and add the connection settings to the repository-root `.env`:
 
-   ```bash
-   DATABASE_URL=postgres://puppetmaster:puppetmaster@localhost:5432/puppetmaster \
-   REDIS_URL=redis://127.0.0.1:6379 \
+   ```dotenv
+   DATABASE_URL=postgres://puppetmaster:puppetmaster@localhost:5432/puppetmaster
+   REDIS_URL=redis://127.0.0.1:6379
+   ```
+
+4. Restart the server:
+
+   ```powershell
    pnpm --filter @puppetmaster/server dev
    ```
 
-Now everything survives restarts, **and** scheduled (cron) triggers work. There's also an
-all-in-one `docker compose -f docker/docker-compose.yml up --build` that runs the API and its
-database together.
+Now everything survives restarts, **and** scheduled (cron) triggers work. There is also an
+all-in-one `docker compose -f docker/docker-compose.yml up --build` for the API, Postgres, and
+Redis. That API container does not include the web app or access to a Docker daemon, so it cannot
+host CLAUDE workbenches; run the server on the host as shown above when using the CLAUDE page.
 
 ## Connect real AI
 
@@ -636,16 +643,18 @@ provider key and set your agents' models accordingly (in the AGENTS inspector, o
 
 ## Full settings reference
 
-The server is configured with environment variables (set them in your shell before starting,
-or use the Docker setup). None are required for the quick trial. The most useful:
+The host-run server reads the repository-root `.env` automatically through its `dev` and `start`
+commands; explicit shell variables take precedence. The Compose service forwards only variables
+declared in its service definition. None are required for the quick trial. The most useful:
 
 | Variable | Default | What it does |
 |---|---|---|
 | `DATABASE_URL` | *(unset → in-memory)* | Postgres connection; makes data permanent |
 | `REDIS_URL` | *(unset → in-memory)* | Redis connection; enables the queue and cron scheduling |
 | `PORT` / `HOST` | `4000` / `0.0.0.0` | Server address |
-| `ANTHROPIC_API_KEY` | *(unset)* | Enables `claude-*` agents |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | *(unset)* | Enables `openai/*` agents (or any OpenAI-compatible server) |
+| `ANTHROPIC_API_KEY` | *(unset)* | Enables `claude-*` agents and Anthropic sessions on the CLAUDE page |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | *(unset)* | Enables `openai/*` agents and OpenAI/Aider sessions on the CLAUDE page |
+| `CLAUDE_CODE_OPENAI_MODEL` | `openai/gpt-5.6` | Default model for new OpenAI sessions on the CLAUDE page |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Endpoint for `ollama/*` agents |
 | `EMBEDDING_PROVIDER` | `mock` | Knowledge/memory embeddings: `mock` (keyless), `openai`, or `none` |
 | `MCP_SERVERS` | *(unset)* | Extra MCP tool servers to launch at boot (JSON) |
@@ -655,10 +664,34 @@ or use the Docker setup). None are required for the quick trial. The most useful
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset → off)* | Export finished missions as OpenTelemetry traces |
 | `MEMORY_CAP` | `200` | Per-agent long-term memory limit before eviction |
 | `COPILOT_MODEL` | `mock` | Model used for the workflow copilot and failure explanations |
-| `WORKBENCH_MODE` | *(local)* | Set to `docker` to run each Workshop project in an isolated container |
+| `WORKBENCH_MODE` | *(unset → disabled)* | Set to `docker` to run each Workshop project in an isolated container |
+| `WORKBENCH_IMAGE` | `puppetmaster-workbench:spike` | Workbench image; rebuild it after changing `docker/workbench.Dockerfile` |
+| `WORKBENCH_EGRESS_PROXY_IMAGE` | `puppetmaster-egress-proxy:spike` | Allowlisting proxy image used for provider network access |
+| `WORKBENCH_EGRESS_ALLOW` | *(unset)* | Comma-separated destinations allowed through the workbench egress proxy; include the selected CLAUDE-page provider's API host |
 | `PGLITE_DATA_DIR` | *(unset → in-memory)* | Save the keyless database to disk (used by the demo seeder) |
 
-The complete list, with every embedding, router, and workbench option, is in `docs/INSTALL.md`.
+For the containerized CLAUDE provider, a custom OpenAI-compatible URL cannot use `localhost`,
+`127.0.0.1`, `::1`, or `0.0.0.0`; those addresses refer to the disposable container and are
+rejected. Use `host.docker.internal` for an explicitly mapped service on the Docker host. See
+`docs/INSTALL.md` for the HTTPS/insecure-override and provider-transport readiness rules.
+
+Before enabling the CLAUDE runtime, build its two local images from the repository root:
+
+```bash
+docker build -t puppetmaster-workbench:spike -f docker/workbench.Dockerfile .
+docker build -t puppetmaster-egress-proxy:spike -f docker/egress-proxy.Dockerfile docker
+```
+
+The CLAUDE view is available to workspace members for inspection and to builders for mutation.
+New sessions default to Anthropic/Claude Code and can instead select OpenAI/Aider. Starting a turn
+requires a running Docker daemon, both images above, Docker workbench mode, credentials for that
+provider, and its effective API hostname in the egress allowlist. Plan is read-only; Execute pauses
+for an explicit write approval and copies successful scratch edits back through a durable signed
+ledger. A session's provider is fixed after creation. Run one active Puppetmaster server against
+one Docker daemon for CLAUDE execution; multi-host recovery ownership is not implemented yet.
+
+The step-by-step operator guide is in [CLAUDE-CODE-MANUAL.md](./CLAUDE-CODE-MANUAL.md). The
+expanded technical settings and verification reference is in `docs/INSTALL.md`.
 
 ## Shutting everything down
 

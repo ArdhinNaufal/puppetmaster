@@ -54,6 +54,8 @@ export function rowFromAudit(e: AuditAppended): ProcessRow {
 export function rowFromSignal(s: SignalEntry): ProcessRow {
   const cat: WatchCat = s.type.startsWith("mission")
     ? "MISSION"
+    : s.type.startsWith("claude")
+      ? "MODEL"
     : s.type.startsWith("agent")
       ? "AGENT"
       : "AUTH";
@@ -65,6 +67,7 @@ const VIEW_PRESET: Record<string, WatchFilter> = {
   nexus: "ALL",
   command: "AGENT",
   canvas: "MISSION",
+  claude: "MODEL",
   templates: "MISSION",
   knowledge: "TOOL",
   missions: "MISSION",

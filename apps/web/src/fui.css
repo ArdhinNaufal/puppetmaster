@@ -1159,6 +1159,41 @@ input[type="color"] { background: #0d0d0f; border: 1px solid var(--stroke-hi); b
 @media (max-width: 760px) {
   .workshop-trace-summary { grid-template-columns: 1fr; }
   .workshop-link-path { grid-template-columns: 1fr; gap: 0.25rem; }
+
+  /* CLAUDE is a primary workbench, so the global dashboard rails yield to it
+     on narrow screens instead of forcing the stage beyond the viewport. */
+  .app-view-claude .rail {
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    padding: 0.4rem 0.55rem;
+  }
+  .app-view-claude .view-switch {
+    order: 3;
+    width: 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  .app-view-claude .rail-meta {
+    min-width: 0;
+    margin-left: auto;
+    gap: 0.4rem;
+  }
+  .app-view-claude .rail-meta > .tag-lo { display: none; }
+  .app-view-claude .user-chip {
+    max-width: 124px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .app-view-claude .grid,
+  .app-view-claude .grid.no-trace {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 6px;
+  }
+  .app-view-claude .grid > .side,
+  .app-view-claude .grid > .trace { display: none; }
+  .app-view-claude .canvas-panel { min-width: 0; }
+  .app-view-claude .stage-hint { display: none; }
 }
 
 .text-input {

@@ -4,8 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/main.ts",
-    "start": "node dist/main.js",
+    "dev": "tsx watch src/bootstrap.ts",
+    "start": "node dist/bootstrap.js",
     "seed:demo": "node dist/seed-demo.js",
     "eval": "tsx src/eval-cli.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"

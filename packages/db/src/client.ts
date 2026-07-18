@@ -341,6 +341,261 @@ const DDL: string[] = [
      workbench_id text,
      created_at timestamptz NOT NULL DEFAULT now()
    )`,
+  `CREATE TABLE IF NOT EXISTS claude_sessions (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+     project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     provider text NOT NULL DEFAULT 'anthropic',
+     backend text NOT NULL DEFAULT 'claude',
+     title text NOT NULL,
+     claude_session_id text,
+     status text NOT NULL DEFAULT 'active',
+     model text NOT NULL,
+     effort text,
+     permission_mode text NOT NULL DEFAULT 'plan',
+     config jsonb NOT NULL DEFAULT '{}',
+     created_at timestamptz NOT NULL DEFAULT now(),
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     CONSTRAINT claude_sessions_provider_backend_check CHECK (
+       (provider = 'anthropic' AND backend = 'claude') OR
+       (provider = 'openai' AND backend = 'aider')
+     ),
+     CONSTRAINT claude_sessions_provider_model_check CHECK (
+       length(btrim(model)) BETWEEN 1 AND 200 AND (
+         (provider = 'anthropic' AND lower(model) NOT LIKE 'openai/%') OR
+         (provider = 'openai' AND model LIKE 'openai/%' AND length(btrim(substr(model, 8))) > 0)
+       )
+     ),
+     CONSTRAINT claude_sessions_model_canonical_check CHECK (
+       model = btrim(model) AND
+       (provider <> 'openai' OR model = 'openai/' || btrim(substr(model, 8)))
+     )
+   )`,
+  `CREATE TABLE IF NOT EXISTS claude_runs (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     session_id uuid NOT NULL REFERENCES claude_sessions(id) ON DELETE CASCADE,
+     mission_id uuid NOT NULL UNIQUE REFERENCES missions(id) ON DELETE CASCADE,
+     provider text NOT NULL DEFAULT 'anthropic',
+     backend text NOT NULL DEFAULT 'claude',
+     turn_number integer NOT NULL,
+     mode text NOT NULL,
+     prompt text NOT NULL,
+     status text NOT NULL DEFAULT 'queued',
+     execution_generation integer NOT NULL DEFAULT 0,
+     model text NOT NULL,
+     effort text,
+     permission_mode text NOT NULL,
+     config jsonb NOT NULL DEFAULT '{}',
+     result jsonb,
+     result_text text,
+     is_error boolean,
+     usage jsonb,
+     cost_usd real,
+     duration_ms integer,
+     duration_api_ms integer,
+     num_turns integer,
+     error text,
+     started_at timestamptz,
+     finished_at timestamptz,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (session_id, turn_number),
+     CONSTRAINT claude_runs_provider_backend_check CHECK (
+       (provider = 'anthropic' AND backend = 'claude') OR
+       (provider = 'openai' AND backend = 'aider')
+     ),
+     CONSTRAINT claude_runs_provider_model_check CHECK (
+       length(btrim(model)) BETWEEN 1 AND 200 AND (
+         (provider = 'anthropic' AND lower(model) NOT LIKE 'openai/%') OR
+         (provider = 'openai' AND model LIKE 'openai/%' AND length(btrim(substr(model, 8))) > 0)
+       )
+     ),
+     CONSTRAINT claude_runs_model_canonical_check CHECK (
+       model = btrim(model) AND
+       (provider <> 'openai' OR model = 'openai/' || btrim(substr(model, 8)))
+     ),
+     CONSTRAINT claude_runs_execution_generation_check CHECK (
+       execution_generation >= 0
+     )
+   )`,
+  `CREATE TABLE IF NOT EXISTS claude_events (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     session_id uuid NOT NULL REFERENCES claude_sessions(id) ON DELETE CASCADE,
+     run_id uuid NOT NULL REFERENCES claude_runs(id) ON DELETE CASCADE,
+     sequence integer NOT NULL,
+     stream text NOT NULL,
+     event_type text NOT NULL,
+     raw text NOT NULL DEFAULT '',
+     payload jsonb,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     UNIQUE (session_id, sequence)
+   )`,
+  `ALTER TABLE claude_sessions ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'anthropic'`,
+  `ALTER TABLE claude_sessions ADD COLUMN IF NOT EXISTS backend text NOT NULL DEFAULT 'claude'`,
+  `ALTER TABLE claude_runs ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'anthropic'`,
+  `ALTER TABLE claude_runs ADD COLUMN IF NOT EXISTS backend text NOT NULL DEFAULT 'claude'`,
+  `ALTER TABLE claude_runs ADD COLUMN IF NOT EXISTS execution_generation integer NOT NULL DEFAULT 0`,
+  `UPDATE claude_sessions
+     SET backend = CASE provider WHEN 'anthropic' THEN 'claude' WHEN 'openai' THEN 'aider' ELSE backend END
+     WHERE (provider = 'anthropic' AND backend IS DISTINCT FROM 'claude')
+        OR (provider = 'openai' AND backend IS DISTINCT FROM 'aider')`,
+  `UPDATE claude_runs AS run
+     SET provider = session.provider, backend = session.backend
+     FROM claude_sessions AS session
+     WHERE run.session_id = session.id
+       AND (run.provider IS DISTINCT FROM session.provider OR run.backend IS DISTINCT FROM session.backend)`,
+  `UPDATE claude_sessions SET model = btrim(model) WHERE model IS DISTINCT FROM btrim(model)`,
+  `UPDATE claude_runs SET model = btrim(model) WHERE model IS DISTINCT FROM btrim(model)`,
+  `UPDATE claude_sessions
+     SET model = 'openai/' || btrim(substr(model, 8))
+     WHERE provider = 'openai'
+       AND lower(model) LIKE 'openai/%'
+       AND model IS DISTINCT FROM 'openai/' || btrim(substr(model, 8))`,
+  `UPDATE claude_runs
+     SET model = 'openai/' || btrim(substr(model, 8))
+     WHERE provider = 'openai'
+       AND lower(model) LIKE 'openai/%'
+       AND model IS DISTINCT FROM 'openai/' || btrim(substr(model, 8))`,
+  `UPDATE claude_sessions
+     SET model = 'openai/' || model
+     WHERE provider = 'openai' AND model <> '' AND position('/' in model) = 0`,
+  `UPDATE claude_runs
+     SET model = 'openai/' || model
+     WHERE provider = 'openai' AND model <> '' AND position('/' in model) = 0`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_sessions_provider_backend_check'
+         AND conrelid = 'claude_sessions'::regclass
+     ) THEN
+       ALTER TABLE claude_sessions ADD CONSTRAINT claude_sessions_provider_backend_check CHECK (
+         (provider = 'anthropic' AND backend = 'claude') OR
+         (provider = 'openai' AND backend = 'aider')
+       );
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_sessions_model_canonical_check'
+         AND conrelid = 'claude_sessions'::regclass
+     ) THEN
+       ALTER TABLE claude_sessions ADD CONSTRAINT claude_sessions_model_canonical_check CHECK (
+         model = btrim(model) AND
+         (provider <> 'openai' OR model = 'openai/' || btrim(substr(model, 8)))
+       );
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_sessions_provider_model_check'
+         AND conrelid = 'claude_sessions'::regclass
+     ) THEN
+       ALTER TABLE claude_sessions ADD CONSTRAINT claude_sessions_provider_model_check CHECK (
+         length(btrim(model)) BETWEEN 1 AND 200 AND (
+           (provider = 'anthropic' AND lower(model) NOT LIKE 'openai/%') OR
+           (provider = 'openai' AND model LIKE 'openai/%' AND length(btrim(substr(model, 8))) > 0)
+         )
+       );
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_runs_model_canonical_check'
+         AND conrelid = 'claude_runs'::regclass
+     ) THEN
+       ALTER TABLE claude_runs ADD CONSTRAINT claude_runs_model_canonical_check CHECK (
+         model = btrim(model) AND
+         (provider <> 'openai' OR model = 'openai/' || btrim(substr(model, 8)))
+       );
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_runs_provider_backend_check'
+         AND conrelid = 'claude_runs'::regclass
+     ) THEN
+       ALTER TABLE claude_runs ADD CONSTRAINT claude_runs_provider_backend_check CHECK (
+         (provider = 'anthropic' AND backend = 'claude') OR
+         (provider = 'openai' AND backend = 'aider')
+       );
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_runs_provider_model_check'
+         AND conrelid = 'claude_runs'::regclass
+     ) THEN
+       ALTER TABLE claude_runs ADD CONSTRAINT claude_runs_provider_model_check CHECK (
+         length(btrim(model)) BETWEEN 1 AND 200 AND (
+           (provider = 'anthropic' AND lower(model) NOT LIKE 'openai/%') OR
+           (provider = 'openai' AND model LIKE 'openai/%' AND length(btrim(substr(model, 8))) > 0)
+         )
+       );
+     END IF;
+   END $$`,
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint
+       WHERE conname = 'claude_runs_execution_generation_check'
+         AND conrelid = 'claude_runs'::regclass
+     ) THEN
+       ALTER TABLE claude_runs ADD CONSTRAINT claude_runs_execution_generation_check CHECK (
+         execution_generation >= 0
+       );
+     END IF;
+   END $$`,
+  `CREATE INDEX IF NOT EXISTS claude_sessions_workspace_idx ON claude_sessions(workspace_id, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS claude_sessions_project_idx ON claude_sessions(project_id, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS claude_runs_session_idx ON claude_runs(session_id, turn_number)`,
+  `CREATE INDEX IF NOT EXISTS claude_runs_status_idx ON claude_runs(status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS claude_runs_one_active_per_session_idx
+     ON claude_runs(session_id)
+     WHERE status IN ('queued', 'awaiting_approval', 'running')`,
+  `CREATE TABLE IF NOT EXISTS workbench_copybacks (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     claude_run_id uuid NOT NULL REFERENCES claude_runs(id) ON DELETE CASCADE,
+     execution_id text NOT NULL,
+     execution_identity_sha256 text NOT NULL,
+     execution_generation integer NOT NULL,
+     state text NOT NULL DEFAULT 'intent',
+     baseline jsonb NOT NULL,
+     candidate jsonb,
+     receipt jsonb,
+     pending_completion jsonb,
+     error text,
+     files_committed_at timestamptz,
+     db_committed_at timestamptz,
+     rolled_back_at timestamptz,
+     quarantined_at timestamptz,
+     cleaned_at timestamptz,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     CONSTRAINT workbench_copybacks_run_generation_unique UNIQUE (claude_run_id, execution_generation),
+     CONSTRAINT workbench_copybacks_execution_id_unique UNIQUE (execution_id),
+     CONSTRAINT workbench_copybacks_execution_identity_unique UNIQUE (execution_identity_sha256),
+     CONSTRAINT workbench_copybacks_state_check CHECK (
+       state IN ('intent', 'files_committed', 'db_committed', 'rolled_back', 'quarantined', 'cleaned')
+     ),
+     CONSTRAINT workbench_copybacks_execution_generation_check CHECK (execution_generation > 0),
+     CONSTRAINT workbench_copybacks_execution_identity_check CHECK (
+       execution_identity_sha256 ~ '^[0-9a-f]{64}$'
+     ),
+     CONSTRAINT workbench_copybacks_execution_id_check CHECK (
+       execution_id = btrim(execution_id) AND length(execution_id) BETWEEN 1 AND 300
+     )
+   )`,
+  `CREATE INDEX IF NOT EXISTS workbench_copybacks_project_state_idx
+     ON workbench_copybacks(project_id, state, created_at)`,
+  `CREATE INDEX IF NOT EXISTS workbench_copybacks_run_idx
+     ON workbench_copybacks(claude_run_id, execution_generation)`,
+  `CREATE INDEX IF NOT EXISTS claude_events_session_idx ON claude_events(session_id, sequence)`,
+  `CREATE INDEX IF NOT EXISTS claude_events_run_idx ON claude_events(run_id, sequence)`,
   `CREATE TABLE IF NOT EXISTS project_artifacts (
      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
      project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

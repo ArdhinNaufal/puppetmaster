@@ -134,7 +134,7 @@ export type MissionStatus = z.infer<typeof MissionStatus>;
 export const Mission = z.object({
   id: z.string().uuid(),
   workspaceId: z.string().uuid(),
-  kind: z.enum(["agent", "workflow"]),
+  kind: z.enum(["agent", "workflow", "claude"]),
   subjectId: z.string().uuid(),
   parentMissionId: z.string().uuid().nullable().default(null),
   status: MissionStatus,

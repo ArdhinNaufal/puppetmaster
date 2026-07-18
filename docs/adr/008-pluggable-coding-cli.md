@@ -73,10 +73,18 @@ uses. Git-write stays outside every adapter (push/commit go through `bench.git.*
 
 The adapter parsers are pure and unit-verified for free (no Docker, no key) by
 `scripts/verify-delegate-parse.mjs` — canned claude stream-json and aider footer transcripts.
-The live per-CLI path (real model, real tokens) is verified on a Docker host by
-`scripts/verify-delegate.mjs` (`DELEGATE_CLI=claude|aider`), same author-here / verify-on-host
-discipline as the rest of WP3b. Golden task `bench-delegate-pluggable-cli-still-gated` pins that
-choosing a different CLI keeps the write-tier approval gate.
+`scripts/verify-delegate.mjs` is the paid Docker-host check for the Claude adapter. Aider execution
+through the CLAUDE page is verified deterministically by `scripts/verify-openai-coding-runtime.mjs`;
+its optional paid provider check is `scripts/verify-openai-live.mjs`.
+
+### 2026-07-17 execution-owner amendment
+
+The adapter remains available for parsing and read-only planning, but mutating
+`bench.delegate(aider)` is disabled until workflow nodes have a durable execution owner that can
+participate in the signed copy-back ledger. The supported OpenAI mutation path is CLAUDE page
+Execute, which supplies an immutable run ID and generation, requires the write approval, and
+atomically reconciles file and database commits. This narrows the original per-call decision rather
+than weakening the workbench boundary to preserve it.
 
 ## Reconsider when
 

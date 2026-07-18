@@ -83,6 +83,7 @@ const POLICY: PolicyRule[] = [
   // The Workshop (AI-SDLC plan WP2): browsing projects/artifacts is member;
   // creating/updating projects and writing artifacts is builder+ (ADR-001).
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/projects(\/|$)/, role: "builder" },
+  { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/claude-code(\/|$)/, role: "builder" },
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/workflows(\/|$)/, role: "builder" },
   // The webhook secret is sensitive: revealing it is builder+, not an open GET.
   { methods: ["GET"], path: /^\/api\/workflows\/[^/]+\/webhook$/, role: "builder" },

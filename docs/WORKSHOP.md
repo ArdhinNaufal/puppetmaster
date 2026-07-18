@@ -111,7 +111,7 @@ admin to perform that action.
 | Word | Meaning |
 | --- | --- |
 | Project | The long-lived container for one software effort. It owns the specification, plan, todos, checks, and learnings. |
-| Repository reference | A label such as `acme/reading-list` that tells humans which codebase the project concerns. It is not a clone operation by itself. |
+| Repository reference | The codebase source. WORKSHOP can display a human label, but the CLAUDE runtime passes this value to `git clone` when its workbench is empty. Use a real cloneable HTTPS URL for a CLAUDE project. |
 | Phase | The current point in the software-development loop: specify, plan, execute, verify, or record. |
 | Artifact | A durable project document or work item. WORKSHOP artifacts are `spec`, `plan`, `todo`, `learning`, and `adr`. |
 | Spec | A concrete description of what to build, its boundaries, and how it will be verified. |
@@ -145,7 +145,10 @@ an advisory percentage, not a pass/fail gate.
 In the **PROJECTS** panel, fill in:
 
 - **Project name** — use a clear name such as `Reading List API`.
-- **Repository reference** — use a repository label such as `acme/reading-list`; leave it blank if you are still exploring.
+- **Repository reference** — for a dossier-only project, this can be a human label or blank. For
+  CLAUDE, enter a real cloneable HTTPS URL such as
+  `https://github.com/your-account/reading-list.git` at creation time. The current UI cannot edit
+  this value later, so create a replacement project if it is wrong.
 - **GATED MODE** — leave this off for your first project unless you already have a reliable check.
 
 Select **CREATE PROJECT**. The new project appears in the list and opens automatically.
@@ -603,7 +606,8 @@ This example builds the first increment of a Reading List API.
 Create:
 
 - Name: `Reading List API`
-- Repository reference: `acme/reading-list`
+- Repository reference: a real cloneable URL for the repository, such as
+  `https://github.com/your-account/reading-list.git` when following the CLAUDE workflow
 - Mode: `supervised`
 
 ### Step 2 — Spec
@@ -713,4 +717,3 @@ Before calling a software increment complete, confirm:
 - [AI-SDLC Integration Plan](./AI-SDLC-INTEGRATION-PLAN.md) — the phased product plan and remaining orchestration work.
 - [Workshop failure-mode ledger](./WORKSHOP-FAILURE-MODES.md) — why specific gates and refusals exist.
 - [ADR-001](./adr/001-workshop-naming-and-v1-scope.md) — naming, role/mode boundaries, and v1 scope.
-

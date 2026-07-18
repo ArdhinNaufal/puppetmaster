@@ -117,7 +117,7 @@ const KB_DOCS = [
     ["Phases", "SPECIFY, PLAN, EXECUTE, VERIFY, and RECORD each map to an agent behavior or a deterministic gate — the software lifecycle as first-class objects."],
     ["Verify gates", "Deterministic checks (test, arch, refactor-gate, todo-sync, spec-sections, load) gate a mission and attach evidence; earned policies are off by default."],
     ["The workbench", "Each project gets an isolated container: non-root, default-closed egress via an allowlist proxy, resource caps, secrets from the vault only."],
-    ["Delegation", "bench.delegate hands a coding task to a pluggable headless CLI inside the workbench; claude and aider adapters ship, selected per call."],
+    ["Delegation", "bench.delegate runs guarded coding work inside the workbench. Claude is the supported mutating delegate; OpenAI/Aider edits use the CLAUDE page's durable approval and copy-back path."],
     ["Knowledge mirror", "Accepted specs and learnings mirror into the knowledge base so retrieval and citations work over the project's own artifacts."],
     ["Independence", "Review runs on a fresh-context agent invoked separately, so the reviewer never shares the builder's conversation."],
   ]),

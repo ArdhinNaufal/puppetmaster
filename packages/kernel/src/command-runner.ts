@@ -12,9 +12,9 @@ import { join } from "node:path";
  *   - LocalCommandExecutor (WP3a, here): runs on the host, verifiable in any
  *     environment with the toolchain — proves the shell-check logic and serves
  *     a trusted-local deployment.
- *   - DockerCommandExecutor (WP3b, host-verified): `docker exec` into the
- *     project's workbench container (ADR-005) — same interface, isolated
- *     execution. The ADR-002 spike validated the container substrate.
+ *   - DockerCommandExecutor (WP3b, host-verified): ordinary checks use the
+ *     project's maintenance container; provider turns use disposable profile
+ *     containers over the same durable workspace boundary (ADR-005).
  */
 
 export interface CommandResult {
@@ -25,11 +25,58 @@ export interface CommandResult {
   timedOut: boolean;
 }
 
+export interface CommandChunk {
+  stream: "stdout" | "stderr";
+  text: string;
+}
+
+export interface CommandContext {
+  projectId: string;
+  command: string;
+  timeoutMs?: number;
+  /** Run in a short-lived container instead of the long-lived project shell.
+   *  Provider profiles also control which companion volumes are mounted. */
+  containerProfile?: "plain" | "claude" | "openai";
+  /** Stable id for cancellation/recovery of an isolated execution. */
+  executionId?: string;
+  /** Exact durable claim generation bound to the isolated execution. Required
+   * for crash-recoverable provider copy-back. */
+  executionGeneration?: number;
+  /** Project lock mode. Reads/plans may share; mutations are exclusive. */
+  accessMode?: "read" | "write";
+  /** Mount the project workspace read-only for provider processes. Managed
+   * Claude Plan turns set this; Execute scratch and trusted maintenance remain RW. */
+  readOnlyProject?: boolean;
+  /** Names from the executor's configured secret vault to expose only to this
+   *  process. Callers cannot supply values or arbitrary environment entries. */
+  secretNames?: string[];
+}
+
 export interface CommandExecutor {
   /** Run a shell command in the project's workspace. Resolves on any exit —
    *  a non-zero code is a normal result, not an error. Rejects only when the
    *  workspace itself is unreachable (a real infra failure → fail closed). */
-  run(ctx: { projectId: string; command: string; timeoutMs?: number }): Promise<CommandResult>;
+  run(ctx: CommandContext): Promise<CommandResult>;
+  /** Docker-only trusted handoff for an attempt-owned provider scratch volume. */
+  applyExecutionResult?(
+    projectId: string,
+    executionId: string,
+    executionGeneration: number,
+    snapshotReceipt: string,
+    signal?: AbortSignal,
+  ): Promise<CommandResult & { commitReceipt?: string; committed?: boolean }>;
+  /** Remove provider scratch state after Plan, failure, cancellation, or apply. */
+  cleanupExecutionArtifacts?(executionId: string): Promise<void>;
+}
+
+/** Incremental peer used by long-running agent processes. Implementations
+ *  preserve the same isolation boundary as CommandExecutor while exposing
+ *  UTF-8 text chunks and cooperative cancellation. */
+export interface StreamingCommandExecutor extends CommandExecutor {
+  runStreaming(
+    ctx: CommandContext & { signal?: AbortSignal },
+    onChunk: (chunk: CommandChunk) => void | Promise<void>,
+  ): Promise<CommandResult>;
 }
 
 const DEFAULT_ROOT = process.env.WORKBENCH_LOCAL_ROOT ?? join(tmpdir(), "pm-workbench");
@@ -53,7 +100,7 @@ export class LocalCommandExecutor implements CommandExecutor {
     return dir;
   }
 
-  run(ctx: { projectId: string; command: string; timeoutMs?: number }): Promise<CommandResult> {
+  run(ctx: CommandContext): Promise<CommandResult> {
     const cwd = this.workspaceDir(ctx.projectId);
     const timeoutMs = ctx.timeoutMs ?? 30_000;
     return new Promise((resolve, reject) => {

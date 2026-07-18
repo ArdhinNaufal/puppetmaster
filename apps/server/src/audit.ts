@@ -25,6 +25,7 @@ export function createAuditSink(db: Db, bus?: EventBus): (entry: AuditEntry) => 
     try {
       await bus.publish({
         type: "audit.appended",
+        workspaceId: entry.workspaceId,
         at: new Date().toISOString(),
         action: entry.action,
         actorKind: entry.actorKind,
@@ -70,6 +71,14 @@ export function startAuditProjector(bus: EventBus, db: Db): () => void {
       if (m.kind === "agent") {
         const a = await getAgent(db, m.subjectId);
         ctx = { workspaceId: m.workspaceId, actorKind: "agent", actorId: m.subjectId, actorLabel: a?.name ?? "agent" };
+      } else if (m.kind === "claude") {
+        const trigger = m.trigger && typeof m.trigger === "object"
+          ? m.trigger as Record<string, unknown>
+          : {};
+        const actorLabel = trigger.provider === "openai" && trigger.backend === "aider"
+          ? "openai-aider"
+          : "claude-code";
+        ctx = { workspaceId: m.workspaceId, actorKind: "system", actorId: m.subjectId, actorLabel };
       } else {
         const wf = await getWorkflowWithGraph(db, m.subjectId);
         ctx = { workspaceId: m.workspaceId, actorKind: "system", actorId: m.subjectId, actorLabel: `workflow:${wf?.workflow.name ?? "?"}` };

@@ -42,6 +42,7 @@ import {
   deleteMemory,
   deleteTemplate,
   ensureDefaultWorkspace,
+  finishClaudeRun,
   getAgent,
   getAgentMessages,
   getApproval,
@@ -51,6 +52,7 @@ import {
   getMemory,
   getMission,
   getMissionSteps,
+  getClaudeRunByMission,
   getProject,
   getTemplate,
   getVerifyCheck,
@@ -102,6 +104,7 @@ import {
 import {
   AgentRuntime,
   BuiltinToolRegistry,
+  ClaudeCodeRuntime,
   connectMcpServer,
   createAgentInvoker,
   createEmbedder,
@@ -146,6 +149,12 @@ import { makeCredentialLookup, registerSecurityRoutes } from "./security.js";
 import { runSuite } from "./eval/harness.js";
 import { BUILTIN_TEMPLATES } from "./seeds.js";
 import { createAuditSink, startAuditProjector } from "./audit.js";
+import { registerClaudeCodeRoutes, terminalizeClaudeQueueFailure } from "./claude-code-routes.js";
+import {
+  providerEnvEnabled,
+  resolveAnthropicProviderReadiness,
+  resolveOpenAiEndpointReadiness,
+} from "./claude-code-readiness.js";
 import {
   graphHasWebhookTrigger,
   newWebhookSecret,
@@ -158,6 +167,9 @@ const HOST = process.env.HOST ?? "0.0.0.0";
 const REDIS_URL = process.env.REDIS_URL ?? null;
 
 const app = Fastify({ logger: true });
+let shuttingDown = false;
+
+const ApprovalDecisionInput = z.object({ approved: z.boolean() }).strict();
 
 // Keep the raw JSON body around so webhook HMAC signatures verify against the
 // exact bytes the caller signed (re-serialising would change whitespace).
@@ -268,9 +280,88 @@ const auditSink: typeof baseAuditSink = async (entry) => {
 // executor means shell checks refuse honestly (DB-native checks still run). A
 // local (host-subprocess) executor is deliberately NOT offered here: running
 // project commands on the host is not the container isolation model.
+const workbenchSecretNames = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "CLOUD_ML_REGION",
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "ANTHROPIC_FOUNDRY_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "OPENAI_API_BASE",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_PROJECT",
+  "DELEGATE_MODEL",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "DEEPSEEK_API_KEY",
+] as const;
+const workbenchSecrets: Record<string, string> = Object.fromEntries(
+  workbenchSecretNames.flatMap((name) => {
+    const value = process.env[name]?.trim();
+    return value ? [[name, value]] : [];
+  }),
+);
+// The server/router uses OPENAI_BASE_URL while Aider follows the established
+// OPENAI_API_BASE name. Mirror it only inside the isolated workbench so one
+// .env setting powers both paths.
+if (!workbenchSecrets.OPENAI_API_BASE && workbenchSecrets.OPENAI_BASE_URL) {
+  workbenchSecrets.OPENAI_API_BASE = workbenchSecrets.OPENAI_BASE_URL;
+}
+const anthropicReadiness = resolveAnthropicProviderReadiness(process.env);
+const openaiWorkbenchAuthenticationConfigured = Boolean(process.env.OPENAI_API_KEY?.trim());
+const workbenchEgressAllow = (process.env.WORKBENCH_EGRESS_ALLOW ?? "")
+  .split(",")
+  .map((host) => host.trim().toLowerCase())
+  .filter(Boolean);
+const egressAllowsHost = (host: string | null): boolean =>
+  host !== null && workbenchEgressAllow.some((entry) => host === entry || host.endsWith(`.${entry}`));
+const anthropicEndpoint = anthropicReadiness.endpoint;
+const effectiveOpenAiEndpointValue =
+  workbenchSecrets.OPENAI_API_BASE || workbenchSecrets.OPENAI_BASE_URL || "https://api.openai.com";
+const openaiReadiness = resolveOpenAiEndpointReadiness(
+  effectiveOpenAiEndpointValue,
+  providerEnvEnabled(process.env.CLAUDE_CODE_ALLOW_INSECURE_OPENAI_BASE_URL),
+);
+const openaiEndpoint = openaiReadiness.endpoint;
+const explicitOpenAiModel =
+  process.env.CLAUDE_CODE_OPENAI_MODEL?.trim() ||
+  process.env.OPENAI_CODE_MODEL?.trim() ||
+  process.env.OPENAI_MODEL?.trim();
+const sharedOpenAiModel = [process.env.DELEGATE_MODEL, process.env.COPILOT_MODEL]
+  .map((value) => value?.trim() ?? "")
+  .find((value) => value.toLowerCase().startsWith("openai/"));
+const normalizeOpenAiModel = (value: string): string =>
+  value.toLowerCase().startsWith("openai/") ? `openai/${value.slice("openai/".length)}` : `openai/${value}`;
+const openaiCodingModel = normalizeOpenAiModel(explicitOpenAiModel || sharedOpenAiModel || "gpt-5.6");
 const workbenchExecutor =
-  process.env.WORKBENCH_MODE === "docker" ? new DockerCommandExecutor() : undefined;
+  process.env.WORKBENCH_MODE === "docker"
+    ? new DockerCommandExecutor({ secrets: workbenchSecrets })
+    : undefined;
 if (workbenchExecutor) app.log.info("workbench: docker executor enabled (shell verify checks active)");
+const [claudeCliProbe, aiderCliProbe, egressProxyProbe] = workbenchExecutor
+  ? await Promise.all([
+      workbenchExecutor.probeCli("claude", "2.1.205"),
+      workbenchExecutor.probeCli("aider", "0.86.1"),
+      workbenchExecutor.probeEgressProxy(),
+    ])
+  : [
+      { available: false, version: null, error: "WORKBENCH_MODE=docker is not enabled" },
+      { available: false, version: null, error: "WORKBENCH_MODE=docker is not enabled" },
+      { available: false, error: "WORKBENCH_MODE=docker is not enabled" },
+    ];
 const executor = new WorkflowExecutor({
   db,
   bus,
@@ -300,6 +391,29 @@ const agentRuntime = new AgentRuntime({
     return null;
   },
 });
+app.addHook("onRequest", async (request, reply) => {
+  if (shuttingDown && !["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+    return reply.code(503).send({ error: "server is shutting down" });
+  }
+});
+const claudeRuntime = new ClaudeCodeRuntime({
+  db,
+  bus,
+  executor: workbenchExecutor,
+  audit: auditSink,
+  anthropicTransport: anthropicReadiness.transport,
+});
+try {
+  const copybackRecovery = await claudeRuntime.reconcilePendingCopybacks();
+  if (copybackRecovery.reconciled > 0 || copybackRecovery.orphaned > 0) {
+    app.log.info(copybackRecovery, "reconciled Claude workbench state before queue startup");
+  }
+} catch (error) {
+  // Reconciliation errors leave a ledger or running claim as a durable
+  // project/session barrier. Keep the control plane available for diagnosis
+  // instead of hiding the evidence behind a startup crash.
+  app.log.error({ err: error }, "Claude workbench state remains blocked after startup reconciliation");
+}
 
 // Credentials vault (Stage 1): AES-256-GCM under PUPPETMASTER_MASTER_KEY.
 // Unset key = vault routes disabled (503 on write) and no credential refs.
@@ -456,7 +570,9 @@ const dispatch: MissionDispatcher = async (missionId) => {
   if (!mission) throw new Error(`mission ${missionId} not found`);
   return mission.kind === "agent"
     ? agentRuntime.runMission(missionId)
-    : executor.runMission(missionId);
+    : mission.kind === "claude"
+      ? claudeRuntime.runMission(missionId)
+      : executor.runMission(missionId);
 };
 
 const runner: WorkflowRunner = REDIS_URL
@@ -467,6 +583,7 @@ app.log.info(
   { dbDriver: handle.driver, bus: REDIS_URL ? "redis" : "memory", runner: REDIS_URL ? "queue" : "inline" },
   "puppetmaster kernel ready",
 );
+await runner.start();
 
 /** Register cron schedulers for any cron-mode trigger nodes in a workflow. */
 async function scheduleCrons(workflowId: string, graph: unknown): Promise<void> {
@@ -502,6 +619,46 @@ await registerAuth(app, { db, workspaceId });
 
 // --- Security surface: credentials vault + approval policies (Stage 1) --------
 registerSecurityRoutes(app, { db, workspaceId, masterKey });
+
+registerClaudeCodeRoutes(app, {
+  db,
+  workspaceId,
+  runtime: claudeRuntime,
+  runner,
+  providers: {
+    anthropic: {
+      authenticationConfigured: anthropicReadiness.authenticationConfigured,
+      authenticationError: anthropicReadiness.authenticationError,
+      networkConfigured: anthropicReadiness.endpointError === null &&
+        egressAllowsHost(anthropicEndpoint?.host ?? null),
+      runtimeConfigured: claudeCliProbe.available && egressProxyProbe.available,
+      runtimeError: claudeCliProbe.error ?? egressProxyProbe.error,
+      detectedCliVersion: claudeCliProbe.version,
+      networkError: anthropicReadiness.endpointError,
+      defaultModel: "sonnet",
+      modelOptions: ["sonnet", "opus", "haiku"],
+      endpointHost: anthropicEndpoint?.host ?? null,
+    },
+    openai: {
+      authenticationConfigured: openaiWorkbenchAuthenticationConfigured,
+      networkConfigured: openaiReadiness.transportAllowed &&
+        egressAllowsHost(openaiEndpoint?.host ?? null),
+      runtimeConfigured: aiderCliProbe.available && egressProxyProbe.available,
+      runtimeError: aiderCliProbe.error ?? egressProxyProbe.error,
+      detectedCliVersion: aiderCliProbe.version,
+      networkError: openaiReadiness.error,
+      defaultModel: openaiCodingModel,
+      modelOptions: [...new Set([
+        openaiCodingModel,
+        "openai/gpt-5.6",
+        "openai/gpt-5.6-terra",
+        "openai/gpt-5.6-luna",
+      ])],
+      endpointHost: openaiEndpoint?.host ?? null,
+    },
+  },
+  egressAllow: workbenchEgressAllow,
+});
 
 // --- Meta --------------------------------------------------------------------
 app.get("/api/health", async () => ({ ok: true, service: "puppetmaster-server", version: "0.0.1" }));
@@ -1639,7 +1796,7 @@ app.get("/api/missions/dead-letter", async () =>
 app.get("/api/missions/:id", async (req, reply) => {
   const { id } = req.params as { id: string };
   const mission = await getMission(db, id);
-  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (!mission || mission.workspaceId !== workspaceId) return reply.code(404).send({ error: "mission not found" });
   const steps = await getMissionSteps(db, id);
   return { mission, steps };
 });
@@ -1649,20 +1806,27 @@ app.get("/api/missions/:id", async (req, reply) => {
 app.post("/api/missions/:id/cancel", async (req, reply) => {
   const { id } = req.params as { id: string };
   const mission = await getMission(db, id);
-  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (!mission || mission.workspaceId !== workspaceId) return reply.code(404).send({ error: "mission not found" });
   if (["succeeded", "failed", "cancelled"].includes(mission.status)) {
     return reply.code(409).send({ error: `mission is already ${mission.status}` });
   }
   await requestMissionCancel(db, id);
-  const immediate = mission.status === "queued" || mission.status === "awaiting_approval";
-  if (immediate) {
-    await updateMission(db, id, {
-      status: "cancelled",
-      error: "cancelled by operator",
-      finishedAt: new Date(),
-    });
-    await bus.publish({ type: "mission.finished", missionId: id, status: "cancelled", at: new Date().toISOString() });
+  const immediateRequested = mission.status === "queued" || mission.status === "awaiting_approval";
+  const processAborted = mission.kind === "claude" ? await claudeRuntime.cancel(id) : false;
+  if (immediateRequested && !processAborted) {
+    if (mission.kind === "claude") {
+      await claudeRuntime.markCancelled(id);
+    } else {
+      await updateMission(db, id, {
+        status: "cancelled",
+        error: "cancelled by operator",
+        finishedAt: new Date(),
+      });
+      await bus.publish({ type: "mission.finished", missionId: id, status: "cancelled", at: new Date().toISOString() });
+    }
   }
+  const latestMission = await getMission(db, id);
+  const cancelled = latestMission?.status === "cancelled";
   await appendAudit(db, {
     workspaceId,
     actorKind: "user",
@@ -1670,9 +1834,9 @@ app.post("/api/missions/:id/cancel", async (req, reply) => {
     actorLabel: req.authUser?.email ?? "unknown",
     missionId: id,
     action: "mission.cancel",
-    detail: { immediate },
+    detail: { immediateRequested, processAborted, cancelled },
   });
-  return reply.code(202).send({ ok: true, cancelled: immediate, cancelling: !immediate });
+  return reply.code(202).send({ ok: true, cancelled, cancelling: !cancelled });
 });
 
 /** Retry-from-step (Stage 2): re-enqueue a failed/cancelled mission; the
@@ -1681,11 +1845,16 @@ app.post("/api/missions/:id/cancel", async (req, reply) => {
 app.post("/api/missions/:id/retry", async (req, reply) => {
   const { id } = req.params as { id: string };
   const mission = await getMission(db, id);
-  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (!mission || mission.workspaceId !== workspaceId) return reply.code(404).send({ error: "mission not found" });
   if (!["failed", "cancelled"].includes(mission.status)) {
     return reply.code(409).send({ error: `only failed/cancelled missions can be retried (status: ${mission.status})` });
   }
-  await resetMissionForRetry(db, id);
+  if (mission.kind === "claude") {
+    const reset = await claudeRuntime.resetForRetry(id);
+    if (!reset.ok) return reply.code(409).send({ error: reset.reason });
+  } else {
+    await resetMissionForRetry(db, id);
+  }
   await appendAudit(db, {
     workspaceId,
     actorKind: "user",
@@ -1695,7 +1864,50 @@ app.post("/api/missions/:id/retry", async (req, reply) => {
     action: "mission.retry",
     detail: { retryCount: mission.retryCount + 1 },
   });
-  await runner.enqueue(id);
+  try {
+    await runner.enqueue(id);
+  } catch (err) {
+    if (mission.kind !== "claude") throw err;
+    const run = await getClaudeRunByMission(db, id);
+    if (!run) throw err;
+    const { completion, finishedAt } = await terminalizeClaudeQueueFailure(db, {
+      runId: run.id,
+      sessionId: run.sessionId,
+      missionId: id,
+      error: err,
+      prefix: "retry queue handoff failed",
+      expectedStatuses: ["queued"],
+    });
+    if (completion.transitioned) {
+      if (
+        (run.provider === "anthropic" && run.backend === "claude") ||
+        (run.provider === "openai" && run.backend === "aider")
+      ) {
+        await bus.publish({
+          type: "claude.run.finished",
+          sessionId: run.sessionId,
+          runId: run.id,
+          missionId: id,
+          provider: run.provider,
+          backend: run.backend,
+          status: "failed",
+          at: finishedAt.toISOString(),
+        }).catch(() => {});
+      }
+      await bus.publish({
+        type: "mission.finished",
+        missionId: id,
+        status: "failed",
+        at: finishedAt.toISOString(),
+      }).catch(() => {});
+    }
+    return reply.code(503).send({
+      error: "Coding retry could not be queued; the mission was marked failed and can be retried again",
+      sessionId: run.sessionId,
+      runId: run.id,
+      missionId: id,
+    });
+  }
   return reply.code(202).send({ ok: true, missionId: id });
 });
 
@@ -1704,7 +1916,7 @@ app.post("/api/missions/:id/retry", async (req, reply) => {
 app.post("/api/missions/:id/explain", async (req, reply) => {
   const { id } = req.params as { id: string };
   const mission = await getMission(db, id);
-  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (!mission || mission.workspaceId !== workspaceId) return reply.code(404).send({ error: "mission not found" });
   if (mission.status !== "failed") {
     return reply.code(409).send({ error: `mission is ${mission.status}, not failed` });
   }
@@ -1718,7 +1930,7 @@ app.post("/api/missions/:id/explain", async (req, reply) => {
 app.get("/api/missions/:id/replay", async (req, reply) => {
   const { id } = req.params as { id: string };
   const mission = await getMission(db, id);
-  if (!mission) return reply.code(404).send({ error: "mission not found" });
+  if (!mission || mission.workspaceId !== workspaceId) return reply.code(404).send({ error: "mission not found" });
   const steps = await getMissionSteps(db, id);
   if (mission.kind !== "workflow" || !mission.workflowVersionId) {
     // Agent ticks are linear: the ordered step log is already the lineage.
@@ -1745,23 +1957,34 @@ app.get("/api/missions/:id/replay", async (req, reply) => {
 app.get("/api/approvals", async (req) => {
   const { status } = req.query as { status?: string };
   const rows = await listApprovals(db, status);
+  const scoped = (
+    await Promise.all(rows.map(async (approval) => ({ approval, mission: await getMission(db, approval.missionId) })))
+  ).filter(({ mission }) => mission?.workspaceId === workspaceId);
   // Workshop WP4 (org layer §1): the inbox judges evidence, not assertions —
   // verify-gate escalations carry their check runs alongside the prompt.
   return Promise.all(
-    rows.map(async (a: { id: string }) => ({
-      ...a,
-      evidence: await listEvidenceForApproval(db, a.id),
+    scoped.map(async ({ approval }) => ({
+      ...approval,
+      evidence: await listEvidenceForApproval(db, approval.id),
     })),
   );
 });
 
 app.post("/api/approvals/:id", async (req, reply) => {
   const { id } = req.params as { id: string };
-  const body = (req.body ?? {}) as { approved?: boolean };
+  const decision = ApprovalDecisionInput.safeParse(req.body);
+  if (!decision.success) {
+    return reply.code(400).send({ error: "approved must be provided as an explicit boolean" });
+  }
   const approval = await getApproval(db, id);
   if (!approval) return reply.code(404).send({ error: "approval not found" });
-  const approved = body.approved !== false;
-  await resolveApproval(db, id, approved);
+  const approvalMission = await getMission(db, approval.missionId);
+  if (!approvalMission || approvalMission.workspaceId !== workspaceId) {
+    return reply.code(404).send({ error: "approval not found" });
+  }
+  const approved = decision.data.approved;
+  const resolved = await resolveApproval(db, id, approved);
+  if (!resolved) return reply.code(409).send({ error: "approval has already been resolved" });
   await appendAudit(db, {
     workspaceId,
     actorKind: "user",
@@ -1785,21 +2008,109 @@ app.post("/api/approvals/:id", async (req, reply) => {
   // concurrently with itself.
   const gated = await getMission(db, approval.missionId);
   if (gated?.status === "awaiting_approval" || gated?.status === "queued") {
-    await runner.enqueue(approval.missionId);
+    try {
+      await runner.enqueue(approval.missionId);
+    } catch (err) {
+      const queueError = err instanceof Error ? err.message : String(err);
+      const finishedAt = new Date();
+      if (gated.kind === "claude") {
+        const run = await getClaudeRunByMission(db, approval.missionId);
+        if (run && (run.status === "queued" || run.status === "awaiting_approval")) {
+          const completion = await finishClaudeRun(db, {
+            runId: run.id,
+            sessionId: run.sessionId,
+            missionId: approval.missionId,
+            status: "failed",
+            result: null,
+            error: `queue handoff failed: ${queueError.slice(0, 1_000)}`,
+            finishedAt,
+            expectedStatuses: [run.status],
+          });
+          if (completion.transitioned) {
+            if (
+              (run.provider === "anthropic" && run.backend === "claude") ||
+              (run.provider === "openai" && run.backend === "aider")
+            ) {
+              await bus.publish({
+                type: "claude.run.finished",
+                sessionId: run.sessionId,
+                runId: run.id,
+                missionId: approval.missionId,
+                provider: run.provider,
+                backend: run.backend,
+                status: "failed",
+                at: finishedAt.toISOString(),
+              }).catch(() => {});
+            }
+            await bus.publish({
+              type: "mission.finished",
+              missionId: approval.missionId,
+              status: "failed",
+              at: finishedAt.toISOString(),
+            }).catch(() => {});
+          }
+        } else if (!run) {
+          await updateMission(db, approval.missionId, {
+            status: "failed",
+            error: "queue handoff failed for Claude mission without a durable run",
+            finishedAt,
+          });
+          await bus.publish({
+            type: "mission.finished",
+            missionId: approval.missionId,
+            status: "failed",
+            at: finishedAt.toISOString(),
+          }).catch(() => {});
+        }
+      } else {
+        await updateMission(db, approval.missionId, {
+          status: "failed",
+          error: `queue handoff failed: ${queueError.slice(0, 1_000)}`,
+          finishedAt,
+        });
+        await bus.publish({
+          type: "mission.finished",
+          missionId: approval.missionId,
+          status: "failed",
+          at: finishedAt.toISOString(),
+        }).catch(() => {});
+      }
+      app.log.error({ err, approvalId: id, missionId: approval.missionId }, "approval resolved but mission queue handoff failed");
+      return reply.code(503).send({ error: "approval was recorded, but the mission could not be queued" });
+    }
   }
   return { ok: true, approved };
 });
 
 // --- Live event stream -------------------------------------------------------
 let wsClients = 0;
+const eventMissionWorkspaces = new Map<string, string | null>();
+const eventBelongsToWorkspace = async (event: import("@puppetmaster/kernel").BusEvent): Promise<boolean> => {
+  if (event.type === "ops.vitals") return event.workspaceId === workspaceId;
+  if (event.type === "audit.appended") return event.workspaceId === workspaceId;
+  if (!("missionId" in event) || typeof event.missionId !== "string") return false;
+  let owner = eventMissionWorkspaces.get(event.missionId);
+  if (owner === undefined) {
+    owner = (await getMission(db, event.missionId))?.workspaceId ?? null;
+    if (eventMissionWorkspaces.size >= 10_000) {
+      const oldest = eventMissionWorkspaces.keys().next().value as string | undefined;
+      if (oldest) eventMissionWorkspaces.delete(oldest);
+    }
+    eventMissionWorkspaces.set(event.missionId, owner);
+  }
+  return owner === workspaceId;
+};
 app.get("/api/events", { websocket: true }, (socket) => {
   wsClients++;
+  let outbound = Promise.resolve();
   const unsubscribe = bus.subscribe((event) => {
-    try {
-      socket.send(JSON.stringify(event));
-    } catch {
-      /* socket closing */
-    }
+    outbound = outbound
+      .then(async () => {
+        if (await eventBelongsToWorkspace(event)) socket.send(JSON.stringify(event));
+      })
+      .catch(() => {
+        /* socket closing or workspace lookup failed */
+      });
   });
   socket.on("close", () => {
     wsClients--;
@@ -1842,6 +2153,7 @@ const vitalsTimer = setInterval(() => {
     }
     const sample: Vitals = {
       type: "ops.vitals",
+      workspaceId,
       at: new Date().toISOString(),
       cpuPct: Math.round(cpuPct * 10) / 10,
       rssMb: Math.round(mem.rss / 1048576),
@@ -1863,18 +2175,37 @@ vitalsTimer.unref?.();
 app.get("/api/ops/vitals", async () => ({ samples: vitalsHistory }));
 
 // --- Lifecycle ---------------------------------------------------------------
-async function shutdown() {
-  app.log.info("shutting down");
-  auditUnsub();
-  otelUnsub?.();
-  await runner.close();
-  for (const conn of mcpConnections.values()) await conn.close().catch(() => {});
-  await bus.close?.();
-  await handle.close();
-  await app.close();
-  process.exit(0);
+let shutdownPromise: Promise<void> | null = null;
+function shutdown(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  clearInterval(vitalsTimer);
+  app.log.info("shutting down: stopping intake and draining managed executions");
+  shutdownPromise = (async () => {
+    // Stop HTTP/queue intake first, but keep DB, event bus, audit projections,
+    // and MCP connections alive until every managed execution has terminated.
+    const httpClosed = app.close();
+    claudeRuntime.beginShutdown();
+    await Promise.all([
+      httpClosed,
+      runner.close(),
+      claudeRuntime.drain(),
+    ]);
+    auditUnsub();
+    otelUnsub?.();
+    for (const conn of mcpConnections.values()) await conn.close().catch(() => {});
+    await bus.close?.();
+    await handle.close();
+  })();
+  return shutdownPromise;
 }
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+const signalShutdown = () => {
+  void shutdown().catch((error) => {
+    process.exitCode = 1;
+    app.log.error({ err: error }, "shutdown could not prove managed execution termination");
+  });
+};
+process.once("SIGINT", signalShutdown);
+process.once("SIGTERM", signalShutdown);
 
 await app.listen({ port: PORT, host: HOST });

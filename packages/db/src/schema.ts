@@ -1,5 +1,6 @@
 import {
   boolean,
+  check,
   integer,
   jsonb,
   pgTable,
@@ -9,6 +10,7 @@ import {
   unique,
   uuid,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 /**
  * Drizzle schema for the M1 persistence layer (ARCHITECTURE.md §4). The DDL is
@@ -499,6 +501,193 @@ export const verifyChecks = pgTable("verify_checks", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Durable Claude Code conversation. Claude's own session id is recorded after
+ *  the first init event; Puppetmaster owns the workspace/project boundary. */
+export const claudeSessions = pgTable(
+  "claude_sessions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    provider: text("provider").notNull().default("anthropic"),
+    backend: text("backend").notNull().default("claude"),
+    title: text("title").notNull(),
+    claudeSessionId: text("claude_session_id"),
+    status: text("status").notNull().default("active"),
+    model: text("model").notNull(),
+    effort: text("effort"),
+    permissionMode: text("permission_mode").notNull().default("plan"),
+    config: jsonb("config").notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    providerBackend: check(
+      "claude_sessions_provider_backend_check",
+      sql`(${t.provider} = 'anthropic' AND ${t.backend} = 'claude') OR (${t.provider} = 'openai' AND ${t.backend} = 'aider')`,
+    ),
+    providerModel: check(
+      "claude_sessions_provider_model_check",
+      sql`length(btrim(${t.model})) BETWEEN 1 AND 200 AND ((${t.provider} = 'anthropic' AND lower(${t.model}) NOT LIKE 'openai/%') OR (${t.provider} = 'openai' AND ${t.model} LIKE 'openai/%' AND length(btrim(substr(${t.model}, 8))) > 0))`,
+    ),
+    canonicalModel: check(
+      "claude_sessions_model_canonical_check",
+      sql`${t.model} = btrim(${t.model}) AND (${t.provider} <> 'openai' OR ${t.model} = 'openai/' || btrim(substr(${t.model}, 8)))`,
+    ),
+  }),
+);
+
+/** One user prompt / Claude response. Each turn is also a Puppetmaster mission
+ *  so approvals, cancellation, audit, and observability remain shared. */
+export const claudeRuns = pgTable(
+  "claude_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: uuid("session_id")
+      .notNull()
+      .references(() => claudeSessions.id, { onDelete: "cascade" }),
+    missionId: uuid("mission_id")
+      .notNull()
+      .references(() => missions.id, { onDelete: "cascade" })
+      .unique(),
+    provider: text("provider").notNull().default("anthropic"),
+    backend: text("backend").notNull().default("claude"),
+    turnNumber: integer("turn_number").notNull(),
+    mode: text("mode").notNull(),
+    prompt: text("prompt").notNull(),
+    status: text("status").notNull().default("queued"),
+    /** Monotonic claim generation. A worker may commit terminal state only for
+     *  the exact generation returned by its queued -> running transition. */
+    executionGeneration: integer("execution_generation").notNull().default(0),
+    model: text("model").notNull(),
+    effort: text("effort"),
+    permissionMode: text("permission_mode").notNull(),
+    config: jsonb("config").notNull().default({}),
+    result: jsonb("result"),
+    resultText: text("result_text"),
+    isError: boolean("is_error"),
+    usage: jsonb("usage"),
+    costUsd: real("cost_usd"),
+    durationMs: integer("duration_ms"),
+    durationApiMs: integer("duration_api_ms"),
+    numTurns: integer("num_turns"),
+    error: text("error"),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqTurn: unique("claude_runs_session_turn_unique").on(t.sessionId, t.turnNumber),
+    providerBackend: check(
+      "claude_runs_provider_backend_check",
+      sql`(${t.provider} = 'anthropic' AND ${t.backend} = 'claude') OR (${t.provider} = 'openai' AND ${t.backend} = 'aider')`,
+    ),
+    providerModel: check(
+      "claude_runs_provider_model_check",
+      sql`length(btrim(${t.model})) BETWEEN 1 AND 200 AND ((${t.provider} = 'anthropic' AND lower(${t.model}) NOT LIKE 'openai/%') OR (${t.provider} = 'openai' AND ${t.model} LIKE 'openai/%' AND length(btrim(substr(${t.model}, 8))) > 0))`,
+    ),
+    canonicalModel: check(
+      "claude_runs_model_canonical_check",
+      sql`${t.model} = btrim(${t.model}) AND (${t.provider} <> 'openai' OR ${t.model} = 'openai/' || btrim(substr(${t.model}, 8)))`,
+    ),
+    nonnegativeExecutionGeneration: check(
+      "claude_runs_execution_generation_check",
+      sql`${t.executionGeneration} >= 0`,
+    ),
+  }),
+);
+
+/** Crash-recovery ledger for copying a disposable workbench execution back to
+ *  its durable project volume. The execution identity is deliberately stored
+ *  in full (a lowercase SHA-256 digest), and every row belongs to one exact
+ *  Claude run claim generation. Runtime code advances this journal only via
+ *  the guarded repository helpers in workbench-copyback-repo.ts. */
+export const workbenchCopybacks = pgTable(
+  "workbench_copybacks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    claudeRunId: uuid("claude_run_id")
+      .notNull()
+      .references(() => claudeRuns.id, { onDelete: "cascade" }),
+    executionId: text("execution_id").notNull(),
+    executionIdentitySha256: text("execution_identity_sha256").notNull(),
+    executionGeneration: integer("execution_generation").notNull(),
+    state: text("state").notNull().default("intent"),
+    /** Pre-mutation project snapshot used to prove or perform rollback. */
+    baseline: jsonb("baseline").notNull(),
+    /** Prepared post-execution snapshot. It is durable before files mutate. */
+    candidate: jsonb("candidate"),
+    /** Authenticated filesystem-commit/rollback acknowledgement. */
+    receipt: jsonb("receipt"),
+    /** Terminal Claude result retained until the DB commit can be reconciled. */
+    pendingCompletion: jsonb("pending_completion"),
+    error: text("error"),
+    filesCommittedAt: timestamp("files_committed_at", { withTimezone: true }),
+    dbCommittedAt: timestamp("db_committed_at", { withTimezone: true }),
+    rolledBackAt: timestamp("rolled_back_at", { withTimezone: true }),
+    quarantinedAt: timestamp("quarantined_at", { withTimezone: true }),
+    cleanedAt: timestamp("cleaned_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqRunGeneration: unique("workbench_copybacks_run_generation_unique").on(
+      t.claudeRunId,
+      t.executionGeneration,
+    ),
+    uniqExecutionId: unique("workbench_copybacks_execution_id_unique").on(t.executionId),
+    uniqExecutionIdentity: unique("workbench_copybacks_execution_identity_unique").on(
+      t.executionIdentitySha256,
+    ),
+    validState: check(
+      "workbench_copybacks_state_check",
+      sql`${t.state} IN ('intent', 'files_committed', 'db_committed', 'rolled_back', 'quarantined', 'cleaned')`,
+    ),
+    positiveGeneration: check(
+      "workbench_copybacks_execution_generation_check",
+      sql`${t.executionGeneration} > 0`,
+    ),
+    fullExecutionIdentity: check(
+      "workbench_copybacks_execution_identity_check",
+      sql`${t.executionIdentitySha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    canonicalExecutionId: check(
+      "workbench_copybacks_execution_id_check",
+      sql`${t.executionId} = btrim(${t.executionId}) AND length(${t.executionId}) BETWEEN 1 AND 300`,
+    ),
+  }),
+);
+
+  /** Bounded line-oriented Claude process event log. `payload` is a decoded
+   *  best effort while `raw` preserves inspectable malformed/future records. */
+export const claudeEvents = pgTable(
+  "claude_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: uuid("session_id")
+      .notNull()
+      .references(() => claudeSessions.id, { onDelete: "cascade" }),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => claudeRuns.id, { onDelete: "cascade" }),
+    sequence: integer("sequence").notNull(),
+    stream: text("stream").notNull(),
+    eventType: text("event_type").notNull(),
+    raw: text("raw").notNull().default(""),
+    payload: jsonb("payload"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({ uniqSequence: unique("claude_events_session_sequence_unique").on(t.sessionId, t.sequence) }),
+);
+
 /** Project-scoped traceability graph. Endpoints are polymorphic references to
  *  either project_artifacts or verify_checks, so repository validation (rather
  *  than a cross-table foreign key) enforces endpoint ownership. */
@@ -569,6 +758,10 @@ export const schema = {
   mcpServers,
   routerProfiles,
   projects,
+  claudeSessions,
+  claudeRuns,
+  workbenchCopybacks,
+  claudeEvents,
   projectArtifacts,
   verifyChecks,
   projectTraceLinks,

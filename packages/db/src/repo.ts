@@ -257,10 +257,12 @@ export async function listApprovals(db: Db, status?: string) {
 }
 
 export async function resolveApproval(db: Db, id: string, approved: boolean) {
-  await db
+  const [row] = await db
     .update(approvals)
     .set({ status: approved ? "approved" : "rejected", decidedAt: new Date() })
-    .where(eq(approvals.id, id));
+    .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+    .returning();
+  return row ?? null;
 }
 
 /** The approval a mission is currently blocked on for a given node, if resolved. */

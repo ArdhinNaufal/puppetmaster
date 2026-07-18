@@ -12,3 +12,5 @@ export * from "./ops-repo.js";
 export * from "./mcp-repo.js";
 export * from "./router-repo.js";
 export * from "./project-repo.js";
+export * from "./claude-repo.js";
+export * from "./workbench-copyback-repo.js";

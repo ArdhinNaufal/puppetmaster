@@ -1,5 +1,7 @@
 /** Thin typed client for the Puppetmaster server REST API. */
 
+import type { ClaudeEvent, ClaudeRun, ClaudeSession } from "@puppetmaster/shared";
+
 export type NodeKind = "trigger" | "action" | "logic" | "code" | "agent" | "approval" | "verify";
 
 /** Verify-check names (mirror of shared VerifyCheckName) — the verify-node
@@ -100,15 +102,21 @@ export interface LintIssue {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+    /** Parsed error payload, retained so callers can recover durable IDs. */
+    public body: unknown = null,
+  ) {
     super(message);
+    this.name = "ApiError";
   }
 }
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? res.statusText);
+    throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? res.statusText, body);
   }
   return res.json() as Promise<T>;
 }
@@ -541,6 +549,212 @@ export const projectApi = {
   },
 };
 
+// --- Claude Code control plane ---------------------------------------------------
+
+export type CodingProvider = "anthropic" | "openai";
+export type CodingBackend = "claude" | "aider";
+
+export interface CodingProviderCapabilities {
+  plan: boolean;
+  execute: boolean;
+  resume: boolean;
+  effort: boolean;
+  maxTurns: boolean;
+  maxBudgetUsd: boolean;
+  structuredEvents: boolean;
+}
+
+export interface CodingProviderRuntime {
+  id: CodingProvider;
+  label: string;
+  backend: CodingBackend;
+  authenticationConfigured: boolean;
+  networkConfigured: boolean;
+  runtimeConfigured: boolean;
+  detectedCliVersion: string | null;
+  ready: boolean;
+  unavailableReason: string | null;
+  defaultModel: string | null;
+  modelOptions: string[];
+  pinnedCliVersion: string;
+  transport: string;
+  capabilities: CodingProviderCapabilities;
+  approvalBoundary: string;
+}
+
+export type ClaudeSessionRow = Omit<ClaudeSession, "createdAt" | "updatedAt"> & {
+  provider: CodingProvider;
+  backend: CodingBackend;
+  createdAt: string;
+  updatedAt: string;
+};
+export type ClaudeRunRow = Omit<ClaudeRun, "createdAt" | "updatedAt" | "startedAt" | "finishedAt"> & {
+  provider: CodingProvider;
+  backend: CodingBackend;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+};
+export type ClaudeEventRow = Omit<ClaudeEvent, "createdAt"> & { createdAt: string };
+
+export interface ClaudeCatalogModel {
+  key: string;
+  name: string;
+  description: string;
+  ids: { claudeApi: string; claudeApiAlias: string; amazonBedrock: string; googleCloud: string };
+  pricing: {
+    currency: string;
+    unit: string;
+    input?: number;
+    output?: number;
+    current?: { input: number; output: number; effectiveThrough: string; note: string };
+    scheduledStandard?: { input: number; output: number; effectiveFrom: string };
+  };
+  contextTokens: number;
+  maxOutputTokens: number;
+  comparativeLatency: string;
+  thinking: {
+    adaptiveThinking: boolean;
+    extendedThinking: boolean;
+    adaptiveThinkingAlwaysOn?: boolean;
+    canDisableThinking?: boolean;
+    providerCaveat?: string;
+    effortLevels: string[];
+    defaultEffort: string | null;
+  };
+  cutoffs: { reliableKnowledge: string; trainingData: string };
+}
+
+export interface ClaudeCodeCatalog {
+  schemaVersion: number;
+  product: string;
+  asOf: string;
+  trustBoundary: { currentBehaviorAuthority: string; captureAuthority: string; rawPromptTextIncluded: boolean; captureUsage: string };
+  sources: { id: string; authority: string; publisher: string; title: string; url: string }[];
+  models: ClaudeCatalogModel[];
+  aliases: { alias: string; kind: string; behavior: string; currentResolution: unknown }[];
+  tools: {
+    sourceAuthority: string;
+    sourceId: string;
+    permissionColumnMeaning: string;
+    current: { name: string; category: string; permissionRequiredByDefault: boolean; summary: string; availability?: string }[];
+    captureMappings: {
+      sourceAuthority: string;
+      sourcePath: string;
+      sourceBlobSha: string;
+      note: string;
+      entries: { captured: string; current: string[]; relation: string; note?: string }[];
+    };
+  };
+  permissionModes: {
+    id: string;
+    displayLabel: string;
+    runsWithoutAsking: string;
+    bestFor: string;
+    controlPlanePolicy: string;
+    controlPlaneReason: string;
+  }[];
+  extensions: { id: string; name: string; summary: string; typicalLocation: string; sourceAuthority: string; sourceId: string }[];
+  provenance: {
+    authority: string;
+    repository: string;
+    repositoryUrl: string;
+    repositoryLicense: string;
+    licenseCaveat: string;
+    requestedPath: string;
+    snapshotCommit: string;
+    snapshotCommitDate: string;
+    snapshotCommitUrl: string;
+    snapshotTreeUrl: string;
+    warning: string;
+    countingMethod: string;
+    rawPromptTextIncluded: boolean;
+    documents: {
+      path: string;
+      blobSha: string;
+      characterCount: number;
+      lineCount: number;
+      relevance: string;
+      summary: string;
+      url: string;
+    }[];
+  };
+  runtime: {
+    workbenchEnabled: boolean;
+    providers: Record<CodingProvider, CodingProviderRuntime>;
+    egressAllow?: string[];
+    /** Legacy Anthropic-only runtime fields retained while older servers roll forward. */
+    authenticationConfigured?: boolean;
+    pinnedCliVersion?: string;
+    transport?: string;
+    granularToolApprovals: boolean;
+    approvalBoundary?: string;
+  };
+}
+
+export interface ClaudeRunInput {
+  prompt: string;
+  mode: "plan" | "execute";
+  model?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max" | null;
+  permissionMode?: "acceptEdits";
+  maxTurns?: number;
+  maxBudgetUsd?: number | null;
+  timeoutMs?: number;
+}
+
+export interface ClaudeNewSessionInput extends ClaudeRunInput {
+  projectId: string;
+  title?: string;
+  /** Omitted remains Anthropic for backward compatibility. */
+  provider?: CodingProvider;
+}
+
+export interface ClaudeWorkbench {
+  status: "absent" | "running" | "stopped";
+  gitStatus: string;
+  diffStat: string;
+  diff: string;
+  error: string | null;
+}
+
+export const claudeCodeApi = {
+  catalog: () => fetch("/api/claude-code/catalog").then(json<ClaudeCodeCatalog>),
+  sessions: () => fetch("/api/claude-code/sessions").then(json<ClaudeSessionRow[]>),
+  get: (id: string) =>
+    fetch(`/api/claude-code/sessions/${id}`).then(
+      json<{ session: ClaudeSessionRow; runs: ClaudeRunRow[] }>,
+    ),
+  events: (
+    id: string,
+    opts: { after?: number; before?: number; limit?: number; tail?: boolean } = {},
+  ) => {
+    const query = new URLSearchParams();
+    if (opts.after !== undefined) query.set("after", String(opts.after));
+    if (opts.before !== undefined) query.set("before", String(opts.before));
+    if (opts.limit !== undefined) query.set("limit", String(opts.limit));
+    if (opts.tail !== undefined) query.set("tail", String(opts.tail));
+    return fetch(`/api/claude-code/sessions/${id}/events?${query}`).then(json<ClaudeEventRow[]>);
+  },
+  workbench: (id: string) =>
+    fetch(`/api/claude-code/sessions/${id}/workbench`).then(json<ClaudeWorkbench>),
+  create: (input: ClaudeNewSessionInput) =>
+    post("/api/claude-code/sessions", input).then(
+      json<{ session: ClaudeSessionRow; run: ClaudeRunRow; missionId: string }>,
+    ),
+  continue: (id: string, input: ClaudeRunInput) =>
+    post(`/api/claude-code/sessions/${id}/messages`, input).then(
+      json<{ session: ClaudeSessionRow; run: ClaudeRunRow; missionId: string }>,
+    ),
+  update: (id: string, patch: { title?: string; status?: "active" | "archived" }) =>
+    fetch(`/api/claude-code/sessions/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(json<ClaudeSessionRow>),
+};
+
 // --- Evals & observability (Stage 5) ----------------------------------------------
 
 export interface EvalRun {
@@ -672,6 +886,7 @@ export const mcpApi = {
 /** Kernel resource sample (docs/PROCESS-WATCH.md R-VITALS). */
 export interface OpsVitals {
   type: "ops.vitals";
+  workspaceId: string;
   at: string;
   cpuPct: number;
   rssMb: number;
@@ -687,6 +902,7 @@ export interface OpsVitals {
 /** Safe llm.call/tool.call summary for the live process log. */
 export interface AuditAppended {
   type: "audit.appended";
+  workspaceId: string;
   at: string;
   action: string;
   actorKind: "user" | "agent" | "system";
@@ -707,6 +923,9 @@ export type BusEvent =
   | { type: "approval.requested"; missionId: string; nodeId: string; approvalId: string; prompt: string; at: string }
   | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string }
   | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string }
+  | { type: "claude.run.started"; sessionId: string; runId: string; missionId: string; model: string; mode: "plan" | "execute"; provider?: CodingProvider; backend?: CodingBackend; at: string }
+  | { type: "claude.event"; sessionId: string; runId: string; missionId: string; seq: number; stream: "stdout" | "stderr" | "system"; eventType: string; provider?: CodingProvider; backend?: CodingBackend; text?: string; payload?: unknown; at: string }
+  | { type: "claude.run.finished"; sessionId: string; runId: string; missionId: string; status: "succeeded" | "failed" | "cancelled"; provider?: CodingProvider; backend?: CodingBackend; costUsd?: number; at: string }
   | OpsVitals
   | AuditAppended;
 

@@ -29,6 +29,15 @@ export interface DelegateResult {
   result: string;
   /** Total cost in USD the CLI reported for the session, if present. */
   costUsd?: number;
+  /** Claude Code's durable conversation id, when the adapter reports one. */
+  sessionId?: string;
+  /** End-to-end and API-only durations reported by Claude Code. */
+  durationMs?: number;
+  durationApiMs?: number;
+  /** Per-model usage/cost breakdown from recent Claude Code result events. */
+  modelUsage?: unknown;
+  /** Tool calls the headless session could not authorize. */
+  permissionDenials?: unknown;
   /** Files the CLI reported editing, when it names them (aider does). */
   filesChanged?: string[];
   /** Why `ok` is false, when it is. */
@@ -41,12 +50,32 @@ export interface DelegateExec {
   stderr: string;
 }
 
+export type ClaudePermissionMode = "plan" | "acceptEdits" | "dontAsk";
+export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface CodingCliOptions {
+  maxTurns: number;
+  model?: string;
+  permissionMode?: ClaudePermissionMode;
+  effort?: ClaudeEffort;
+  maxBudgetUsd?: number;
+  sessionId?: string;
+  resume?: boolean;
+  sessionName?: string;
+  configDir?: string;
+  includePartialMessages?: boolean;
+  includeHookEvents?: boolean;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  additionalDirectories?: string[];
+}
+
 export interface CodingCliAdapter {
   /** Stable adapter id, also the value of DelegateResult.cli. */
   readonly name: string;
   /** Build the shell command to run headless in the workbench. `maxTurns` is
    *  advisory — an adapter whose CLI has no turn cap may ignore it. */
-  buildCommand(task: string, opts: { maxTurns: number }): string;
+  buildCommand(task: string, opts: CodingCliOptions): string;
   /** Parse the CLI's stdout (+ exit context) into a DelegateResult. */
   parse(stdout: string, exec: DelegateExec): DelegateResult;
 }
@@ -54,6 +83,50 @@ export interface CodingCliAdapter {
 /** POSIX single-quote for safe interpolation into `sh -c`. */
 function shQuote(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
+}
+
+const AIDER_REPO_CONTROL_FILES = [
+  ".env",
+  ".aider.conf.yml",
+  ".aider.conf.yaml",
+  ".aider.model.settings.yml",
+  ".aider.model.metadata.json",
+  ".aiderignore",
+] as const;
+
+/** Run Aider in a disposable repository copy with repository-owned Aider and
+ * dotenv controls removed. Docker execution applies approved successful edits
+ * later from a secret-free trusted container; this command never sees the
+ * durable project volume writable. */
+export function isolateAiderRepositoryCommand(
+  command: string,
+  executionId: string,
+  _mode: "plan" | "execute",
+): string {
+  const token = executionId.replace(/[^A-Za-z0-9]/g, "");
+  if (!token) throw new Error("Aider isolation requires a stable execution id");
+  const turnRoot = `/tmp/puppetmaster-aider-turn-${token}`;
+  // This key authenticates journals inside the disposable provider scratch
+  // only. Durable copy-back uses a separate random key held in Docker volume
+  // metadata and never supplied to the provider container.
+  const scratchJournalKey = `scratch-${token}`;
+  const controls = AIDER_REPO_CONTROL_FILES.map(shQuote).join(" ");
+  const apply = _mode === "execute"
+    ? `if [ "$code" -eq 0 ]; then ` +
+      `puppetmaster-sync apply "$turn_root/repo" /workbench ${shQuote(token)} - ${shQuote(scratchJournalKey)} || exit $?; ` +
+      `fi; `
+    : "";
+  return (
+    `turn_root=${shQuote(turnRoot)}; ` +
+    `cleanup_aider_turn() { cd /; ` +
+    `puppetmaster-sync recover /workbench ${shQuote(token)} ${shQuote(scratchJournalKey)} >/dev/null 2>&1 || true; ` +
+    `rm -rf -- "$turn_root"; }; ` +
+    `trap cleanup_aider_turn EXIT; trap 'exit 143' HUP INT TERM; ` +
+    `rm -rf -- "$turn_root"; mkdir -p -- "$turn_root/repo"; ` +
+    `cp -a -- . "$turn_root/repo" || exit $?; ` +
+    `cd "$turn_root/repo" || exit $?; rm -rf -- ${controls}; ` +
+    `${command}; code=$?; ${apply}exit "$code"`
+  );
 }
 
 // --- Claude Code (Anthropic) -------------------------------------------------
@@ -89,6 +162,12 @@ export function parseClaudeStream(stdout: string, exec?: DelegateExec): Delegate
   const numTurns = typeof resultEvent.num_turns === "number" ? resultEvent.num_turns : undefined;
   const costUsd =
     typeof resultEvent.total_cost_usd === "number" ? resultEvent.total_cost_usd : undefined;
+  const sessionId = typeof resultEvent.session_id === "string" ? resultEvent.session_id : undefined;
+  const durationMs = typeof resultEvent.duration_ms === "number" ? resultEvent.duration_ms : undefined;
+  const durationApiMs =
+    typeof resultEvent.duration_api_ms === "number" ? resultEvent.duration_api_ms : undefined;
+  const modelUsage = resultEvent.modelUsage ?? resultEvent.model_usage;
+  const permissionDenials = resultEvent.permission_denials;
 
   return {
     cli: "claude",
@@ -97,6 +176,11 @@ export function parseClaudeStream(stdout: string, exec?: DelegateExec): Delegate
     usage: resultEvent.usage,
     result: text || subtype || "",
     costUsd,
+    sessionId,
+    durationMs,
+    durationApiMs,
+    ...(modelUsage === undefined ? {} : { modelUsage }),
+    ...(permissionDenials === undefined ? {} : { permissionDenials }),
     ...(isError ? { reason: subtype ?? "the CLI reported an error result" } : {}),
     // exec is accepted for a uniform signature; claude's own result event is
     // authoritative for ok/reason, so we don't override it from the exit code.
@@ -104,11 +188,64 @@ export function parseClaudeStream(stdout: string, exec?: DelegateExec): Delegate
   };
 }
 
+/** Build the current Claude Code non-interactive command. Every variable value
+ *  is quoted here so the opaque delegate and durable session runtime share the
+ *  same command-injection boundary. */
+export function buildClaudeCommand(task: string, opts: CodingCliOptions): string {
+  // Managed runs must not inherit commit-able project/local settings, hooks,
+  // plugins, or MCP servers. The explicit settings object is still supplied so
+  // hook execution remains disabled even if Claude's empty-source semantics
+  // change in a future CLI release.
+  const managedSettings = JSON.stringify({
+    disableAllHooks: true,
+    hooks: {},
+    enabledPlugins: {},
+  });
+  const managedMcp = JSON.stringify({ mcpServers: {} });
+  const args = [
+    "claude",
+    "-p",
+    shQuote(task),
+    "--output-format stream-json",
+    "--verbose",
+    `--max-turns ${Math.max(1, Math.trunc(opts.maxTurns))}`,
+    `--permission-mode ${shQuote(opts.permissionMode ?? "acceptEdits")}`,
+    `--setting-sources ${shQuote("")}`,
+    `--settings ${shQuote(managedSettings)}`,
+    "--strict-mcp-config",
+    `--mcp-config ${shQuote(managedMcp)}`,
+  ];
+  if (opts.model?.trim()) args.push(`--model ${shQuote(opts.model.trim())}`);
+  if (opts.effort) args.push(`--effort ${shQuote(opts.effort)}`);
+  if (typeof opts.maxBudgetUsd === "number" && Number.isFinite(opts.maxBudgetUsd)) {
+    args.push(`--max-budget-usd ${Math.max(0.01, opts.maxBudgetUsd)}`);
+  }
+  if (opts.sessionId?.trim()) {
+    args.push(`${opts.resume ? "--resume" : "--session-id"} ${shQuote(opts.sessionId.trim())}`);
+  }
+  if (!opts.resume && opts.sessionName?.trim()) {
+    args.push(`--name ${shQuote(opts.sessionName.trim())}`);
+  }
+  if (opts.includePartialMessages) args.push("--include-partial-messages");
+  if (opts.includeHookEvents) args.push("--include-hook-events");
+  if (opts.allowedTools?.length) {
+    args.push(`--allowedTools ${shQuote(opts.allowedTools.join(","))}`);
+  }
+  if (opts.disallowedTools?.length) {
+    args.push(`--disallowedTools ${shQuote(opts.disallowedTools.join(","))}`);
+  }
+  for (const dir of opts.additionalDirectories ?? []) {
+    if (dir.trim()) args.push(`--add-dir ${shQuote(dir.trim())}`);
+  }
+  const command = args.join(" ");
+  return opts.configDir?.trim()
+    ? `CLAUDE_CONFIG_DIR=${shQuote(opts.configDir.trim())} ${command}`
+    : command;
+}
+
 export const claudeAdapter: CodingCliAdapter = {
   name: "claude",
-  buildCommand: (task, { maxTurns }) =>
-    `claude -p ${shQuote(task)} --output-format stream-json --verbose ` +
-    `--max-turns ${maxTurns} --permission-mode acceptEdits`,
+  buildCommand: buildClaudeCommand,
   parse: (stdout, exec) => parseClaudeStream(stdout, exec),
 };
 
@@ -123,6 +260,36 @@ export const claudeAdapter: CodingCliAdapter = {
 const AIDER_APPLIED_RE = /^Applied edit to (.+)$/gm;
 const AIDER_COST_RE = /Cost:\s*\$([\d.]+)\s*message,\s*\$([\d.]+)\s*session/i;
 const AIDER_TOKENS_RE = /Tokens:\s*([\d.]+k?)\s*sent,\s*([\d.]+k?)\s*received/i;
+const AIDER_CLI_ERROR_RE = /\baider:\s*error:/i;
+const AIDER_ENV_ALLOWLIST = [
+  "OPENAI_API_KEY",
+  "OPENAI_API_BASE",
+  "OPENAI_BASE_URL",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_PROJECT",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "OLLAMA_API_BASE",
+  "DELEGATE_MODEL",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "REQUESTS_CA_BUNDLE",
+] as const;
 
 /** Parse a token count like "3.2k" or "412" into a number. */
 function parseTokenCount(s: string): number {
@@ -137,6 +304,7 @@ function parseTokenCount(s: string): number {
 export function parseAiderOutput(stdout: string, exec?: DelegateExec): DelegateResult {
   const text = String(stdout ?? "");
   const code = exec?.code ?? 0;
+  const stderr = String(exec?.stderr ?? "");
 
   const filesChanged = [...text.matchAll(AIDER_APPLIED_RE)].map((m) => m[1]!.trim());
 
@@ -148,7 +316,12 @@ export function parseAiderOutput(stdout: string, exec?: DelegateExec): DelegateR
     ? { inputTokens: parseTokenCount(tokM[1]!), outputTokens: parseTokenCount(tokM[2]!) }
     : undefined;
 
-  const ok = code === 0;
+  // Aider 0.86.1 can return exit 0 after argparse/configuration errors. Treat
+  // its explicit CLI error marker and an empty transcript as terminal even
+  // when the process code lies. A successful no-edit answer still has text.
+  const cliError = AIDER_CLI_ERROR_RE.test(stderr);
+  const noResponse = text.trim().length === 0;
+  const ok = code === 0 && !cliError && !noResponse;
   const result = ok
     ? filesChanged.length > 0
       ? `Applied edits to ${filesChanged.join(", ")}`
@@ -164,7 +337,15 @@ export function parseAiderOutput(stdout: string, exec?: DelegateExec): DelegateR
     result,
     costUsd,
     ...(filesChanged.length > 0 ? { filesChanged } : {}),
-    ...(ok ? {} : { reason: `aider exited ${code}${exec?.stderr ? `: ${exec.stderr.trim().slice(0, 200)}` : ""}` }),
+    ...(ok
+      ? {}
+      : {
+          reason: cliError
+            ? `aider rejected the command: ${stderr.trim().slice(0, 200)}`
+            : code === 0 && noResponse
+              ? `aider exited without a model response${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`
+            : `aider exited ${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`,
+        }),
   };
 }
 
@@ -172,13 +353,68 @@ export const aiderAdapter: CodingCliAdapter = {
   name: "aider",
   // --yes-always: no interactive confirms; --no-auto-commits: commits stay a
   // separate reviewed step via bench.git.commit/push (ADR-002 keeps git-write
-  // outside the CLI). The model rides DELEGATE_MODEL (its --model), defaulting
-  // to a local Ollama model so a keyless local deployment still works.
+  // outside the CLI). An explicit per-run model wins; DELEGATE_MODEL remains
+  // the legacy fallback for bench.delegate deployments.
   // maxTurns is not applicable to aider's single-message mode — intentionally
   // ignored (the wall-clock budget in bench.delegate is the hard stop).
-  buildCommand: (task) =>
-    `aider --yes-always --no-auto-commits --no-pretty ` +
-    `--model "\${DELEGATE_MODEL:-ollama/llama3}" --message ${shQuote(task)}`,
+  // Repository-local Aider config/.env/history is disabled so project content
+  // cannot override the server-selected model, credentials, or safety flags.
+  buildCommand: (task, opts) => {
+    const model = opts.model?.trim()
+      ? shQuote(opts.model.trim())
+      : '"${DELEGATE_MODEL:-ollama/llama3}"';
+    const planning = opts.permissionMode === "plan";
+    const chatMode = planning ? "ask" : "code";
+    const isolatedEnv =
+      `env -i PATH="$PATH" HOME="$aider_home" XDG_CONFIG_HOME="$aider_home/.config" ` +
+      `LANG="\${LANG:-C.UTF-8}" TERM=dumb ` +
+      `GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 ` +
+      `GIT_CONFIG_COUNT=2 ` +
+      `GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null ` +
+      `GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false ` +
+      AIDER_ENV_ALLOWLIST.map((name) => `${name}="\${${name}-}"`).join(" ") +
+      ` `;
+    const invocation =
+      `${isolatedEnv}aider --yes-always --no-auto-commits --no-dirty-commits --no-gitignore --no-pretty ` +
+      `--config "$aider_config" --env-file /dev/null ` +
+      `--model-settings-file "$aider_model_settings" ` +
+      `--model-metadata-file "$aider_model_metadata" --aiderignore /dev/null ` +
+      `--input-history-file /dev/null --chat-history-file /dev/null ` +
+      `--llm-history-file /dev/null --no-restore-chat-history ` +
+      `--verify-ssl --no-auto-lint --no-auto-test --no-watch-files ` +
+      `--no-notifications --no-fancy-input ` +
+      `--no-analytics --no-check-update --no-show-release-notes ` +
+      `--no-detect-urls --disable-playwright --no-suggest-shell-commands ` +
+      `${planning ? "--dry-run" : "--no-dry-run"} ` +
+      `--model ${model} --chat-mode ${chatMode}` +
+      (opts.effort ? ` --reasoning-effort ${shQuote(opts.effort)}` : "") +
+      ` --message ${shQuote(task)}`;
+    // /dev/null is not a valid YAML mapping to Aider 0.86.1. Generate valid,
+    // process-private empty config/model files instead. This also prevents an
+    // untrusted repository from supplying model API parameters via Aider's
+    // default .aider.model.* files.
+    return (
+      `(umask 077; aider_tmp="/tmp/puppetmaster-aider-$$"; ` +
+      `aider_home="$aider_tmp-home"; ` +
+      `aider_config="$aider_tmp-config.yml"; ` +
+      `aider_model_settings="$aider_tmp-model-settings.yml"; ` +
+      `aider_model_metadata="$aider_tmp-model-metadata.json"; ` +
+      `aider_stdout="$aider_tmp-stdout"; aider_stderr="$aider_tmp-stderr"; ` +
+      `cleanup_aider_config() { rm -rf -- "$aider_home"; ` +
+      `rm -f -- "$aider_config" "$aider_model_settings" "$aider_model_metadata" ` +
+      `"$aider_stdout" "$aider_stderr"; }; ` +
+      `trap cleanup_aider_config EXIT; trap 'exit 143' HUP INT TERM; ` +
+      `mkdir -p -- "$aider_home/.config" || exit $?; ` +
+      `printf '%s\\n' '{}' > "$aider_config" || exit $?; ` +
+      `printf '%s\\n' '[]' > "$aider_model_settings" || exit $?; ` +
+      `printf '%s\\n' '{}' > "$aider_model_metadata" || exit $?; ` +
+      `${invocation} >"$aider_stdout" 2>"$aider_stderr"; aider_code=$?; ` +
+      `cat "$aider_stdout"; cat "$aider_stderr" >&2; ` +
+      `if [ "$aider_code" -eq 0 ] && ` +
+      `{ ! grep -q '[^[:space:]]' "$aider_stdout" || grep -Eqi 'aider:[[:space:]]*error:' "$aider_stderr"; }; ` +
+      `then aider_code=64; fi; exit "$aider_code")`
+    );
+  },
   parse: (stdout, exec) => parseAiderOutput(stdout, exec),
 };
 
@@ -190,8 +426,8 @@ export const CODING_CLI_ADAPTERS: Record<string, CodingCliAdapter> = {
 };
 
 /** The default adapter name when a caller/deployment doesn't specify one.
- *  Overridable via DELEGATE_CLI so a deployment without Anthropic access can
- *  make aider the default. */
+ *  Overridable via DELEGATE_CLI. Aider is currently supported here for parsing
+ *  and read-only Plan; mutating ownership is supplied by the CLAUDE runtime. */
 export function defaultCliName(env: { DELEGATE_CLI?: string } = {}): string {
   const name = (env.DELEGATE_CLI ?? "").trim();
   return name && name in CODING_CLI_ADAPTERS ? name : "claude";

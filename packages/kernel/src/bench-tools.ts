@@ -1,5 +1,6 @@
-import { getProject, type Db } from "@puppetmaster/db";
-import { resolveCodingCli } from "./coding-cli.js";
+import { randomUUID } from "node:crypto";
+import { getBlockingWorkbenchCopybackForProject, getProject, type Db } from "@puppetmaster/db";
+import { isolateAiderRepositoryCommand, resolveCodingCli } from "./coding-cli.js";
 import type { CommandExecutor } from "./command-runner.js";
 import type { BuiltinToolRegistry } from "./tools.js";
 
@@ -36,6 +37,53 @@ function clampInt(value: unknown, def: number, min: number, max: number): number
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return def;
   return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+function clampFloat(value: unknown, def: number, min: number, max: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(max, Math.max(min, n));
+}
+
+const CLAUDE_DELEGATE_SECRETS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "ANTHROPIC_VERTEX_PROJECT_ID",
+  "CLOUD_ML_REGION",
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "ANTHROPIC_FOUNDRY_BASE_URL",
+];
+
+function delegateSecretNames(cli: string, model: string | undefined): string[] {
+  if (cli === "claude") return CLAUDE_DELEGATE_SECRETS;
+  const selected = (model ?? process.env.DELEGATE_MODEL ?? "").trim().toLowerCase();
+  const provider = selected.includes("/") ? selected.split("/", 1)[0]! :
+    /^(claude|anthropic)/.test(selected) ? "anthropic" :
+      /^(gemini|google)/.test(selected) ? "gemini" : "openai";
+  if (provider === "anthropic") return ["DELEGATE_MODEL", ...CLAUDE_DELEGATE_SECRETS];
+  if (provider === "gemini" || provider === "google") {
+    return ["DELEGATE_MODEL", "GEMINI_API_KEY", "GOOGLE_API_KEY"];
+  }
+  if (provider === "openrouter") return ["DELEGATE_MODEL", "OPENROUTER_API_KEY"];
+  if (provider === "deepseek") return ["DELEGATE_MODEL", "DEEPSEEK_API_KEY"];
+  return [
+    "DELEGATE_MODEL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_PROJECT",
+  ];
 }
 
 /** A file path confined to the workbench: relative, no `..` escape. */
@@ -79,10 +127,23 @@ export function registerBenchTools(
   };
 
   /** Run a shell command in a scoped project's workbench, guards applied. */
-  const inWorkbench = async (projectId: unknown, command: string) => {
+  const inWorkbench = async (projectId: unknown, command: string, mutation = true) => {
     const exec = requireExecutor();
     const id = await requireProject(String(projectId ?? ""));
-    const res = await exec.run({ projectId: id, command });
+    if (mutation) {
+      const blocked = await getBlockingWorkbenchCopybackForProject(deps.db, id);
+      if (blocked) {
+        throw new Error(`project mutation is blocked by unresolved copy-back ${blocked.id} (${blocked.state})`);
+      }
+    }
+    const res = await exec.run({
+      projectId: id,
+      command,
+      accessMode: mutation ? "write" : "read",
+      ...(mutation
+        ? { containerProfile: "plain" as const, executionId: `bench-${randomUUID()}` }
+        : {}),
+    });
     return { code: res.code, stdout: res.stdout, stderr: res.stderr, timedOut: res.timedOut };
   };
 
@@ -98,7 +159,7 @@ export function registerBenchTools(
     },
     async (args) => {
       const path = safeRelPath(String(args.path ?? ""));
-      const res = await inWorkbench(args.projectId, `cat -- ${shQuote(path)}`);
+      const res = await inWorkbench(args.projectId, `cat -- ${shQuote(path)}`, false);
       if (res.code !== 0) {
         throw new Error(`bench.read: ${res.stderr.trim() || `cat exited ${res.code}`}`);
       }
@@ -126,11 +187,11 @@ export function registerBenchTools(
   registry.register(
     "bench",
     "delegate",
-    "Delegate a coding task to a pluggable headless coding CLI running inside a project's " +
-      "workbench (ADR-002/ADR-008). Pick the CLI with `cli` (claude | aider) — aider is " +
-      "provider-agnostic (its model rides DELEGATE_MODEL). Runs with a turn cap + wall-clock " +
+    "Delegate a coding task to a headless CLI inside a project's workbench (ADR-002/ADR-008). " +
+      "Claude supports approved mutation. Aider supports permissionMode=plan here; use the " +
+      "CLAUDE page OpenAI Execute flow for durable Aider edits. Runs with a turn cap + wall-clock " +
       "budget; returns the parsed outcome (cli, ok, numTurns?, usage?, result, costUsd?). " +
-      "Mutating — gated behind approval. Does not push (use bench.git.push).",
+      "Gated behind approval. Does not push (use bench.git.push).",
     "write_approved",
     {
       type: "object",
@@ -140,7 +201,7 @@ export function registerBenchTools(
         cli: {
           type: "string",
           enum: ["claude", "aider"],
-          description: "Which coding CLI to delegate to (default: the deployment's DELEGATE_CLI, else claude).",
+          description: "Which coding CLI to delegate to. Aider is read-only in this tool; default is DELEGATE_CLI, else claude.",
         },
         maxTurns: {
           type: "number",
@@ -149,6 +210,24 @@ export function registerBenchTools(
         timeoutMs: {
           type: "number",
           description: "Wall-clock budget in ms (default 300000, max 1800000). Kills the run if exceeded.",
+        },
+        model: {
+          type: "string",
+          description: "Backend model alias or full model id; Aider Plan accepts a provider/model value.",
+        },
+        effort: {
+          type: "string",
+          enum: ["low", "medium", "high", "xhigh", "max"],
+          description: "Adaptive reasoning effort for Claude Code models that support it.",
+        },
+        permissionMode: {
+          type: "string",
+          enum: ["plan", "acceptEdits", "dontAsk"],
+          description: "Inner permission mode. plan maps Aider to ask; non-plan Aider is refused here. bypassPermissions is unavailable.",
+        },
+        maxBudgetUsd: {
+          type: "number",
+          description: "Maximum Claude API spend for this run in USD (0.01-100).",
         },
       },
       required: ["projectId", "task"],
@@ -169,10 +248,62 @@ export function registerBenchTools(
       // silently downgraded here.
       const maxTurns = clampInt(args.maxTurns, 12, 1, 50);
       const timeoutMs = clampInt(args.timeoutMs, 300_000, 1_000, 1_800_000);
-      const command = adapter.buildCommand(task, { maxTurns });
+      const effort = ["low", "medium", "high", "xhigh", "max"].includes(String(args.effort ?? ""))
+        ? (String(args.effort) as "low" | "medium" | "high" | "xhigh" | "max")
+        : undefined;
+      const permissionMode = ["plan", "acceptEdits", "dontAsk"].includes(String(args.permissionMode ?? ""))
+        ? (String(args.permissionMode) as "plan" | "acceptEdits" | "dontAsk")
+        : undefined;
+      const maxBudgetUsd = args.maxBudgetUsd == null
+        ? undefined
+        : clampFloat(args.maxBudgetUsd, 5, 0.01, 100);
+      const model = typeof args.model === "string" && args.model.trim()
+        ? args.model.trim()
+        : undefined;
+      const adapterCommand = adapter.buildCommand(task, {
+        maxTurns,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        ...(permissionMode ? { permissionMode } : {}),
+        ...(maxBudgetUsd === undefined ? {} : { maxBudgetUsd }),
+      });
+      const executionId = `delegate-${randomUUID()}`;
+      const command = adapter.name === "aider"
+        ? isolateAiderRepositoryCommand(
+            adapterCommand,
+            executionId,
+            permissionMode === "plan" ? "plan" : "execute",
+          )
+        : adapterCommand;
       const exec = requireExecutor();
       const id = await requireProject(String(args.projectId ?? ""));
-      const res = await exec.run({ projectId: id, command, timeoutMs });
+      if (permissionMode !== "plan") {
+        const blocked = await getBlockingWorkbenchCopybackForProject(deps.db, id);
+        if (blocked) {
+          throw new Error(`project mutation is blocked by unresolved copy-back ${blocked.id} (${blocked.state})`);
+        }
+      }
+      if (adapter.name === "aider" && (!exec.applyExecutionResult || !exec.cleanupExecutionArtifacts)) {
+        throw new Error("bench.delegate (aider): requires the Docker provider-isolation executor");
+      }
+      if (adapter.name === "aider" && permissionMode !== "plan") {
+        throw new Error(
+          "bench.delegate (aider): mutating copy-back requires a durable node-execution owner; " +
+            "use the CLAUDE page OpenAI Execute flow",
+        );
+      }
+      try {
+      const res = await exec.run({
+        projectId: id,
+        command,
+        timeoutMs,
+        executionId,
+        ...(adapter.name === "aider" ? { executionGeneration: 1 } : {}),
+        containerProfile: adapter.name === "claude" ? "claude" : "openai",
+        accessMode: permissionMode === "plan" ? "read" : "write",
+        readOnlyProject: adapter.name === "claude" && permissionMode === "plan",
+        secretNames: delegateSecretNames(adapter.name, model),
+      });
       if (res.timedOut) {
         throw new Error(`bench.delegate (${adapter.name}): exceeded the ${timeoutMs}ms wall-clock budget`);
       }
@@ -187,6 +318,9 @@ export function registerBenchTools(
         );
       }
       return parsed;
+      } finally {
+        if (adapter.name === "aider") await exec.cleanupExecutionArtifacts!(executionId);
+      }
     },
   );
 
@@ -226,7 +360,7 @@ export function registerBenchTools(
     "Show a project workbench's git status (porcelain).",
     "read_auto",
     { type: "object", properties: { projectId: { type: "string" } }, required: ["projectId"] },
-    async (args) => inWorkbench(args.projectId, "git status --porcelain"),
+    async (args) => inWorkbench(args.projectId, "git status --porcelain", false),
   );
 
   registry.register(
@@ -235,7 +369,7 @@ export function registerBenchTools(
     "Show a project workbench's unstaged git diff.",
     "read_auto",
     { type: "object", properties: { projectId: { type: "string" } }, required: ["projectId"] },
-    async (args) => inWorkbench(args.projectId, "git diff"),
+    async (args) => inWorkbench(args.projectId, "git diff", false),
   );
 
   registry.register(
