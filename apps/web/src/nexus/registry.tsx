@@ -18,6 +18,7 @@ import {
 import { Command } from "../Command.js";
 import { SignalRadar, type SignalEntry } from "../Signal.js";
 import { TraceDossier, type StepTiming } from "../Trace.js";
+import { isMissionResult, type MissionAcknowledgement } from "./missionGate.js";
 
 /**
  * NEXUS task registry (docs/NEXUS.md §4.2): the single source of truth for
@@ -72,6 +73,10 @@ export interface NX {
   connected: boolean;
   rxTotal: number;
   operation: OperationState;
+  missionAcknowledgements: Record<string, MissionAcknowledgement>;
+  isMissionAcknowledged: (mission: Pick<Mission, "id" | "status">) => boolean;
+  isMissionUrgent: (mission: Pick<Mission, "id" | "status">) => boolean;
+  acknowledgeMission: (missionId: string, status: string) => void;
   navigate: (view: string) => void;
   track: (missionId: string) => void;
   decide: (id: string, approved: boolean) => Promise<void>;
@@ -222,21 +227,42 @@ function MissionDossierBody({ ctx, nx }: { ctx: Record<string, unknown>; nx: NX 
     api.getMission(sel).then(setDetail).catch(() => setDetail(null));
   }, [sel, missionEvents]);
 
+  useEffect(() => {
+    if (sel && missions.some((m) => m.id === sel)) return;
+    setSel(missions[0]?.id ?? "");
+  }, [sel, missions]);
+
   return (
     <div className="nx-task-stack">
       <select value={sel} onChange={(e) => setSel(e.target.value)} aria-label="Mission">
         {missions.slice(0, 25).map((m) => (
           <option key={m.id} value={m.id}>
             {m.kind.toUpperCase()} {m.id.slice(0, 8)} · {m.status.replace(/_/g, " ").toUpperCase()}
+            {nx.isMissionAcknowledged(m) ? " · ACKNOWLEDGED" : ""}
           </option>
         ))}
         {missions.length === 0 && <option value="">— no missions —</option>}
       </select>
       <div className="nx-dossier-well">
         {detail ? (
-          <TraceDossier mission={detail.mission} steps={detail.steps} timing={{}} diagnosis={null} />
+          <>
+            {isMissionResult(detail.mission) && (
+              <div className="nx-task-row">
+                {nx.isMissionUrgent(detail.mission) && <span className="tag-lo">URGENT ACTION</span>}
+                <span className="tag-lo">
+                  {nx.isMissionAcknowledged(detail.mission) ? "ACKNOWLEDGED" : "RESULT REQUIRES ACKNOWLEDGEMENT"}
+                </span>
+                {!nx.isMissionAcknowledged(detail.mission) && (
+                  <Chip tiny onClick={() => nx.acknowledgeMission(detail.mission.id, detail.mission.status)}>
+                    ✓ ACKNOWLEDGE RESULT
+                  </Chip>
+                )}
+              </div>
+            )}
+            <TraceDossier mission={detail.mission} steps={detail.steps} timing={{}} diagnosis={null} />
+          </>
         ) : (
-          <p className="dim pad">Select a mission.</p>
+          <p className="dim pad">Select a mission to inspect.</p>
         )}
       </div>
     </div>
@@ -406,10 +432,19 @@ function OperationLogBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
   }
   const m = op.mission;
   const live = LIVE_MISSION.has(m.status);
+  const result = isMissionResult(m);
+  const acknowledged = nx.isMissionAcknowledged(m);
   return (
     <div className="nx-task-stack">
       <div className="nx-task-row">
         <span className={`mstatus st-${m.status}`}>{m.status.replace(/_/g, " ").toUpperCase()}</span>
+        {nx.isMissionUrgent(m) && <span className="tag-lo">URGENT ACTION</span>}
+        {result && (
+          <span className="tag-lo">{acknowledged ? "ACKNOWLEDGED" : "RESULT REQUIRES ACKNOWLEDGEMENT"}</span>
+        )}
+        {result && !acknowledged && (
+          <Chip tiny onClick={() => nx.acknowledgeMission(m.id, m.status)}>✓ ACKNOWLEDGE RESULT</Chip>
+        )}
         {nx.canBuild && live && (
           <Chip tiny tone="danger" onClick={() => api.cancelMission(m.id).then(() => nx.track(m.id)).catch(() => {})}>
             ✕ CANCEL

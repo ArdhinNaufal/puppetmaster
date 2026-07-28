@@ -9,6 +9,7 @@ import {
 } from "./Construct.js";
 import { ROLE_RANK, TASKS, taskById, type DiscoveryItem, type NX } from "./registry.js";
 import { TaskWindow, type PaneState } from "./TaskWindow.js";
+import { isMissionResult, isUrgentMission, shouldShowMissionInPane, type MissionAcknowledgement } from "./missionGate.js";
 
 /**
  * NEXUS (docs/NEXUS.md): the single-page operations theater. The Construct
@@ -36,9 +37,10 @@ interface PersistedPane {
 
 /** Cadence between auto-hailed attention panes (§4.3). */
 const HAIL_INTERVAL_MS = 2800;
+const ACTIVE_ATTENTION_GATE = "__nexusActiveAttentionGate";
 
 export function Nexus(props: {
-  nx: Omit<NX, "openPane" | "closeTask" | "construct">;
+  nx: Omit<NX, "openPane" | "closeTask" | "construct" | "missionAcknowledgements" | "isMissionAcknowledged" | "isMissionUrgent" | "acknowledgeMission">;
   /** External spawn order (palette): bump `n` to open `task`. */
   spawn: { task: string; ctx?: Record<string, unknown>; n: number } | null;
   reducedMotion: boolean;
@@ -50,6 +52,7 @@ export function Nexus(props: {
 
   // --- Construct data (page-owned fetches; bus signals drive refresh) --------
   const [missions, setMissions] = useState<Mission[]>([]);
+  const [missionAcknowledgements, setMissionAcknowledgements] = useState<Record<string, MissionAcknowledgement>>({});
   const [wfNodes, setWfNodes] = useState<Record<string, number>>({});
   const missionEvents = useMemo(
     () => props.nx.signals.filter((s) => s.type.startsWith("mission")).length,
@@ -106,6 +109,15 @@ export function Nexus(props: {
       rxTotal: props.nx.rxTotal,
     }),
     [props.nx.agents, constructWorkflows, props.nx.docs, props.nx.toolServers, missions, props.nx.approvals, props.nx.signals, props.nx.connected, props.nx.rxTotal],
+  );
+
+  const isMissionAcknowledged = useCallback(
+    (mission: Pick<Mission, "id" | "status">) => missionAcknowledgements[mission.id]?.status === mission.status,
+    [missionAcknowledgements],
+  );
+  const isMissionUrgentForNx = useCallback(
+    (mission: Pick<Mission, "id" | "status">) => isUrgentMission(mission, props.nx.approvals),
+    [props.nx.approvals],
   );
 
   // --- strata: the Construct stacked by creation year -------------------------
@@ -197,7 +209,7 @@ export function Nexus(props: {
   const trackAndLog = useCallback(
     (missionId: string) => {
       nxTrack(missionId);
-      openPane("operation.log");
+      openPane("operation.log", missionId ? { missionId } : {});
     },
     [nxTrack, openPane],
   );
@@ -208,6 +220,16 @@ export function Nexus(props: {
       openPane,
       closeTask,
       track: trackAndLog,
+      missionAcknowledgements,
+      isMissionAcknowledged,
+      isMissionUrgent: isMissionUrgentForNx,
+      acknowledgeMission: (missionId, status) => {
+        if (!isMissionResult({ status })) return;
+        setMissionAcknowledgements((current) => ({
+          ...current,
+          [missionId]: { status, acknowledgedAt: new Date().toISOString() },
+        }));
+      },
       construct: {
         layers: layers.map((l) => ({ id: l.id, year: l.year, count: l.count })),
         active: activeLayer,
@@ -217,7 +239,7 @@ export function Nexus(props: {
         items: discoveryItems,
       },
     }),
-    [props.nx, openPane, closeTask, trackAndLog, layers, activeLayer, setLayer, stepLayer, discoveryItems],
+    [props.nx, openPane, closeTask, trackAndLog, layers, activeLayer, setLayer, stepLayer, discoveryItems, missionAcknowledgements, isMissionAcknowledged, isMissionUrgentForNx],
   );
 
   const move = (key: string, x: number, y: number) =>
@@ -230,6 +252,30 @@ export function Nexus(props: {
       return ps.map((p) => (p.key === key ? { ...p, z: ++zSeq.current } : p));
     });
   const close = (key: string) => setPanes((ps) => ps.filter((p) => p.key !== key));
+  const missionForPane = (pane: PaneState): Mission | null => {
+    const missionId = pane.task === "mission.dossier"
+      ? pane.ctx.missionId as string | undefined
+      : pane.task === "operation.log"
+        ? (pane.ctx.missionId as string | undefined) ?? props.nx.operation.mission?.id
+        : undefined;
+    return missionId
+      ? missions.find((m) => m.id === missionId)
+        ?? (props.nx.operation.mission?.id === missionId ? props.nx.operation.mission : null)
+      : null;
+  };
+  const paneShowsMission = (pane: PaneState) => {
+    if (pane.ctx[ACTIVE_ATTENTION_GATE] !== true) return true;
+    const mission = missionForPane(pane);
+    return !mission || shouldShowMissionInPane(mission, missionAcknowledgements[mission.id], props.nx.approvals);
+  };
+  useEffect(() => {
+    setPanes((current) => {
+      const visible = current.filter(paneShowsMission);
+      return visible.length === current.length ? current : visible;
+    });
+    // The gate must re-run when either the persisted tags or mission state arrives.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [missionAcknowledgements, missions, props.nx.operation, props.nx.approvals]);
   const jump = (key: string) => {
     const pane = panes.find((p) => p.key === key);
     if (!pane) return;
@@ -257,17 +303,18 @@ export function Nexus(props: {
   // respect. The timer reads through a ref so shell re-renders (vitals
   // heartbeat and the like) never reset the cadence.
   const hailed = useRef(new Set<string>());
-  const hailRef = useRef({ approvals: props.nx.approvals, missions, openPane });
-  hailRef.current = { approvals: props.nx.approvals, missions, openPane };
+  const hailRef = useRef({ approvals: props.nx.approvals, missions, openPane, missionAcknowledgements });
+  hailRef.current = { approvals: props.nx.approvals, missions, openPane, missionAcknowledgements };
   useEffect(() => {
     const t = setInterval(() => {
-      const { approvals, missions, openPane } = hailRef.current;
+      const { approvals, missions, openPane, missionAcknowledgements } = hailRef.current;
       if (approvals.length === 0) hailed.current.delete("auth");
       const queue: { key: string; task: string; ctx: Record<string, unknown> }[] = [];
       if (approvals.length > 0) queue.push({ key: "auth", task: "authorizations", ctx: {} });
       const dayAgo = Date.now() - 86_400_000;
       for (const m of missions.filter((m) => m.status === "failed" && Date.parse(m.createdAt) > dayAgo).slice(0, 5)) {
-        queue.push({ key: `fail:${m.id}`, task: "mission.dossier", ctx: { missionId: m.id } });
+        if (!shouldShowMissionInPane(m, missionAcknowledgements[m.id], approvals)) continue;
+        queue.push({ key: `fail:${m.id}`, task: "mission.dossier", ctx: { missionId: m.id, [ACTIVE_ATTENTION_GATE]: true } });
       }
       const next = queue.find((i) => !hailed.current.has(i.key));
       if (!next) return;
@@ -282,7 +329,10 @@ export function Nexus(props: {
     prefsApi
       .get()
       .then(({ layout }) => {
-        const saved = (layout as { nexus?: { panes?: PersistedPane[] } }).nexus;
+        const saved = (layout as { nexus?: { panes?: PersistedPane[]; acknowledgedResults?: Record<string, MissionAcknowledgement> } }).nexus;
+        if (saved?.acknowledgedResults && typeof saved.acknowledgedResults === "object") {
+          setMissionAcknowledgements(saved.acknowledgedResults);
+        }
         if (saved?.panes?.length) {
           const W = stageRef.current?.clientWidth ?? 1200;
           setPanes(
@@ -309,10 +359,10 @@ export function Nexus(props: {
     if (!restored.current) return;
     const t = setTimeout(() => {
       const persisted: PersistedPane[] = panes.map((p) => ({ task: p.task, x: p.x, y: p.y, ctx: p.ctx, z: p.z }));
-      prefsApi.save({ nexus: { panes: persisted } }).catch(() => {});
+      prefsApi.save({ nexus: { panes: persisted, acknowledgedResults: missionAcknowledgements } }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [panes]);
+  }, [panes, missionAcknowledgements]);
 
   // --- tray ------------------------------------------------------------------------
   const trayTasks = TASKS.filter((t) => !t.hidden);
@@ -331,6 +381,7 @@ export function Nexus(props: {
           reducedMotion={props.reducedMotion}
         />
         {panes.map((pane) => {
+          if (!paneShowsMission(pane)) return null;
           const def = taskById(pane.task);
           if (!def?.body) return null;
           const Body = def.body;

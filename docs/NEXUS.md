@@ -231,6 +231,14 @@ emerging on the emptier flank, so the operator is hailed, not buried:
 
 ### 4.4 Persistence
 
+Mission results use an active pane gate. Succeeded and failed results receive a
+per-user `ACKNOWLEDGED` tag when the operator confirms them; acknowledged results
+are filtered from automatically restored attention panes and future failure
+follow-ups. They remain available in manual mission dossier/history views. Live
+work remains visible. Urgent work bypasses the gate: a mission in
+`awaiting_approval` or a mission with an open/pending authorization always remains
+visible for immediate action.
+
 `ui_preferences.layout.nexus` (server already stores arbitrary layout JSON):
 
 ```jsonc

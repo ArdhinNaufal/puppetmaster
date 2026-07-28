@@ -344,6 +344,8 @@ export interface PanelLayout {
  *  `x`/`y` survive only to migrate pre-dock layouts on restore. */
 export interface NexusLayout {
   panes?: { task: string; side?: "left" | "right"; x?: number; y?: number; ctx?: Record<string, unknown>; z?: number }[];
+  /** Per-user mission result acknowledgement tags used by NEXUS's pane gate. */
+  acknowledgedResults?: Record<string, { status: string; acknowledgedAt: string }>;
 }
 
 /** PROCESS WATCH strip state (docs/PROCESS-WATCH.md). */

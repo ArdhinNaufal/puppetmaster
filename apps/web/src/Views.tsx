@@ -606,9 +606,9 @@ export function TemplatesView(props: {
         </Panel>
       )}
 
-      <div className="tool-grid">
+      <div className="templates-grid">
         {groups.map((g) => (
-          <Panel key={g.kind} title={g.title} scroll>
+          <Panel key={g.kind} title={g.title} className="template-pane" scroll>
             <div className="tpl-cards">
               {templates.filter((t) => t.kind === g.kind).map((t) => (
                 <div key={t.id} className="tpl-card">

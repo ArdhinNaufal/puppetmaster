@@ -1242,6 +1242,21 @@ input[type="color"] { background: #0d0d0f; border: 1px solid var(--stroke-hi); b
 .role-badge.r-owner { color: var(--warn); border-color: var(--warn); }
 .inspector-grid.readonly { opacity: 0.75; pointer-events: none; }
 
+.templates-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+  align-items: start;
+  pointer-events: none;
+}
+.template-pane {
+  align-self: start;
+  height: fit-content;
+  max-height: clamp(220px, calc(100vh - 260px), 560px);
+  pointer-events: auto;
+}
+.template-pane .fui-panel-body.scroll { overflow-y: auto; }
+
 .tpl-cards { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem 0.7rem; }
 .tpl-card { border: 1px solid var(--stroke); border-radius: var(--radius); padding: 0.6rem 0.7rem; background: #0c0c0e; position: relative; }
 .tpl-card:hover { border-color: var(--stroke-hi); }
