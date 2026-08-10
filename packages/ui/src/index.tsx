@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 
 /**
  * Puppetmaster FUI design system (docs/DESIGN-LANGUAGE.md v0.2): thin linework,
@@ -181,9 +181,21 @@ export function MeterBar(props: { value: number; max: number; segments?: number;
 
 const GLYPHS = "▖▘▝▗░▒#$&<>/\\+=~ABCDEF0123456789";
 
-/** True once the user prefers reduced motion; evaluated per mount. */
-function prefersReducedMotion(): boolean {
-  return typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+/** Track reduced-motion changes so an active decode stops immediately. */
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(
+    () => typeof window !== "undefined"
+      && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReduced(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return reduced;
 }
 
 /**
@@ -194,11 +206,12 @@ function prefersReducedMotion(): boolean {
 export function Decode(props: { text: string; className?: string }) {
   const [shown, setShown] = useState(props.text);
   const prev = useRef(props.text);
+  const reducedMotion = usePrefersReducedMotion();
 
   useEffect(() => {
-    if (props.text === prev.current) return;
+    const changed = props.text !== prev.current;
     prev.current = props.text;
-    if (prefersReducedMotion()) {
+    if (reducedMotion || !changed) {
       setShown(props.text);
       return;
     }
@@ -220,9 +233,14 @@ export function Decode(props: { text: string; className?: string }) {
       setShown(out);
     }, 40);
     return () => clearInterval(timer);
-  }, [props.text]);
+  }, [props.text, reducedMotion]);
 
-  return <span className={props.className}>{shown}</span>;
+  return (
+    <span className={props.className}>
+      <span aria-hidden="true">{shown}</span>
+      <span className="fui-sr-only">{props.text}</span>
+    </span>
+  );
 }
 
 /* ----------------------------------------------------------------- Status */
@@ -250,6 +268,7 @@ export function Chip(props: {
 }) {
   return (
     <button
+      type="button"
       className={`fui-chip tone-${props.tone ?? "default"} ${props.tiny ? "tiny" : ""}`}
       onClick={props.onClick}
       disabled={props.disabled}
@@ -279,52 +298,112 @@ export function HoldButton(props: {
 }) {
   const ms = props.ms ?? 700;
   const [holding, setHolding] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [announcement, setAnnouncement] = useState("");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const done = useRef(false);
+  const disabledRef = useRef(Boolean(props.disabled));
+  disabledRef.current = Boolean(props.disabled);
+  const progressId = useId();
+  const statusId = useId();
 
   const start = () => {
-    if (props.disabled || timer.current) return;
+    if (disabledRef.current || timer.current) return;
     done.current = false;
     setHolding(true);
+    setProgress(0);
+    setAnnouncement("Confirmation hold started. Keep holding to complete.");
+    const startedAt = Date.now();
+    progressTimer.current = setInterval(() => {
+      setProgress(Math.min(99, Math.round(((Date.now() - startedAt) / ms) * 100)));
+    }, Math.max(50, Math.min(100, Math.round(ms / 10))));
     timer.current = setTimeout(() => {
       timer.current = null;
+      if (progressTimer.current) {
+        clearInterval(progressTimer.current);
+        progressTimer.current = null;
+      }
+      if (disabledRef.current) {
+        done.current = false;
+        setProgress(0);
+        setHolding(false);
+        setAnnouncement("Confirmation hold cancelled because the control became unavailable.");
+        return;
+      }
       done.current = true;
+      setProgress(100);
       setHolding(false);
+      setAnnouncement("Confirmation complete.");
       props.onComplete();
     }, ms);
   };
   const cancel = () => {
+    const wasHolding = timer.current !== null;
     if (timer.current) {
       clearTimeout(timer.current);
       timer.current = null;
     }
-    if (!done.current) setHolding(false);
+    if (progressTimer.current) {
+      clearInterval(progressTimer.current);
+      progressTimer.current = null;
+    }
+    if (!done.current) {
+      setHolding(false);
+      setProgress(0);
+      if (wasHolding) setAnnouncement("Confirmation hold cancelled.");
+    }
   };
+  useEffect(() => {
+    if (props.disabled) cancel();
+  }, [props.disabled]);
   useEffect(() => cancel, []);
 
   return (
-    <button
-      className={`fui-hold tone-${props.tone ?? "accent"} ${props.tiny ? "tiny" : ""} ${holding ? "holding" : ""}`}
-      style={{ "--hold-ms": `${ms}ms` } as React.CSSProperties}
-      disabled={props.disabled}
-      title={props.title ?? "Hold to confirm"}
-      onPointerDown={start}
-      onPointerUp={cancel}
-      onPointerLeave={cancel}
-      onKeyDown={(e) => {
-        if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
-          e.preventDefault();
-          start();
-        }
-      }}
-      onKeyUp={(e) => {
-        if (e.key === "Enter" || e.key === " ") cancel();
-      }}
-      onClick={(e) => e.preventDefault()}
-    >
-      <span className="fui-hold-fill" aria-hidden="true" />
-      <span className="fui-hold-label">{props.children}</span>
-    </button>
+    <>
+      <button
+        type="button"
+        className={`fui-hold tone-${props.tone ?? "accent"} ${props.tiny ? "tiny" : ""} ${holding ? "holding" : ""}`}
+        style={{ "--hold-ms": `${ms}ms` } as React.CSSProperties}
+        disabled={props.disabled}
+        title={props.title ?? "Hold to confirm"}
+        aria-pressed={holding}
+        aria-describedby={`${progressId} ${statusId}`}
+        aria-keyshortcuts="Enter Space"
+        onPointerDown={start}
+        onPointerUp={cancel}
+        onPointerLeave={cancel}
+        onPointerCancel={cancel}
+        onBlur={cancel}
+        onKeyDown={(e) => {
+          if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+            e.preventDefault();
+            start();
+          }
+        }}
+        onKeyUp={(e) => {
+          if (e.key === "Enter" || e.key === " ") cancel();
+        }}
+        onClick={(e) => e.preventDefault()}
+      >
+        <span className="fui-hold-fill" aria-hidden="true" />
+        <span className="fui-hold-label">{props.children}</span>
+      </button>
+      <span
+        id={progressId}
+        className="fui-hold-progress"
+        role="progressbar"
+        aria-label="Confirmation hold progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress}
+      >
+        Confirmation progress {progress} percent.
+      </span>
+      <span id={statusId} className="fui-hold-progress" role="status" aria-live="polite">
+        {announcement}
+      </span>
+    </>
   );
 }
 

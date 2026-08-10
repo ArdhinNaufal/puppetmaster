@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { BusEvent } from "./api.js";
+import type { BusEvent, ScienceBusEvent } from "./api.js";
 
 /**
  * Signal instruments (DESIGN-LANGUAGE §process is the hero): nothing the
@@ -27,10 +27,48 @@ export interface SignalEntry {
 
 let seq = 0;
 
+const isScienceEvent = (event: SignalEvent): event is ScienceBusEvent =>
+  event.type.startsWith("science.");
+
 /** Map an operational bus event to a ticker/radar entry. */
 export function toSignal(e: SignalEvent): SignalEntry {
   const at = Date.parse(e.at) || Date.now();
   const short = (id: string) => id.slice(0, 8);
+  if (isScienceEvent(e)) {
+    const subject = e.runId
+      ?? e.artifactVersionId
+      ?? e.studyId
+      ?? e.renderSessionId
+      ?? e.workspaceId;
+    const entity = e.runId
+      ? `RUN ${short(e.runId)}`
+      : e.artifactVersionId
+        ? `ARTIFACT ${short(e.artifactVersionId)}`
+        : e.studyId
+          ? `STUDY ${short(e.studyId)}`
+          : e.renderSessionId
+            ? `RENDER ${short(e.renderSessionId)}`
+            : "SCIENCE";
+    const operation = e.type.slice("science.".length).replace(/\./g, " ").replace(/_/g, " ").toUpperCase();
+    const tone: SignalEntry["tone"] =
+      e.type.endsWith(".failed") || e.type.endsWith(".quarantined") || e.type.endsWith(".expired")
+        ? "danger"
+        : e.type.endsWith(".awaiting_approval") || e.type.endsWith(".cancelling")
+          ? "warn"
+          : e.type.endsWith(".ready") || e.type.endsWith(".succeeded")
+            ? "ok"
+            : e.type.endsWith(".started") || e.type.endsWith(".starting") || e.type.endsWith(".provisioning")
+              ? "accent"
+              : "default";
+    return {
+      seq: ++seq,
+      at,
+      type: e.type,
+      subject,
+      tone,
+      label: `${entity} · ${operation}`,
+    };
+  }
   switch (e.type) {
     case "mission.started":
       return { seq: ++seq, at, type: e.type, subject: e.missionId, tone: "accent", label: `MISSION ${short(e.missionId)} LAUNCH` };

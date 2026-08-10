@@ -79,6 +79,13 @@ export function startAuditProjector(bus: EventBus, db: Db): () => void {
           ? "openai-aider"
           : "claude-code";
         ctx = { workspaceId: m.workspaceId, actorKind: "system", actorId: m.subjectId, actorLabel };
+      } else if (m.kind === "science") {
+        ctx = {
+          workspaceId: m.workspaceId,
+          actorKind: "system",
+          actorId: m.subjectId,
+          actorLabel: "science-run",
+        };
       } else {
         const wf = await getWorkflowWithGraph(db, m.subjectId);
         ctx = { workspaceId: m.workspaceId, actorKind: "system", actorId: m.subjectId, actorLabel: `workflow:${wf?.workflow.name ?? "?"}` };

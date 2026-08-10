@@ -1,6 +1,8 @@
 import {
+  bigint,
   boolean,
   check,
+  index,
   integer,
   jsonb,
   pgTable,
@@ -79,6 +81,24 @@ export const uiPreferences = pgTable(
   },
   (t) => ({ uniqPrefs: unique().on(t.userId, t.workspaceId) }),
 );
+
+/** Default-deny, persisted admission for the opt-in Science pilot. */
+export const scienceWorkspaceAdmissions = pgTable(
+  "science_workspace_admissions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    admitted: boolean("admitted").notNull().default(false),
+    updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "set null" }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqWorkspace: unique("science_workspace_admissions_workspace_unique").on(t.workspaceId),
+  }),
+);
+
 
 export const workflows = pgTable("workflows", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -730,6 +750,376 @@ export const evidence = pgTable("evidence", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// --- Science Operations (scientific subsystem WP1) -----------------------------
+
+export const scienceStudies = pgTable(
+  "science_studies",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    status: text("status").notNull().default("active"),
+    /** MVP admits non-regulated research data only. */
+    classification: text("classification").notNull().default("non_regulated"),
+    workshopProjectId: uuid("workshop_project_id").references(() => projects.id, {
+      onDelete: "set null",
+    }),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    workspaceIdx: index("science_studies_workspace_idx").on(t.workspaceId, t.createdAt),
+    validStatus: check("science_studies_status_check", sql`${t.status} IN ('active', 'archived')`),
+    validClassification: check(
+      "science_studies_classification_check",
+      sql`${t.classification} = 'non_regulated'`,
+    ),
+  }),
+);
+
+export const scienceArtifacts = pgTable(
+  "science_artifacts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    studyId: uuid("study_id")
+      .notNull()
+      .references(() => scienceStudies.id, { onDelete: "cascade" }),
+    logicalName: text("logical_name").notNull(),
+    kind: text("kind").notNull(),
+    format: text("format").notNull(),
+    status: text("status").notNull().default("active"),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqLogicalName: unique("science_artifacts_study_logical_name_unique").on(
+      t.studyId,
+      t.logicalName,
+    ),
+    studyIdx: index("science_artifacts_study_idx").on(t.studyId, t.createdAt),
+    validStatus: check("science_artifacts_status_check", sql`${t.status} IN ('active', 'archived')`),
+    validKind: check(
+      "science_artifacts_kind_check",
+      sql`${t.kind} IN ('dataset', 'notebook', 'geometry', 'result', 'log', 'manifest', 'environment', 'other')`,
+    ),
+  }),
+);
+
+export const scienceArtifactVersions = pgTable(
+  "science_artifact_versions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    artifactId: uuid("artifact_id")
+      .notNull()
+      .references(() => scienceArtifacts.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    status: text("status").notNull().default("pending"),
+    storageKey: text("storage_key").notNull().unique(),
+    sha256: text("sha256").notNull(),
+    sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+    mediaType: text("media_type").notNull(),
+    metadata: jsonb("metadata").notNull().default({}),
+    /** Internal retention fence; cleared atomically when a version becomes ready. */
+    cleanupEligible: boolean("cleanup_eligible").notNull().default(false),
+    cleanupAttempts: integer("cleanup_attempts").notNull().default(0),
+    cleanupNotBefore: timestamp("cleanup_not_before", { withTimezone: true }),
+    /** Repository validation keeps a parent inside the same logical artifact. */
+    parentVersionId: uuid("parent_version_id"),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    readyAt: timestamp("ready_at", { withTimezone: true }),
+  },
+  (t) => ({
+    uniqVersion: unique("science_artifact_versions_artifact_version_unique").on(
+      t.artifactId,
+      t.version,
+    ),
+    uniqChecksum: unique("science_artifact_versions_artifact_checksum_unique").on(
+      t.artifactId,
+      t.sha256,
+    ),
+    artifactIdx: index("science_artifact_versions_artifact_idx").on(t.artifactId, t.version),
+    validVersion: check("science_artifact_versions_version_check", sql`${t.version} > 0`),
+    validSize: check("science_artifact_versions_size_check", sql`${t.sizeBytes} >= 0`),
+    validSha: check(
+      "science_artifact_versions_sha256_check",
+      sql`${t.sha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validStatus: check(
+      "science_artifact_versions_status_check",
+      sql`${t.status} IN ('pending', 'ready', 'quarantined', 'expired')`,
+    ),
+  }),
+);
+
+/** Durable upload intent and lease. Raw upload tokens are never persisted. */
+export const scienceUploads = pgTable(
+  "science_uploads",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    artifactId: uuid("artifact_id")
+      .notNull()
+      .references(() => scienceArtifacts.id, { onDelete: "cascade" }),
+    artifactVersionId: uuid("artifact_version_id").references(() => scienceArtifactVersions.id, {
+      onDelete: "restrict",
+    }),
+    tokenHash: text("token_hash").notNull().unique(),
+    expectedSizeBytes: bigint("expected_size_bytes", { mode: "number" }).notNull(),
+    expectedSha256: text("expected_sha256").notNull(),
+    quarantineKey: text("quarantine_key").notNull().unique(),
+    receivedBytes: bigint("received_bytes", { mode: "number" }).notNull().default(0),
+    state: text("state").notNull().default("pending"),
+    error: text("error"),
+    transferLeaseId: uuid("transfer_lease_id"),
+    finalizationLeaseId: uuid("finalization_lease_id"),
+    cleanupAttempts: integer("cleanup_attempts").notNull().default(0),
+    cleanupNotBefore: timestamp("cleanup_not_before", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => ({
+    workspaceStateIdx: index("science_uploads_workspace_state_idx").on(
+      t.workspaceId,
+      t.state,
+      t.expiresAt,
+    ),
+    artifactIdx: index("science_uploads_artifact_idx").on(t.artifactId, t.createdAt),
+    validSize: check(
+      "science_uploads_size_check",
+      sql`${t.expectedSizeBytes} >= 0 AND ${t.receivedBytes} >= 0 AND ${t.receivedBytes} <= ${t.expectedSizeBytes}`,
+    ),
+    validTokenHash: check(
+      "science_uploads_token_hash_check",
+      sql`${t.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validExpectedSha: check(
+      "science_uploads_expected_sha256_check",
+      sql`${t.expectedSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validState: check(
+      "science_uploads_state_check",
+      sql`${t.state} IN ('pending', 'uploading', 'finalizing', 'completed', 'quarantined', 'expired')`,
+    ),
+  }),
+);
+
+export const scienceComputeProfiles = pgTable(
+  "science_compute_profiles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    providerKind: text("provider_kind").notNull(),
+    imageDigest: text("image_digest").notNull(),
+    kernelName: text("kernel_name").notNull(),
+    resourceBounds: jsonb("resource_bounds").notNull(),
+    config: jsonb("config").notNull().default({}),
+    enabled: boolean("enabled").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqName: unique("science_compute_profiles_workspace_name_unique").on(t.workspaceId, t.name),
+    workspaceIdx: index("science_compute_profiles_workspace_idx").on(t.workspaceId, t.createdAt),
+    validProvider: check(
+      "science_compute_profiles_provider_check",
+      sql`${t.providerKind} IN ('local_container', 'jupyter_enterprise_gateway')`,
+    ),
+    immutableDigest: check(
+      "science_compute_profiles_image_digest_check",
+      sql`${t.imageDigest} ~ '^sha256:[0-9a-f]{64}$'`,
+    ),
+  }),
+);
+
+export const scienceRuns = pgTable(
+  "science_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    studyId: uuid("study_id")
+      .notNull()
+      .references(() => scienceStudies.id, { onDelete: "cascade" }),
+    missionId: uuid("mission_id")
+      .notNull()
+      .references(() => missions.id, { onDelete: "restrict" })
+      .unique(),
+    computeProfileId: uuid("compute_profile_id")
+      .notNull()
+      .references(() => scienceComputeProfiles.id, { onDelete: "restrict" }),
+    profileSnapshot: jsonb("profile_snapshot").notNull(),
+    resourceRequest: jsonb("resource_request").notNull(),
+    providerHandle: text("provider_handle"),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
+    state: text("state").notNull().default("draft"),
+    executionGeneration: integer("execution_generation").notNull().default(0),
+    idempotencyKey: text("idempotency_key").notNull(),
+    parameters: jsonb("parameters").notNull().default({}),
+    manifest: jsonb("manifest"),
+    manifestHash: text("manifest_hash"),
+    error: text("error"),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => ({
+    uniqIdempotency: unique("science_runs_study_idempotency_unique").on(
+      t.studyId,
+      t.idempotencyKey,
+    ),
+    studyStateIdx: index("science_runs_study_state_idx").on(t.studyId, t.state, t.createdAt),
+    validState: check(
+      "science_runs_state_check",
+      sql`${t.state} IN ('draft', 'awaiting_approval', 'queued', 'provisioning', 'running', 'finalizing', 'cancelling', 'succeeded', 'failed', 'cancelled')`,
+    ),
+    nonnegativeGeneration: check(
+      "science_runs_generation_check",
+      sql`${t.executionGeneration} >= 0`,
+    ),
+    validManifestHash: check(
+      "science_runs_manifest_hash_check",
+      sql`${t.manifestHash} IS NULL OR ${t.manifestHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validLease: check(
+      "science_runs_lease_check",
+      sql`(${t.leaseOwner} IS NULL AND ${t.leaseExpiresAt} IS NULL AND ${t.heartbeatAt} IS NULL)
+        OR (${t.leaseOwner} IS NOT NULL AND ${t.leaseExpiresAt} IS NOT NULL)`,
+    ),
+  }),
+);
+
+export const scienceRunArtifacts = pgTable(
+  "science_run_artifacts",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => scienceRuns.id, { onDelete: "cascade" }),
+    artifactVersionId: uuid("artifact_version_id")
+      .notNull()
+      .references(() => scienceArtifactVersions.id, { onDelete: "restrict" }),
+    direction: text("direction").notNull(),
+    semanticRole: text("semantic_role").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqLink: unique("science_run_artifacts_unique").on(
+      t.runId,
+      t.artifactVersionId,
+      t.direction,
+      t.semanticRole,
+    ),
+    runIdx: index("science_run_artifacts_run_idx").on(t.runId, t.direction, t.createdAt),
+    validDirection: check(
+      "science_run_artifacts_direction_check",
+      sql`${t.direction} IN ('input', 'output')`,
+    ),
+  }),
+);
+
+export const scienceRunEvents = pgTable(
+  "science_run_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    studyId: uuid("study_id")
+      .notNull()
+      .references(() => scienceStudies.id, { onDelete: "cascade" }),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => scienceRuns.id, { onDelete: "cascade" }),
+    missionId: uuid("mission_id")
+      .notNull()
+      .references(() => missions.id, { onDelete: "cascade" }),
+    sequence: integer("sequence").notNull(),
+    eventType: text("event_type").notNull(),
+    executionGeneration: integer("execution_generation").notNull(),
+    state: text("state").notNull(),
+    payload: jsonb("payload").notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqSequence: unique("science_run_events_run_sequence_unique").on(t.runId, t.sequence),
+    runIdx: index("science_run_events_run_idx").on(t.runId, t.sequence),
+    positiveSequence: check("science_run_events_sequence_check", sql`${t.sequence} > 0`),
+    nonnegativeGeneration: check(
+      "science_run_events_generation_check",
+      sql`${t.executionGeneration} >= 0`,
+    ),
+  }),
+);
+
+export const scienceRenderSessions = pgTable(
+  "science_render_sessions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    runId: uuid("run_id").references(() => scienceRuns.id, { onDelete: "cascade" }),
+    artifactVersionId: uuid("artifact_version_id").references(() => scienceArtifactVersions.id, {
+      onDelete: "cascade",
+    }),
+    providerHandle: text("provider_handle"),
+    tokenHash: text("token_hash").notNull().unique(),
+    audience: text("audience").notNull(),
+    state: text("state").notNull().default("starting"),
+    cleanupAttempts: integer("cleanup_attempts").notNull().default(0),
+    cleanupNotBefore: timestamp("cleanup_not_before", { withTimezone: true }),
+    ownerId: uuid("owner_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    workspaceStateIdx: index("science_render_sessions_workspace_state_idx").on(
+      t.workspaceId,
+      t.state,
+      t.expiresAt,
+    ),
+    validTarget: check(
+      "science_render_sessions_target_check",
+      sql`${t.runId} IS NOT NULL OR ${t.artifactVersionId} IS NOT NULL`,
+    ),
+    validTokenHash: check(
+      "science_render_sessions_token_hash_check",
+      sql`${t.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validState: check(
+      "science_render_sessions_state_check",
+      sql`${t.state} IN ('starting', 'ready', 'expired', 'failed', 'revoked')`,
+    ),
+  }),
+);
+
 export const schema = {
   users,
   sessions,
@@ -766,4 +1156,13 @@ export const schema = {
   verifyChecks,
   projectTraceLinks,
   evidence,
+  scienceStudies,
+  scienceArtifacts,
+  scienceArtifactVersions,
+  scienceUploads,
+  scienceComputeProfiles,
+  scienceRuns,
+  scienceRunArtifacts,
+  scienceRunEvents,
+  scienceRenderSessions,
 };

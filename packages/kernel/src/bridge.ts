@@ -1,11 +1,51 @@
 import type { CodingBackend, CodingProvider, MissionStatus, StepStatus, WorkflowNodeKind } from "@puppetmaster/shared";
 
+export type ScienceEventType =
+  | "science.study.created"
+  | "science.artifact.uploaded"
+  | "science.artifact.ready"
+  | "science.artifact.quarantined"
+  | "science.run.awaiting_approval"
+  | "science.run.queued"
+  | "science.run.provisioning"
+  | "science.run.submit_attempted"
+  | "science.run.started"
+  | "science.run.progress"
+  | "science.run.log"
+  | "science.run.finalizing"
+  | "science.run.succeeded"
+  | "science.run.failed"
+  | "science.run.cancelling"
+  | "science.run.cancelled"
+  | "science.render.starting"
+  | "science.render.ready"
+  | "science.render.heartbeat"
+  | "science.render.expired"
+  | "science.render.failed";
+
+export interface ScienceBusEvent {
+  type: ScienceEventType;
+  workspaceId: string;
+  studyId?: string;
+  runId?: string;
+  /** Required on run events so mission trace and existing authorization paths correlate. */
+  missionId?: string;
+  artifactVersionId?: string;
+  renderSessionId?: string;
+  sequence: number;
+  at: string;
+  state?: string;
+  /** Bounded telemetry only. Binary data and full logs are artifact references. */
+  metadata?: Record<string, unknown>;
+}
+
 /**
  * Typed events flowing on the kernel bus (Redis streams in production, in-memory
  * for single-process dev). Payloads are plain JSON so they serialize onto a
  * Redis stream unchanged. See docs/ARCHITECTURE.md §3.3.
  */
 export type BusEvent =
+  | ScienceBusEvent
   | { type: "mission.started"; missionId: string; workflowVersionId?: string; agentId?: string; at: string }
   | { type: "mission.finished"; missionId: string; status: MissionStatus; at: string }
   | {

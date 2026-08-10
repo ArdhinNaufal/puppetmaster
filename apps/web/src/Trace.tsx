@@ -111,6 +111,7 @@ export function TraceDossier(props: {
 
       <ul className="step-list">
         {steps.map((s) => {
+          const glyph = s.kind === "science" ? "∿" : NODE_META[s.kind]?.glyph ?? "·";
           const t = timing[s.nodeId];
           const start = t?.start;
           const end = t?.end ?? (s.status === "running" ? now : undefined);
@@ -120,7 +121,7 @@ export function TraceDossier(props: {
             <li key={s.id} className={`step st-${s.status}`}>
               <span className="step-dot" />
               <span className="step-node">
-                <span className="step-glyph">{NODE_META[s.kind]?.glyph}</span>
+                <span className="step-glyph" aria-hidden="true">{glyph}</span>
                 {s.nodeId}
                 {s.attempt > 1 && <span className="dim"> ·A{s.attempt}</span>}
               </span>

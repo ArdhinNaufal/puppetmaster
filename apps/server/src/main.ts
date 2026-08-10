@@ -50,6 +50,8 @@ import {
   getDocument,
   getDocumentChunks,
   getMemory,
+  getMembership,
+  getScienceWorkspaceAdmission,
   getMission,
   getMissionSteps,
   getClaudeRunByMission,
@@ -100,6 +102,7 @@ import {
   updateWorkspace,
   writeArtifact,
   type DbHandle,
+  ScienceConflictError,
 } from "@puppetmaster/db";
 import {
   AgentRuntime,
@@ -127,7 +130,9 @@ import {
   registerBridgeTools,
   registerKbTools,
   registerProjectTools,
+  registerScienceTools,
   resolveRequiredSections,
+  resolveScienceRuntimeConfig,
   sectionCoverage,
   replayMission,
   startOtelExporter,
@@ -135,6 +140,13 @@ import {
   startAgentTick,
   startWorkflow,
   WorkflowExecutor,
+  createArtifactStoreFromEnv,
+  createComputeProvidersFromEnv,
+  createRenderProvidersFromEnv,
+  InlineScienceScheduler,
+  QueueScienceScheduler,
+  ScienceDisabledError,
+  ScienceService,
   COST_CLASSES,
   type CostClass,
   type EventBus,
@@ -151,6 +163,10 @@ import { BUILTIN_TEMPLATES } from "./seeds.js";
 import { createAuditSink, startAuditProjector } from "./audit.js";
 import { registerClaudeCodeRoutes, terminalizeClaudeQueueFailure } from "./claude-code-routes.js";
 import {
+  redactScienceRequestPath,
+  registerScienceRoutes,
+} from "./science-routes.js";
+import {
   providerEnvEnabled,
   resolveAnthropicProviderReadiness,
   resolveOpenAiEndpointReadiness,
@@ -166,7 +182,24 @@ const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const REDIS_URL = process.env.REDIS_URL ?? null;
 
-const app = Fastify({ logger: true });
+const app = Fastify({
+  logger: {
+    serializers: {
+      // Signed artifact references carry a short-lived capability in the
+      // query string. Never copy query parameters into normal request logs.
+      req(request) {
+        const rawUrl = typeof request.url === "string" ? request.url : "";
+        return {
+          method: request.method,
+          url: redactScienceRequestPath(rawUrl),
+          host: request.hostname,
+          remoteAddress: request.ip,
+          remotePort: request.socket?.remotePort,
+        };
+      },
+    },
+  },
+});
 let shuttingDown = false;
 
 const ApprovalDecisionInput = z.object({ approved: z.boolean() }).strict();
@@ -421,6 +454,80 @@ const masterKey = process.env.PUPPETMASTER_MASTER_KEY?.trim() || null;
 const credentialLookup = makeCredentialLookup(db, workspaceId, masterKey);
 const auditUnsub = startAuditProjector(bus, db);
 
+// Science Operations is an independently recoverable subsystem. Its control
+// plane shares auth/audit/mission primitives with Puppetmaster, while bytes and
+// long-running computation stay behind artifact/provider adapters.
+const scienceConfig = resolveScienceRuntimeConfig(process.env);
+const configuredScienceSecret =
+  process.env.SCIENCE_SIGNING_SECRET?.trim() || masterKey;
+if (
+  scienceConfig.enabled &&
+  process.env.NODE_ENV === "production" &&
+  !configuredScienceSecret
+) {
+  throw new Error(
+    "SCIENCE_SIGNING_SECRET or PUPPETMASTER_MASTER_KEY is required when Science Operations is enabled in production",
+  );
+}
+const scienceSecret =
+  configuredScienceSecret || "puppetmaster-science-development-key-v1";
+const scienceStore = createArtifactStoreFromEnv(process.env, scienceSecret);
+const scienceComputeProviders = createComputeProvidersFromEnv(process.env);
+const scienceRenderProviders = createRenderProvidersFromEnv(process.env);
+const scienceWorkspaceAdmission = await getScienceWorkspaceAdmission(db, workspaceId);
+const scienceService = new ScienceService({
+  db,
+  workspaceId,
+  store: scienceStore,
+  computeProviders: scienceComputeProviders,
+  renderProviders: scienceRenderProviders,
+  bus,
+  config: scienceConfig,
+  audit: auditSink,
+  gatewaySecret: scienceSecret,
+});
+const scienceScheduler = REDIS_URL && scienceConfig.enabled
+  ? new QueueScienceScheduler(
+      REDIS_URL,
+      (runId, generation) => scienceService.tick(runId, generation),
+      {
+        concurrency: scienceConfig.maxConcurrentRunsPerWorkspace,
+        onError: (message, error) => app.log.error({ err: error }, message),
+      },
+    )
+  : new InlineScienceScheduler(
+      (runId, generation) => scienceService.tick(runId, generation),
+      (message, error) => app.log.error({ err: error }, message),
+    );
+scienceService.attachScheduler(scienceScheduler);
+
+const resolveScienceToolActor = async (
+  ctx: import("@puppetmaster/kernel").ToolContext,
+): Promise<string> => {
+  // Preserve the initiating user across nested workflow/agent missions. Cron
+  // and webhook automation must name an explicit service-account member; they
+  // are never silently attributed to the workspace owner.
+  let missionId = ctx.missionId ?? null;
+  for (let depth = 0; missionId && depth < 20; depth++) {
+    const mission = await getMission(db, missionId);
+    if (!mission) break;
+    const trigger = mission.trigger as Record<string, unknown>;
+    const candidate = typeof trigger.actorId === "string" ? trigger.actorId : null;
+    if (candidate && await getMembership(db, candidate, workspaceId)) return candidate;
+    missionId = mission.parentMissionId;
+  }
+  const automationActor = process.env.SCIENCE_AUTOMATION_USER_ID?.trim();
+  if (automationActor) {
+    const membership = await getMembership(db, automationActor, workspaceId);
+    if (membership && ["builder", "admin", "owner"].includes(membership.role)) {
+      return automationActor;
+    }
+  }
+  throw new Error(
+    "science write tools require an initiating user or a builder SCIENCE_AUTOMATION_USER_ID",
+  );
+};
+
 // OTel GenAI export (Stage 5): finished missions become gen_ai.* traces
 // POSTed as OTLP/HTTP JSON — pluggable into any observability stack.
 const otelEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim();
@@ -453,6 +560,14 @@ registerProjectTools(tools, { db, workspaceId, kb: kbDeps });
 // project's container over the same executor as the shell verify checks.
 // Shares the WORKBENCH_MODE executor — unset ⇒ every bench call refuses by name.
 registerBenchTools(tools, { db, workspaceId, executor: workbenchExecutor });
+
+// Science tools are bounded metadata/reference facades over the same service
+// used by REST. Provider handles and artifact bytes are never registered as
+// user-facing tools.
+registerScienceTools(tools, {
+  service: scienceService,
+  resolveActorId: resolveScienceToolActor,
+});
 
 // --- Tool layer: MCP servers (ARCHITECTURE.md §3.4) ---------------------------
 // Bundled utils connector by default; extend/override via MCP_SERVERS JSON.
@@ -568,6 +683,18 @@ for (const row of await listMcpServers(db, workspaceId)) {
 const dispatch: MissionDispatcher = async (missionId) => {
   const mission = await getMission(db, missionId);
   if (!mission) throw new Error(`mission ${missionId} not found`);
+  if (mission.kind === "science") {
+    if (scienceConfig.submissionsEnabled) {
+      const run = await scienceService.getRunByMission(mission.id);
+      if (run && !["succeeded", "failed", "cancelled"].includes(run.state)) {
+        await scienceScheduler.enqueue(run.id, null);
+      }
+    }
+    // The science scheduler owns provider polling and terminalization. A
+    // generic mission recovery job must hand off and then finish, not execute
+    // a science mission as a workflow graph.
+    return mission.status;
+  }
   return mission.kind === "agent"
     ? agentRuntime.runMission(missionId)
     : mission.kind === "claude"
@@ -580,9 +707,61 @@ const runner: WorkflowRunner = REDIS_URL
   : new InlineRunner(dispatch);
 
 app.log.info(
-  { dbDriver: handle.driver, bus: REDIS_URL ? "redis" : "memory", runner: REDIS_URL ? "queue" : "inline" },
+  {
+    dbDriver: handle.driver,
+    bus: REDIS_URL ? "redis" : "memory",
+    runner: REDIS_URL ? "queue" : "inline",
+    science: {
+      enabled: scienceConfig.enabled,
+      submissionsEnabled: scienceConfig.submissionsEnabled,
+      workspaceAdmittedAtStartup: scienceWorkspaceAdmission.admitted,
+      storage: scienceStore.adapter,
+      computeProviders: scienceComputeProviders.list(),
+      renderProviders: scienceRenderProviders.list(),
+    },
+  },
   "puppetmaster kernel ready",
 );
+const scienceRecovery = await scienceService.reconcile();
+if (
+  scienceRecovery.enqueued > 0 ||
+  scienceRecovery.expiredUploads > 0 ||
+  scienceRecovery.expiredArtifactVersions > 0 ||
+  scienceRecovery.expiredRenderSessions > 0
+) {
+  app.log.info(scienceRecovery, "reconciled Science Operations durable state");
+}
+const scienceReconcilePeriodMs = Math.max(
+  5_000,
+  Math.min(60_000, Math.floor(scienceConfig.uploadTtlSeconds * 500)),
+);
+let scienceReconcilePromise: Promise<void> | null = null;
+const scienceReconcileTimer = scienceConfig.enabled
+  ? setInterval(() => {
+      if (scienceReconcilePromise) return;
+      scienceReconcilePromise = scienceService
+        .reconcile()
+        .then((result) => {
+          if (
+            result.enqueued > 0 ||
+            result.expiredUploads > 0 ||
+            result.expiredArtifactVersions > 0 ||
+            result.expiredRenderSessions > 0 ||
+            result.orphanQuarantineObjects > 0
+          ) {
+            app.log.info(result, "completed periodic Science durable-state reconciliation");
+          }
+        })
+        .catch((error) => {
+          app.log.error({ err: error }, "periodic Science durable-state reconciliation failed");
+        })
+        .finally(() => {
+          scienceReconcilePromise = null;
+        });
+    }, scienceReconcilePeriodMs)
+  : null;
+scienceReconcileTimer?.unref?.();
+await scienceScheduler.start();
 await runner.start();
 
 /** Register cron schedulers for any cron-mode trigger nodes in a workflow. */
@@ -619,6 +798,7 @@ await registerAuth(app, { db, workspaceId });
 
 // --- Security surface: credentials vault + approval policies (Stage 1) --------
 registerSecurityRoutes(app, { db, workspaceId, masterKey });
+registerScienceRoutes(app, { service: scienceService });
 
 registerClaudeCodeRoutes(app, {
   db,
@@ -661,13 +841,55 @@ registerClaudeCodeRoutes(app, {
 });
 
 // --- Meta --------------------------------------------------------------------
-app.get("/api/health", async () => ({ ok: true, service: "puppetmaster-server", version: "0.0.1" }));
+app.get("/api/health", async () => ({
+  ok: true,
+  service: "puppetmaster-server",
+  version: "0.0.1",
+}));
+
+let readinessCache:
+  | { expiresAt: number; value: Awaited<ReturnType<typeof scienceService.health>> }
+  | null = null;
+async function currentReadiness() {
+  const now = Date.now();
+  if (!readinessCache || readinessCache.expiresAt <= now) {
+    readinessCache = {
+      expiresAt: now + 5_000,
+      value: await scienceService.health(),
+    };
+  }
+  return readinessCache.value;
+}
+app.get("/api/readiness", async (_request, reply) => {
+  const readiness = await currentReadiness();
+  return reply.code(readiness.ok ? 200 : 503).send({
+    ok: readiness.ok,
+    service: "puppetmaster-server",
+    version: "0.0.1",
+    science: readiness,
+  });
+});
+
+app.get("/api/readyz", async (_request, reply) => {
+  const readiness = await currentReadiness();
+  return reply.code(readiness.ok ? 200 : 503).send({
+    ok: readiness.ok,
+    service: "puppetmaster-server",
+  });
+});
 
 app.get("/api/bootstrap", async () => ({
   workspaceId,
   dbDriver: handle.driver,
   queue: REDIS_URL ? "bullmq" : "inline",
   tools: tools.list(),
+  science: {
+    enabled: scienceConfig.enabled,
+    submissionsEnabled: scienceConfig.submissionsEnabled,
+    storage: scienceStore.adapter,
+    computeProviders: scienceComputeProviders.list(),
+    renderProviders: scienceRenderProviders.list(),
+  },
 }));
 
 app.get("/api/tools", async () => tools.list());
@@ -1249,7 +1471,7 @@ app.post("/api/workflows/:id/run", async (req, reply) => {
   try {
     const mission = await startWorkflow(db, {
       workflowId: id,
-      trigger: { mode: "manual" },
+      trigger: { mode: "manual", actorId: req.authUser!.id },
       payload: body.input ?? {},
     });
     await runner.enqueue(mission.id);
@@ -1349,7 +1571,7 @@ app.post("/api/agents/:id/chat", async (req, reply) => {
   try {
     const mission = await startAgentTick(db, {
       agentId: id,
-      trigger: { mode: "chat" },
+      trigger: { mode: "chat", actorId: req.authUser!.id },
       payload: { message: body.message },
     });
     await runner.enqueue(mission.id);
@@ -1983,6 +2205,34 @@ app.post("/api/approvals/:id", async (req, reply) => {
     return reply.code(404).send({ error: "approval not found" });
   }
   const approved = decision.data.approved;
+  if (approvalMission.kind === "science") {
+    const scienceRun = await scienceService.getRunByMission(approvalMission.id);
+    if (!scienceRun) {
+      return reply.code(409).send({ error: "science approval is missing its durable run" });
+    }
+    try {
+      const result = await scienceService.resolveApproval({
+        runId: scienceRun.id,
+        approvalId: approval.id,
+        approved,
+        actorId: req.authUser!.id,
+      });
+      return {
+        ok: true,
+        approved,
+        runId: result.run.id,
+        state: result.run.state,
+      };
+    } catch (error) {
+      if (error instanceof ScienceConflictError) {
+        return reply.code(409).send({ error: error.message });
+      }
+      if (error instanceof ScienceDisabledError) {
+        return reply.code(503).send({ error: error.message });
+      }
+      throw error;
+    }
+  }
   const resolved = await resolveApproval(db, id, approved);
   if (!resolved) return reply.code(409).send({ error: "approval has already been resolved" });
   await appendAudit(db, {
@@ -2088,6 +2338,9 @@ const eventMissionWorkspaces = new Map<string, string | null>();
 const eventBelongsToWorkspace = async (event: import("@puppetmaster/kernel").BusEvent): Promise<boolean> => {
   if (event.type === "ops.vitals") return event.workspaceId === workspaceId;
   if (event.type === "audit.appended") return event.workspaceId === workspaceId;
+  if (event.type.startsWith("science.") && "workspaceId" in event) {
+    return event.workspaceId === workspaceId;
+  }
   if (!("missionId" in event) || typeof event.missionId !== "string") return false;
   let owner = eventMissionWorkspaces.get(event.missionId);
   if (owner === undefined) {
@@ -2180,6 +2433,7 @@ function shutdown(): Promise<void> {
   if (shutdownPromise) return shutdownPromise;
   shuttingDown = true;
   clearInterval(vitalsTimer);
+  if (scienceReconcileTimer) clearInterval(scienceReconcileTimer);
   app.log.info("shutting down: stopping intake and draining managed executions");
   shutdownPromise = (async () => {
     // Stop HTTP/queue intake first, but keep DB, event bus, audit projections,
@@ -2189,7 +2443,9 @@ function shutdown(): Promise<void> {
     await Promise.all([
       httpClosed,
       runner.close(),
+      scienceScheduler.close(),
       claudeRuntime.drain(),
+      scienceReconcilePromise ?? Promise.resolve(),
     ]);
     auditUnsub();
     otelUnsub?.();

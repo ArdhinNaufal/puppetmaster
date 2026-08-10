@@ -16,6 +16,8 @@ export interface McpServerConfig {
   headers?: Record<string, string>;
   /** Autonomy tier applied to every tool from this server (default read_auto). */
   tier?: AutonomyTier;
+  /** Optional per-tool overrides for mixed read/write/destructive servers. */
+  toolTiers?: Record<string, AutonomyTier>;
 }
 
 export interface McpConnection {
@@ -49,6 +51,22 @@ export function hashToolDefinition(tool: { description?: string; inputSchema?: u
     .digest("hex");
 }
 
+/** MCP is a bounded command plane. Binary resources and large values belong
+ * in the artifact store and must be returned by reference. */
+const MAX_MCP_RESULT_BYTES = 64 * 1024;
+
+function boundedJson(value: unknown, label: string): unknown {
+  const json = JSON.stringify(value);
+  if (json === undefined) throw new Error(`${label} was not JSON serializable`);
+  if (Buffer.byteLength(json, "utf8") > MAX_MCP_RESULT_BYTES) {
+    throw new Error(`${label} exceeded ${MAX_MCP_RESULT_BYTES} bytes; return an artifact reference`);
+  }
+  if (/data:[^;,]+;base64,/i.test(json)) {
+    throw new Error(`${label} contained inline binary data; return an artifact reference`);
+  }
+  return value;
+}
+
 /**
  * Tool Layer (docs/ARCHITECTURE.md §3.4): connect to an MCP server — stdio or
  * streamable HTTP (Stage 7) — and merge its tools into the shared catalog, so
@@ -79,6 +97,10 @@ export async function connectMcpServer(
   // elicitation requests are attributed to it (tool calls on one MCP client
   // are serialized through the registry's sequential agent/executor loops).
   const current: { missionId: string | null } = { missionId: null };
+  // MCP elicitation requests do not expose the originating tool-call id. Keep
+  // one explicit call lane per client so the mutable mission correlation above
+  // is safe even when registry callers invoke tools concurrently.
+  let callTail: Promise<void> = Promise.resolve();
 
   if (opts?.elicitation) {
     try {
@@ -131,26 +153,53 @@ export async function connectMcpServer(
       config.name,
       tool.name,
       tool.description ?? `MCP tool ${tool.name} from ${config.name}`,
-      config.tier ?? "read_auto",
+      config.toolTiers?.[tool.name] ?? config.tier ?? "read_auto",
       (tool.inputSchema as Record<string, unknown>) ?? { type: "object", properties: {} },
       async (args, ctx) => {
-        current.missionId = ctx.missionId ?? null;
-        try {
-          const result = await client.callTool({ name: tool.name, arguments: args });
-          const blocks = Array.isArray(result.content) ? result.content : [];
-          const text = blocks
-            .filter((b: { type: string }) => b.type === "text")
-            .map((b: { text: string }) => b.text)
-            .join("\n");
-          if (result.isError) throw new Error(text || `MCP tool ${tool.name} failed`);
+        const execute = callTail.then(async () => {
+          current.missionId = ctx.missionId ?? null;
           try {
-            return JSON.parse(text);
-          } catch {
-            return text;
+            const result = await client.callTool({ name: tool.name, arguments: args });
+            const blocks = Array.isArray(result.content) ? result.content : [];
+            const unsupported = blocks.find((block: { type?: string }) => block.type !== "text");
+            if (unsupported) {
+              throw new Error(
+                `MCP tool ${tool.name} returned ${unsupported.type ?? "unknown"} content; ` +
+                "register it as an artifact and return a reference",
+              );
+            }
+            const text = blocks
+              .map((block: { text?: string }) => block.text ?? "")
+              .join("\n");
+            if (result.isError) throw new Error(text || `MCP tool ${tool.name} failed`);
+
+            const structured = (result as { structuredContent?: unknown }).structuredContent;
+            if (structured !== undefined) {
+              return boundedJson(structured, `MCP tool ${tool.name} structured result`);
+            }
+            if (Buffer.byteLength(text, "utf8") > MAX_MCP_RESULT_BYTES) {
+              throw new Error(
+                `MCP tool ${tool.name} result exceeded ${MAX_MCP_RESULT_BYTES} bytes; ` +
+                "return an artifact reference",
+              );
+            }
+            if (/data:[^;,]+;base64,/i.test(text)) {
+              throw new Error(
+                `MCP tool ${tool.name} returned inline binary data; return an artifact reference`,
+              );
+            }
+            try {
+              return boundedJson(JSON.parse(text), `MCP tool ${tool.name} result`);
+            } catch (error) {
+              if (error instanceof SyntaxError) return text;
+              throw error;
+            }
+          } finally {
+            current.missionId = null;
           }
-        } finally {
-          current.missionId = null;
-        }
+        });
+        callTail = execute.then(() => undefined, () => undefined);
+        return execute;
       },
     );
   }

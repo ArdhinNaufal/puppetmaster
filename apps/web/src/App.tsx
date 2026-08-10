@@ -36,16 +36,34 @@ import { useEventStream } from "./useEventStream.js";
 const ClaudeCodeView = lazy(() =>
   import("./claude/ClaudeCodeView.js").then((module) => ({ default: module.ClaudeCodeView })),
 );
+const ScienceView = lazy(() =>
+  import("./science/ScienceView.js").then((module) => ({ default: module.ScienceView })),
+);
 
-const VIEWS = ["nexus", "command", "canvas", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
+const VIEWS = ["nexus", "command", "canvas", "science", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools", "evals", "admin"] as const;
 type View = (typeof VIEWS)[number];
+const VIEW_TITLES: Record<View, string> = {
+  nexus: "NEXUS",
+  command: "COMMAND",
+  canvas: "CANVAS",
+  science: "SCIENCE OPERATIONS",
+  workshop: "WORKSHOP",
+  claude: "CLAUDE",
+  templates: "TEMPLATES",
+  knowledge: "KNOWLEDGE",
+  missions: "MISSIONS",
+  agents: "AGENTS",
+  tools: "TOOLS",
+  evals: "EVALS",
+  admin: "ADMIN",
+};
 
 const RANK: Record<Role, number> = { member: 0, builder: 1, admin: 2, owner: 3 };
 
 /** Role-based navigation (ARCHITECTURE.md §5): which views each role sees… */
 const ROLE_VIEWS: Record<Role, View[]> = {
-  member: ["nexus", "command", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools"],
-  builder: ["nexus", "command", "canvas", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools"],
+  member: ["nexus", "command", "science", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools"],
+  builder: ["nexus", "command", "canvas", "science", "workshop", "claude", "templates", "knowledge", "missions", "agents", "tools"],
   admin: [...VIEWS],
   owner: [...VIEWS],
 };
@@ -65,10 +83,46 @@ const PANEL_PRESET: Record<Role, { order: string[]; collapsed: Record<string, bo
   owner: { order: ["approvals", "signal", "suggested", "list"], collapsed: {} },
 };
 
+const DEFAULT_ACCENT = "#f4f4f0";
+const SHELL_SURFACE_RGB = [10, 10, 11] as const;
+
+function parseHexColor(value: string): [number, number, number] | null {
+  const match = /^#([0-9a-f]{6})$/i.exec(value.trim());
+  if (!match) return null;
+  const hex = match[1];
+  return [
+    Number.parseInt(hex.slice(0, 2), 16),
+    Number.parseInt(hex.slice(2, 4), 16),
+    Number.parseInt(hex.slice(4, 6), 16),
+  ];
+}
+
+function relativeLuminance(rgb: readonly number[]): number {
+  const [r, g, b] = rgb.map((channel) => {
+    const normalized = channel / 255;
+    return normalized <= 0.04045
+      ? normalized / 12.92
+      : ((normalized + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function contrastRatio(left: readonly number[], right: readonly number[]): number {
+  const high = Math.max(relativeLuminance(left), relativeLuminance(right));
+  const low = Math.min(relativeLuminance(left), relativeLuminance(right));
+  return (high + 0.05) / (low + 0.05);
+}
+
+function contrastSafeAccent(value: string | undefined): string {
+  const rgb = value ? parseHexColor(value) : null;
+  return rgb && contrastRatio(rgb, SHELL_SURFACE_RGB) >= 4.5 ? value! : DEFAULT_ACCENT;
+}
+
 function applyBranding(ws: Workspace) {
-  if (ws.branding?.accent) {
-    document.documentElement.style.setProperty("--accent", ws.branding.accent);
-  }
+  document.documentElement.style.setProperty(
+    "--accent",
+    contrastSafeAccent(ws.branding?.accent),
+  );
 }
 
 const SAMPLE_GRAPH = {
@@ -393,7 +447,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     const acts: PaletteAction[] = roleViews.map((v, i) => ({
       id: `view:${v}`,
       group: "VIEWS",
-      label: `GO TO ${v.toUpperCase()}`,
+      label: `GO TO ${VIEW_TITLES[v]}`,
       hint: String(i + 1),
       run: () => setView(v),
     }));
@@ -620,7 +674,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const missionLive = mission !== null && ["queued", "running", "awaiting_approval"].includes(mission.status);
   // NEXUS is the whole theater: the shell's side/operation panels give way to
   // the stage — their content lives on as docked task panes (docs/NEXUS.md §3).
-  const nexusSolo = view === "nexus";
+  const stageSolo = view === "nexus" || view === "science";
 
   return (
     <div className={`app app-view-${view}`}>
@@ -633,7 +687,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           {roleViews.map((v, i) => (
             <button key={v} className={`vs ${view === v ? "on" : ""}`} onClick={() => setView(v)}>
               <span className="vs-idx">{String(i + 1).padStart(2, "0")}</span>
-              {v.toUpperCase()}
+              {VIEW_TITLES[v]}
             </button>
           ))}
         </nav>
@@ -646,8 +700,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </span>
       </header>
 
-      <div className={`grid ${nexusSolo ? "nx-solo" : collapsed.trace ? "no-trace" : ""}`}>
-        {!nexusSolo && (
+      <div className={`grid ${stageSolo ? "nx-solo" : collapsed.trace ? "no-trace" : ""}`}>
+        {!stageSolo && (
           <aside className="panel side">
             {panelOrder.map((id) => sections[id]?.() ?? null)}
           </aside>
@@ -657,7 +711,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           <div className="stage-head">
             <span className="stage-title">
               <span className="stage-idx">{String(roleViews.indexOf(view) + 1).padStart(2, "0")} //</span>
-              <Decode text={view.toUpperCase()} />
+              <Decode text={VIEW_TITLES[view]} />
             </span>
             <span className="stage-hint">
               <kbd>⌘K</kbd> COMMAND · <kbd>1–9</kbd> QUICK VIEWS
@@ -699,6 +753,17 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             )}
             {view === "canvas" && canBuild && (
               <Canvas workflowId={selected} nodeStatus={nodeStatus} onRan={track} onSaved={refreshWorkflows} />
+            )}
+            {view === "science" && (
+              <Suspense fallback={<div className="canvas-empty">LOADING SCIENCE OPERATIONS...</div>}>
+                <ScienceView
+                  canBuild={canBuild}
+                  isAdmin={RANK[me.role] >= RANK.admin}
+                  connected={connected}
+                  signals={signals}
+                  onTrackMission={track}
+                />
+              </Suspense>
             )}
             {view === "templates" && (
               <TemplatesView
@@ -757,7 +822,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           </div>
         </main>
 
-        {!nexusSolo && (
+        {!stageSolo && (
         <aside className="panel trace">
           <div className="panel-head">
             <span><span className="ph-idx">OP</span>{collapsed.trace ? "TRACE" : "OPERATION"}</span>

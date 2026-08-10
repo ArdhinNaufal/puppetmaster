@@ -38,6 +38,11 @@ export const WorkflowNodeKind = z.enum([
 ]);
 export type WorkflowNodeKind = z.infer<typeof WorkflowNodeKind>;
 
+/** Trace steps include one domain-level science operation without making
+ * science a workflow-node implementation detail. */
+export const MissionStepKind = z.union([WorkflowNodeKind, z.literal("science")]);
+export type MissionStepKind = z.infer<typeof MissionStepKind>;
+
 export const NodePosition = z.object({ x: z.number(), y: z.number() });
 export type NodePosition = z.infer<typeof NodePosition>;
 
@@ -131,10 +136,13 @@ export const MissionStatus = z.enum([
 ]);
 export type MissionStatus = z.infer<typeof MissionStatus>;
 
+export const MissionKind = z.enum(["agent", "workflow", "claude", "science"]);
+export type MissionKind = z.infer<typeof MissionKind>;
+
 export const Mission = z.object({
   id: z.string().uuid(),
   workspaceId: z.string().uuid(),
-  kind: z.enum(["agent", "workflow", "claude"]),
+  kind: MissionKind,
   subjectId: z.string().uuid(),
   parentMissionId: z.string().uuid().nullable().default(null),
   status: MissionStatus,
@@ -158,7 +166,7 @@ export const MissionStep = z.object({
   id: z.string().uuid(),
   missionId: z.string().uuid(),
   nodeId: z.string(),
-  kind: WorkflowNodeKind,
+  kind: MissionStepKind,
   status: StepStatus,
   attempt: z.number().int().nonnegative().default(0),
   input: z.unknown().nullable().default(null),

@@ -36,6 +36,31 @@ interface Registered extends ToolInfo {
   fn: ToolFn;
 }
 
+/** Built-ins and MCP share one bounded command plane. Scientific bytes and
+ * large structured values must be persisted as artifacts and returned by
+ * reference, regardless of which registry adapter produced the result. */
+export const MAX_TOOL_RESULT_BYTES = 64 * 1024;
+
+export function boundedToolResult(value: unknown, label: string): unknown {
+  let json: string;
+  try {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new Error("undefined");
+    json = encoded;
+  } catch {
+    throw new Error(`${label} was not JSON serializable`);
+  }
+  if (Buffer.byteLength(json, "utf8") > MAX_TOOL_RESULT_BYTES) {
+    throw new Error(
+      `${label} exceeded ${MAX_TOOL_RESULT_BYTES} bytes; return an artifact reference`,
+    );
+  }
+  if (/data:[^;,]+;base64,/i.test(json)) {
+    throw new Error(`${label} contained inline binary data; return an artifact reference`);
+  }
+  return value;
+}
+
 const obj = (props: Record<string, unknown>, required: string[] = []) => ({
   type: "object",
   properties: props,
@@ -138,7 +163,10 @@ export class BuiltinToolRegistry implements ToolRegistry {
   ): Promise<unknown> {
     const entry = this.tools.get(`${server}.${tool}`);
     if (!entry) throw new Error(`tool ${server}.${tool} not found`);
-    return entry.fn(args, ctx);
+    return boundedToolResult(
+      await entry.fn(args, ctx),
+      `tool ${server}.${tool} result`,
+    );
   }
 
   info(server: string, tool: string): ToolInfo | null {

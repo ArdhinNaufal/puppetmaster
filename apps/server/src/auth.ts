@@ -84,6 +84,13 @@ const POLICY: PolicyRule[] = [
   // creating/updating projects and writing artifacts is builder+ (ADR-001).
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/projects(\/|$)/, role: "builder" },
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/claude-code(\/|$)/, role: "builder" },
+  // Science Operations: reads remain member-visible. Provider/profile
+  // configuration is admin-only; study, artifact, run, and renderer mutation
+  // is builder+. Domain repositories still re-check workspace ownership.
+  { methods: ["PATCH"], path: /^\/api\/science\/workspace-admission$/, role: "admin" },
+  { methods: ["POST", "PATCH", "PUT", "DELETE"], path: /^\/api\/science\/compute-profiles(\/|$)/, role: "admin" },
+  { methods: ["DELETE"], path: /^\/api\/science\/artifact-versions\/[^/]+$/, role: "admin" },
+  { methods: ["POST", "PATCH", "PUT", "DELETE"], path: /^\/api\/science(\/|$)/, role: "builder" },
   { methods: ["POST", "PUT", "DELETE"], path: /^\/api\/workflows(\/|$)/, role: "builder" },
   // The webhook secret is sensitive: revealing it is builder+, not an open GET.
   { methods: ["GET"], path: /^\/api\/workflows\/[^/]+\/webhook$/, role: "builder" },
@@ -112,10 +119,16 @@ const POLICY: PolicyRule[] = [
  *  hardening step). */
 const PUBLIC: RegExp[] = [
   /^\/api\/health$/,
+  /^\/api\/readyz$/,
   /^\/api\/auth\/(status|setup|login)$/,
   /^\/api\/auth\/oidc\/(login|callback)$/,
   /^\/api\/hooks\/[^/]+$/,
 ];
+
+/** Capability URL used by isolated compute/render providers. The route itself
+ * verifies its audience-bound HMAC and expiry before reading any bytes. */
+const SIGNED_ARTIFACT_CONTENT =
+  /^\/api\/science\/artifact-versions\/[^/]+\/content$/;
 
 function requiredRole(method: string, path: string): Role | null {
   for (const rule of POLICY) {
@@ -161,6 +174,10 @@ export async function registerAuth(
     const path = req.url.split("?")[0] ?? req.url;
     if (!path.startsWith("/api")) return;
     if (PUBLIC.some((p) => p.test(path))) return;
+    if (SIGNED_ARTIFACT_CONTENT.test(path)) {
+      const query = new URL(req.url, "http://puppetmaster.invalid").searchParams;
+      if (query.has("sig") && query.has("expires") && query.has("audience")) return;
+    }
 
     const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
     const session = token ? await getSessionUser(db, token) : null;

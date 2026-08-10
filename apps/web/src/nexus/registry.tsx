@@ -590,6 +590,12 @@ export const TASKS: TaskDef[] = [
   { id: "construct.discovery", glyph: "◈", title: "DISCOVERY", category: "OPERATE", minRole: "member", jumpView: null, width: 396, body: DiscoveryBody },
   { id: "system.snapshot", glyph: "⏣", title: "SYSTEM SNAPSHOT", category: "OBSERVE", minRole: "member", jumpView: null, width: 340, hidden: true, body: SnapshotBody },
   // P6: convert these to live pane bodies, one row per commit (docs/NEXUS.md §10).
+  { id: "science.study.open", glyph: "∿", title: "STUDY DOSSIER", category: "OBSERVE", minRole: "member", jumpView: "science", jumpOnly: true },
+  { id: "science.artifact.ingest", glyph: "⇪", title: "INGEST SCIENTIFIC ARTIFACT", category: "BUILD", minRole: "builder", jumpView: "science", jumpOnly: true },
+  { id: "science.run.configure", glyph: "▶", title: "CONFIGURE COMPUTATION", category: "OPERATE", minRole: "builder", jumpView: "science", jumpOnly: true },
+  { id: "science.run.observe", glyph: "⌁", title: "OBSERVE SCIENTIFIC RUN", category: "OBSERVE", minRole: "member", jumpView: "science", jumpOnly: true },
+  { id: "science.provenance.inspect", glyph: "#", title: "INSPECT PROVENANCE", category: "OBSERVE", minRole: "member", jumpView: "science", jumpOnly: true },
+  { id: "science.compute.manage", glyph: "⚙", title: "COMPUTE PROFILES", category: "GOVERN", minRole: "admin", jumpView: "science", jumpOnly: true },
   { id: "workshop", glyph: "⚒", title: "WORKSHOP", category: "BUILD", minRole: "member", jumpView: "workshop", jumpOnly: true },
   { id: "knowledge.ingest", glyph: "⇪", title: "INGEST DOCUMENT", category: "BUILD", minRole: "builder", jumpView: "knowledge", jumpOnly: true },
   { id: "evals.run", glyph: "✓", title: "EVAL SUITE", category: "GOVERN", minRole: "admin", jumpView: "evals", jumpOnly: true },

@@ -3,6 +3,7 @@
 import type { ClaudeEvent, ClaudeRun, ClaudeSession } from "@puppetmaster/shared";
 
 export type NodeKind = "trigger" | "action" | "logic" | "code" | "agent" | "approval" | "verify";
+export type MissionStepKind = NodeKind | "science";
 
 /** Verify-check names (mirror of shared VerifyCheckName) — the verify-node
  *  config inspector's check picker (WP7.4). */
@@ -69,7 +70,7 @@ export interface Mission {
 export interface MissionStep {
   id: string;
   nodeId: string;
-  kind: NodeKind;
+  kind: MissionStepKind;
   status: StepStatus;
   attempt: number;
   output: unknown;
@@ -353,6 +354,16 @@ export interface WatchLayout {
   open?: boolean;
 }
 
+/** Science Operations workspace state. Selection is convenience state only;
+ * authoritative study/run data is always reloaded from REST. */
+export interface ScienceLayout {
+  studyId?: string;
+  runId?: string;
+  railCollapsed?: boolean;
+  dossierCollapsed?: boolean;
+  fallbackMode?: "auto" | "static" | "table";
+}
+
 const post = (url: string, body: unknown) =>
   fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
@@ -380,9 +391,9 @@ export const memberApi = {
 };
 
 export const prefsApi = {
-  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout } }>),
+  get: () => fetch("/api/me/preferences").then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout; science?: ScienceLayout } }>),
   /** Merges the given keys over the saved layout (server stores the whole object). */
-  save: async (layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout }) => {
+  save: async (layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout; science?: ScienceLayout }) => {
     const current = await fetch("/api/me/preferences")
       .then(json<{ layout: Record<string, unknown> }>)
       .catch(() => ({ layout: {} as Record<string, unknown> }));
@@ -390,7 +401,487 @@ export const prefsApi = {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ layout: { ...current.layout, ...layout } }),
-    }).then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout } }>);
+    }).then(json<{ layout: { panels?: PanelLayout; nexus?: NexusLayout; watch?: WatchLayout; science?: ScienceLayout } }>);
+  },
+};
+
+// --- Science Operations --------------------------------------------------------
+
+export interface SciencePage<T> {
+  items: T[];
+  nextCursor: string | null;
+  total?: number;
+}
+
+export interface ScienceWorkspaceAdmission {
+  workspaceId: string;
+  admitted: boolean;
+  updatedAt: string | null;
+}
+
+export type ScienceRunState =
+  | "draft"
+  | "awaiting_approval"
+  | "queued"
+  | "provisioning"
+  | "running"
+  | "finalizing"
+  | "cancelling"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface ScienceStudy {
+  id: string;
+  workspaceId: string;
+  name: string;
+  description: string;
+  status: "active" | "archived" | string;
+  classification: string;
+  workshopProjectId: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScienceArtifactVersion {
+  id: string;
+  artifactId: string;
+  version: number;
+  status: "pending" | "ready" | "quarantined" | "expired" | string;
+  sha256: string;
+  sizeBytes: number;
+  mediaType: string;
+  metadata: Record<string, unknown>;
+  parentVersionId: string | null;
+  createdBy?: string;
+  createdAt: string;
+  readyAt?: string | null;
+}
+
+export interface ScienceArtifact {
+  id: string;
+  studyId: string;
+  logicalName: string;
+  kind: string;
+  format: string;
+  status: string;
+  createdBy?: string;
+  versionCount?: number;
+  /** List/detail projection required by the Science rail; content is not included. */
+  latestVersion?: ScienceArtifactVersion | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScienceResourceRequest {
+  cpuMillicores: number;
+  memoryMb: number;
+  gpuCount: number;
+  wallTimeSeconds: number;
+}
+
+export type ScienceComputeProviderKind =
+  | "local_container"
+  | "jupyter_enterprise_gateway";
+
+export interface ScienceComputeSnapshot {
+  profileId: string;
+  providerKind: ScienceComputeProviderKind;
+  imageDigest: string;
+  kernelName: string;
+  resourceBounds: ScienceResourceRequest;
+  config: Record<string, unknown>;
+}
+
+export interface ScienceComputeProfile {
+  id: string;
+  workspaceId: string;
+  name: string;
+  providerKind: ScienceComputeProviderKind;
+  imageDigest: string;
+  kernelName: string;
+  resourceBounds: ScienceResourceRequest;
+  config: Record<string, unknown>;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /** Optional measured quote projection; absent values are rendered as N/A. */
+  availability?: "available" | "degraded" | "offline" | string;
+  measuredEstimate?: {
+    queueWaitMs?: number | null;
+    cost?: number | null;
+    currency?: string | null;
+  } | null;
+}
+
+export type ScienceComputeProfileInput = Omit<
+  ScienceComputeProfile,
+  "id" | "workspaceId" | "createdAt" | "updatedAt" | "availability" | "measuredEstimate"
+>;
+
+export interface ScienceRunArtifactRef {
+  id?: string;
+  runId?: string;
+  artifactVersionId: string;
+  artifactId?: string;
+  logicalName?: string;
+  direction: "input" | "output";
+  semanticRole: string;
+  sha256?: string | null;
+  sizeBytes?: number | null;
+  createdAt?: string;
+}
+
+export interface ScienceRunEvent {
+  id: string;
+  runId: string;
+  sequence: number;
+  eventType: string;
+  executionGeneration: number;
+  state: ScienceRunState;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface ScienceRun {
+  id: string;
+  studyId: string;
+  missionId: string;
+  computeProfileId: string;
+  profileSnapshot: ScienceComputeSnapshot;
+  profileName?: string;
+  state: ScienceRunState;
+  executionGeneration: number;
+  idempotencyKey: string;
+  parameters: Record<string, unknown>;
+  resourceRequest: ScienceResourceRequest;
+  progress?: number | null;
+  manifest?: ScienceManifest | null;
+  manifestHash: string | null;
+  inputs?: ScienceRunArtifactRef[];
+  outputs?: ScienceRunArtifactRef[];
+  recentEvents?: ScienceRunEvent[];
+  createdAt: string;
+  updatedAt: string;
+  submittedAt?: string | null;
+  queuedAt?: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
+
+export interface ScienceManifestArtifact {
+  artifactVersionId: string;
+  logicalName?: string;
+  semanticRole: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface ScienceManifest {
+  schemaVersion: 1;
+  studyId: string;
+  runId: string;
+  missionId: string;
+  complete: boolean;
+  gaps: string[];
+  inputs: ScienceManifestArtifact[];
+  outputs: ScienceManifestArtifact[];
+  codeArtifactVersionId: string | null;
+  sourceRevision: string | null;
+  compute: ScienceComputeSnapshot & {
+    requestedResources: ScienceResourceRequest;
+    adapterVersion: string;
+    dependencyLock: Record<string, unknown>;
+  };
+  parameters: Record<string, unknown>;
+  units: Record<string, string>;
+  randomSeeds: Record<string, number>;
+  environment: Record<string, string>;
+  actorId: string;
+  approvalIds: string[];
+  policyIds: string[];
+  toolCalls: string[];
+  startedAt: string | null;
+  finishedAt: string;
+  history: Array<{
+    event: string;
+    at: string;
+    generation: number;
+    detail: Record<string, unknown>;
+  }>;
+  validations: Record<string, unknown>[];
+  limitations: string[];
+}
+
+export interface ScienceRunComparison {
+  leftRunId: string;
+  rightRunId: string;
+  comparison: {
+    sameInputs: boolean;
+    sameParameters: boolean;
+    sameEnvironment: boolean;
+    sameOutputs: boolean;
+    differences: string[];
+    /** Null means no candidate validation declared both a metric and tolerance. */
+    numericallyEquivalent: boolean | null;
+    numericalValidation: {
+      passed: boolean;
+      metric: string | null;
+      tolerance: number | string | Record<string, number | string> | null;
+      observed: number | string | null;
+      units: string | null;
+    } | null;
+  };
+}
+
+export interface ScienceRenderSession {
+  id: string;
+  workspaceId: string;
+  runId: string | null;
+  artifactVersionId: string | null;
+  state: "starting" | "ready" | "expired" | "failed" | "revoked" | string;
+  /** Authorized same-origin projection; never persisted in the session row. */
+  url: string | null;
+  expiresAt: string;
+  heartbeatAt: string | null;
+}
+
+export interface ScienceRunInput {
+  computeProfileId: string;
+  inputs: Array<{
+    artifactVersionId: string;
+    semanticRole: string;
+  }>;
+  parameters: Record<string, unknown>;
+  requestedResources: ScienceResourceRequest;
+  idempotencyKey: string;
+}
+
+interface SciencePageEnvelope<T> {
+  items?: T[];
+  data?: T[];
+  nextCursor?: string | null;
+  next?: string | null;
+  nextOffset?: number | null;
+  total?: number;
+}
+
+/** Lists are cursor-bounded from v1. Accept an array only as a temporary
+ * compatibility envelope; callers still render and retain one page at a time. */
+async function sciencePage<T>(res: Response): Promise<SciencePage<T>> {
+  const body = await json<T[] | SciencePageEnvelope<T>>(res);
+  if (Array.isArray(body)) return { items: body, nextCursor: null, total: body.length };
+  return {
+    items: body.items ?? body.data ?? [],
+    nextCursor: body.nextCursor ?? body.next ?? (body.nextOffset == null ? null : String(body.nextOffset)),
+    ...(body.total === undefined ? {} : { total: body.total }),
+  };
+}
+
+const scienceQuery = (input: { cursor?: string | null; limit?: number; state?: string } = {}) => {
+  const query = new URLSearchParams();
+  if (input.cursor) {
+    if (/^\d+$/.test(input.cursor)) query.set("offset", input.cursor);
+    else query.set("cursor", input.cursor);
+  }
+  if (input.limit !== undefined) query.set("limit", String(input.limit));
+  if (input.state) query.set("state", input.state);
+  const qs = query.toString();
+  return qs ? `?${qs}` : "";
+};
+
+async function expectScienceOk(res: Response): Promise<void> {
+  if (res.ok) return;
+  await json<never>(res);
+}
+
+async function scienceEntity<T>(res: Response, key: string): Promise<T> {
+  const body = await json<T | Record<string, unknown>>(res);
+  if (body && typeof body === "object" && key in body) {
+    return (body as Record<string, unknown>)[key] as T;
+  }
+  return body as T;
+}
+
+async function scienceManifest(res: Response): Promise<ScienceManifest> {
+  const body = await json<
+    ScienceManifest | { manifest: ScienceManifest | null; manifestHash?: string | null }
+  >(res);
+  if ("manifest" in body) {
+    if (body.manifest) return body.manifest;
+    throw new ApiError(404, "No provenance manifest is available for this run.", body);
+  }
+  return body;
+}
+
+async function scienceRenderSession(res: Response): Promise<ScienceRenderSession> {
+  const body = await json<
+    | ScienceRenderSession
+    | {
+        session: Omit<ScienceRenderSession, "url"> & { url?: string | null };
+        renderUrl?: string | null;
+        launchUrl?: string | null;
+      }
+  >(res);
+  if ("session" in body) {
+    return {
+      ...body.session,
+      url: body.renderUrl ?? body.launchUrl ?? body.session.url ?? null,
+    };
+  }
+  return body;
+}
+
+export const scienceApi = {
+  workspaceAdmission: () =>
+    fetch("/api/science/workspace-admission")
+      .then(json<{ admission: ScienceWorkspaceAdmission }>)
+      .then(({ admission }) => admission),
+  updateWorkspaceAdmission: (input: { admitted: boolean; reason: string }) =>
+    fetch("/api/science/workspace-admission", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    })
+      .then(json<{ admission: ScienceWorkspaceAdmission }>)
+      .then(({ admission }) => admission),
+  studies: (input: { cursor?: string | null; limit?: number } = {}) =>
+    fetch(`/api/science/studies${scienceQuery(input)}`).then(sciencePage<ScienceStudy>),
+  createStudy: (input: { name: string; classification?: string; workshopProjectId?: string }) =>
+    post("/api/science/studies", input).then((res) => scienceEntity<ScienceStudy>(res, "study")),
+  study: (studyId: string) =>
+    fetch(`/api/science/studies/${encodeURIComponent(studyId)}`).then(
+      (res) => scienceEntity<ScienceStudy>(res, "study"),
+    ),
+  updateStudy: (studyId: string, patch: { name?: string; status?: string; classification?: string; workshopProjectId?: string | null }) =>
+    fetch(`/api/science/studies/${encodeURIComponent(studyId)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then((res) => scienceEntity<ScienceStudy>(res, "study")),
+  artifacts: (studyId: string, input: { cursor?: string | null; limit?: number } = {}) =>
+    fetch(`/api/science/studies/${encodeURIComponent(studyId)}/artifacts${scienceQuery(input)}`).then(
+      sciencePage<ScienceArtifact>,
+    ),
+  createArtifact: (studyId: string, input: { logicalName: string; kind: string; format: string }) =>
+    post(`/api/science/studies/${encodeURIComponent(studyId)}/artifacts`, input).then(
+      (res) => scienceEntity<ScienceArtifact>(res, "artifact"),
+    ),
+  artifactVersions: (
+    artifactId: string,
+    input: { cursor?: string | null; limit?: number } = {},
+  ) =>
+    fetch(
+      `/api/science/artifacts/${encodeURIComponent(artifactId)}/versions${scienceQuery(input)}`,
+    ).then(sciencePage<ScienceArtifactVersion>),
+  beginUpload: (
+    artifactId: string,
+    input: {
+      filename: string;
+      expectedSizeBytes: number;
+      expectedSha256: string;
+      mediaType: string;
+    },
+  ) =>
+    post(`/api/science/artifacts/${encodeURIComponent(artifactId)}/uploads`, input).then(
+      json<{ uploadToken: string; uploadUrl?: string; expiresAt?: string }>,
+    ),
+  putUpload: async (uploadToken: string, file: Blob, uploadUrl?: string) => {
+    const res = await fetch(uploadUrl ?? `/api/science/uploads/${encodeURIComponent(uploadToken)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/octet-stream" },
+      body: file,
+    });
+    await expectScienceOk(res);
+  },
+  completeUpload: (
+    uploadToken: string,
+    input: {
+      mediaType: string;
+      metadata: Record<string, unknown> & { filename: string };
+      parentVersionId?: string | null;
+    },
+  ) =>
+    post(`/api/science/uploads/${encodeURIComponent(uploadToken)}/complete`, input).then(
+      json<ScienceArtifactVersion>,
+    ),
+  artifactVersion: (versionId: string) =>
+    fetch(`/api/science/artifact-versions/${encodeURIComponent(versionId)}`).then(
+      (res) => scienceEntity<ScienceArtifactVersion>(res, "artifactVersion"),
+    ),
+  artifactContentUrl: (versionId: string) =>
+    `/api/science/artifact-versions/${encodeURIComponent(versionId)}/content`,
+  expireArtifactVersion: (versionId: string, confirmSha256: string) =>
+    fetch(`/api/science/artifact-versions/${encodeURIComponent(versionId)}`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirmSha256 }),
+    }).then((res) =>
+      scienceEntity<ScienceArtifactVersion>(res, "artifactVersion"),
+    ),
+  computeProfiles: () =>
+    fetch("/api/science/compute-profiles")
+      .then(sciencePage<ScienceComputeProfile>)
+      .then((page) => page.items),
+  createComputeProfile: (input: ScienceComputeProfileInput) =>
+    post("/api/science/compute-profiles", input).then(
+      (res) => scienceEntity<ScienceComputeProfile>(res, "profile"),
+    ),
+  updateComputeProfile: (
+    profileId: string,
+    patch: Partial<ScienceComputeProfileInput>,
+  ) =>
+    fetch(`/api/science/compute-profiles/${encodeURIComponent(profileId)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then((res) => scienceEntity<ScienceComputeProfile>(res, "profile")),
+  runs: (studyId: string, input: { cursor?: string | null; limit?: number; state?: string } = {}) =>
+    fetch(`/api/science/studies/${encodeURIComponent(studyId)}/runs${scienceQuery(input)}`).then(
+      sciencePage<ScienceRun>,
+    ),
+  createRun: (studyId: string, input: ScienceRunInput) =>
+    post(`/api/science/studies/${encodeURIComponent(studyId)}/runs`, {
+      computeProfileId: input.computeProfileId,
+      inputs: input.inputs,
+      parameters: input.parameters,
+      resourceRequest: input.requestedResources,
+      idempotencyKey: input.idempotencyKey,
+    }).then((res) => scienceEntity<ScienceRun>(res, "run")),
+  run: (runId: string) =>
+    fetch(`/api/science/runs/${encodeURIComponent(runId)}`).then(
+      (res) => scienceEntity<ScienceRun>(res, "run"),
+    ),
+  cancelRun: (runId: string, input: { generation: number; reason?: string }) =>
+    post(`/api/science/runs/${encodeURIComponent(runId)}/cancel`, input).then(
+      (res) => scienceEntity<ScienceRun>(res, "run"),
+    ),
+  manifest: (runId: string) =>
+    fetch(`/api/science/runs/${encodeURIComponent(runId)}/manifest`).then(scienceManifest),
+  reproduce: (runId: string, input: { idempotencyKey: string }) =>
+    post(`/api/science/runs/${encodeURIComponent(runId)}/reproduce`, input).then(
+      (res) => scienceEntity<ScienceRun>(res, "run"),
+    ),
+  compareRuns: (runId: string, candidateRunId: string) =>
+    post(`/api/science/runs/${encodeURIComponent(runId)}/reproduce`, {
+      candidateRunId,
+    }).then(json<ScienceRunComparison>),
+  createRenderSession: (runId: string, input: { artifactVersionId?: string } = {}) =>
+    post(`/api/science/runs/${encodeURIComponent(runId)}/render-sessions`, {
+      ...input,
+      audience: globalThis.location?.origin ?? "puppetmaster-web",
+    }).then(scienceRenderSession),
+  renewRenderSession: (sessionId: string) =>
+    post(`/api/science/render-sessions/${encodeURIComponent(sessionId)}/renew`, {}).then(
+      scienceRenderSession,
+    ),
+  closeRenderSession: async (sessionId: string) => {
+    const res = await fetch(`/api/science/render-sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+    await expectScienceOk(res);
   },
 };
 
@@ -917,11 +1408,50 @@ export interface AuditAppended {
   tier?: string;
 }
 
+export type ScienceEventType =
+  | "science.study.created"
+  | "science.artifact.uploaded"
+  | "science.artifact.ready"
+  | "science.artifact.quarantined"
+  | "science.run.awaiting_approval"
+  | "science.run.queued"
+  | "science.run.provisioning"
+  | "science.run.started"
+  | "science.run.progress"
+  | "science.run.log"
+  | "science.run.finalizing"
+  | "science.run.succeeded"
+  | "science.run.failed"
+  | "science.run.cancelling"
+  | "science.run.cancelled"
+  | "science.render.starting"
+  | "science.render.ready"
+  | "science.render.heartbeat"
+  | "science.render.expired"
+  | "science.render.failed";
+
+/** Bounded Science Operations projection carried over the existing event
+ * stream. Durable run, artifact, and manifest state is still re-read by REST. */
+export interface ScienceBusEvent {
+  type: ScienceEventType;
+  workspaceId: string;
+  studyId?: string;
+  runId?: string;
+  missionId?: string;
+  artifactVersionId?: string;
+  renderSessionId?: string;
+  sequence: number;
+  at: string;
+  state?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export type BusEvent =
+  | ScienceBusEvent
   | { type: "mission.started"; missionId: string; agentId?: string; at: string }
   | { type: "agent.message"; agentId: string; missionId: string; role: string; text: string; at: string }
   | { type: "mission.finished"; missionId: string; status: string; at: string }
-  | { type: "mission.step"; missionId: string; nodeId: string; kind: NodeKind; status: StepStatus; at: string }
+  | { type: "mission.step"; missionId: string; nodeId: string; kind: MissionStepKind; status: StepStatus; at: string }
   | { type: "approval.requested"; missionId: string; nodeId: string; approvalId: string; prompt: string; at: string }
   | { type: "approval.resolved"; missionId: string; approvalId: string; approved: boolean; at: string }
   | { type: "agent.message.delta"; agentId: string; missionId: string; delta: string; at: string }

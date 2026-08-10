@@ -735,7 +735,8 @@ export function AdminView(props: { meId: string; onBrandingChange: (ws: Workspac
           </div>
           <p className="dim">
             Branding is workspace-scoped white-labelling (PRD §6): the accent hue and brand name skin
-            the shell for every member.
+            the shell for every member. Hues below AA text contrast on the dark shell are saved but
+            rendered with the neutral safe accent.
           </p>
         </div>
       </Panel>

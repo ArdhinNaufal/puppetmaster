@@ -1,0 +1,18 @@
+# vtk DataFile Version 3.0
+Puppetmaster deterministic scalar fixture
+ASCII
+DATASET STRUCTURED_POINTS
+DIMENSIONS 2 2 2
+ORIGIN 0 0 0
+SPACING 1 1 1
+POINT_DATA 8
+SCALARS temperature float 1
+LOOKUP_TABLE default
+293.15
+293.80
+294.10
+294.45
+294.80
+295.02
+295.40
+295.80
