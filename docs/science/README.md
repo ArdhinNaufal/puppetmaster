@@ -29,6 +29,8 @@ same thing as an admitted adapter.
 
 ## Documentation map
 
+- [`user-guide.md`](./user-guide.md): plain-language operating manual,
+  end-to-end workflows, troubleshooting, and a beginner REST integration guide.
 - [`installation-and-configuration.md`](./installation-and-configuration.md):
   install, environment variables, first-run setup, and verification commands.
 - [`provider-contracts.md`](./provider-contracts.md): artifact, compute,
