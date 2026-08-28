@@ -11,6 +11,7 @@ import {
   appendAudit,
   createDb,
   createUser,
+  deleteTerminalScienceUploadAfterDiscard,
   ensureDefaultWorkspace,
   getApproval,
   getMission,
@@ -34,6 +35,10 @@ import {
   hashPassword,
   registerAuth,
 } from "../apps/server/dist/auth.js";
+import {
+  authorizationMethod,
+  canonicalRequestPath,
+} from "../apps/server/dist/request-path.js";
 import { registerScienceRoutes } from "../apps/server/dist/science-routes.js";
 
 const requireFromServer = createRequire(
@@ -64,6 +69,9 @@ const CONFIG = {
   maxUploadBytes: 8 * 1024 * 1024,
   maxWorkspaceStorageBytes: 64 * 1024 * 1024,
   uploadTtlSeconds: 600,
+  externalUploadAbsoluteTimeoutMs: 60_000,
+  externalUploadIdleTimeoutMs: 10_000,
+  maxConcurrentExternalUploadStreamsPerWorkspace: 4,
   renderTtlSeconds: 300,
   maxConcurrentRunsPerWorkspace: 8,
   maxConcurrentRenderSessionsPerWorkspace: 16,
@@ -385,11 +393,105 @@ try {
     url: "/api/science/studies",
     payload: { name: "Unauthenticated mutation" },
   }), 401);
+  responseJson(await app.inject({
+    method: "GET",
+    url: "/%61pi/science/studies",
+  }), 401);
+  responseJson(await app.inject({
+    method: "GET",
+    url: "/api/%73cience/studies",
+  }), 401);
+  for (const url of [
+    "/%2561pi/science/studies",
+    "/api/%2573cience/studies",
+    "/api/%252Gscience/studies",
+    "/api/%ZZscience/studies",
+    "/api/%7",
+  ]) {
+    assert.equal((await app.inject({ method: "GET", url })).statusCode, 400);
+  }
+  assert.equal(canonicalRequestPath("/%61pi"), "/api");
+  assert.equal(canonicalRequestPath("/api/%73cience"), "/api/science");
+  assert.equal(canonicalRequestPath("/%61pi/%73cience?view=all"), "/api/science");
+  assert.equal(authorizationMethod("HEAD"), "GET");
+  assert.throws(() => canonicalRequestPath("/%2561pi/science"), /invalid request path/);
   console.log("ok - unauthenticated science reads and mutations return 401");
+  console.log("ok - encoded API paths canonicalize once while ambiguous or invalid encoding fails closed");
 
   const adminCookie = await login(app, admin.email, "admin");
   const builderCookie = await login(app, builder.email, "builder");
   const memberCookie = await login(app, member.email, "member");
+  responseJson(await app.inject({
+    method: "GET",
+    url: "/api/%6dembers",
+    headers: { cookie: memberCookie },
+  }), 403);
+  assert.equal((await app.inject({
+    method: "HEAD",
+    url: "/api/members",
+    headers: { cookie: memberCookie },
+  })).statusCode, 403);
+  assert.equal((await app.inject({
+    method: "HEAD",
+    url: "/api/%6dembers",
+    headers: { cookie: memberCookie },
+  })).statusCode, 403);
+  responseJson(await app.inject({
+    method: "POST",
+    url: "/%61pi/%73cience/studies",
+    headers: { cookie: memberCookie },
+    payload: { name: "Encoded member mutation" },
+  }), 403);
+  responseJson(await app.inject({
+    method: "POST",
+    url: "/api/science/%63ompute-profiles",
+    headers: { cookie: builderCookie },
+    payload: {},
+  }), 403);
+  assert.equal((await app.inject({
+    method: "HEAD",
+    url: "/api/science/admin/action-queue",
+    headers: { cookie: builderCookie },
+  })).statusCode, 403);
+  console.log("ok - encoded admin and mutation paths plus HEAD inherit canonical RBAC policy");
+
+  const rateLimitApp = Fastify({ logger: false });
+  try {
+    await registerAuth(rateLimitApp, {
+      db: dbHandle.db,
+      workspaceId: workspaceAId,
+    });
+    registerScienceRoutes(rateLimitApp, {
+      service: serviceA,
+      rateLimit: { readPerMinute: 1, writePerMinute: 1 },
+    });
+    await rateLimitApp.ready();
+    responseJson(await rateLimitApp.inject({
+      method: "GET",
+      url: "/api/science/studies",
+      headers: { cookie: memberCookie },
+    }), 200);
+    responseJson(await rateLimitApp.inject({
+      method: "GET",
+      url: "/api/%73cience/studies",
+      headers: { cookie: memberCookie },
+    }), 429);
+    responseJson(await rateLimitApp.inject({
+      method: "POST",
+      url: "/api/science/studies",
+      headers: { cookie: builderCookie },
+      payload: {},
+    }), 400);
+    responseJson(await rateLimitApp.inject({
+      method: "POST",
+      url: "/api/%73cience/studies",
+      headers: { cookie: builderCookie },
+      payload: {},
+    }), 429);
+  } finally {
+    await rateLimitApp.close();
+  }
+  console.log("ok - canonical and encoded Science paths share read and write rate buckets");
   const authenticatedReadiness = responseJson(await app.inject({
     method: "GET",
     url: "/api/readiness",
@@ -713,18 +815,97 @@ try {
   }
   assert.equal(dossier.state, "succeeded");
   assert.equal(dossier.providerHandle, null);
-  assert.equal(dossier.outputs.length, 2);
+  assert.equal(dossier.outputs.length, 3);
+  const staticPreview = dossier.outputs.find((output) =>
+    output.logicalName?.endsWith("-fixture-preview.png") &&
+    output.semanticRole === "fixture-preview.png" &&
+    output.mediaType === "image/png" &&
+    output.format === "png"
+  );
+  assert.ok(staticPreview, "deterministic authorization run must expose its static PNG preview");
+  assert.match(staticPreview.sha256 ?? "", /^[0-9a-f]{64}$/);
+  assert.ok(Number.isSafeInteger(staticPreview.sizeBytes));
+  assert.ok(staticPreview.sizeBytes > 0 && staticPreview.sizeBytes <= 8 * 1024 * 1024);
   const manifest = responseJson(await app.inject({
     method: "GET",
     url: `/api/science/runs/${submitted.run.id}/manifest`,
     headers: { cookie: builderCookie },
   }), 200).manifest;
   assert.equal(manifest.complete, true);
-  assert.equal(manifest.outputs.length, 2);
+  assert.equal(manifest.outputs.length, 3);
+  assert.ok(manifest.outputs.some((output) =>
+    output.artifactVersionId === staticPreview.artifactVersionId &&
+    output.sha256 === staticPreview.sha256 &&
+    output.sizeBytes === staticPreview.sizeBytes
+  ));
   assert.equal(schedulerErrors.length, 0);
   console.log(
     "ok - builder completes study, upload, generic approval, execution, and manifest flow",
   );
+
+  const syntheticDomainReview = {
+    kind: "domain-validation",
+    metric: "synthetic-output-count",
+    tolerance: 0,
+    observedValue: manifest.outputs.length,
+    units: "count",
+    methodProtocolId: "synthetic-authz-protocol/v1",
+    decision: true,
+    limitationsReason: "Synthetic authorization fixture; not release or domain evidence.",
+  };
+  responseJson(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/validations`,
+    headers: { cookie: memberCookie },
+    payload: syntheticDomainReview,
+  }), 403);
+  responseJson(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/validations`,
+    headers: { cookie: builderCookie },
+    payload: syntheticDomainReview,
+  }), 403);
+  responseJson(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/validations`,
+    headers: { cookie: adminCookie },
+    payload: { ...syntheticDomainReview, reviewerId: member.id },
+  }), 400);
+  const domainReview = responseJson(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/validations`,
+    headers: { cookie: adminCookie },
+    payload: syntheticDomainReview,
+  }), 201).validation;
+  assert.equal(domainReview.reviewerId, admin.id);
+  assert.equal(domainReview.reviewerRole, "admin");
+  assert.equal(domainReview.revision, 1);
+  assert.equal(domainReview.runManifestHash, dossier.manifestHash);
+  assert.match(domainReview.recordHash, /^[0-9a-f]{64}$/);
+  const memberReviews = responseJson(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/validations`,
+    headers: { cookie: memberCookie },
+  }), 200);
+  assert.deepEqual(memberReviews.items.map((entry) => entry.id), [domainReview.id]);
+  assert.equal(JSON.stringify(memberReviews).includes("OutputChecksums"), false);
+  const memberReviewDetail = responseJson(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/validations/${domainReview.id}`,
+    headers: { cookie: memberCookie },
+  }), 200).validation;
+  assert.deepEqual(memberReviewDetail.runOutputChecksums, domainReview.runOutputChecksums);
+  responseJson(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/validations?limit=101`,
+    headers: { cookie: memberCookie },
+  }), 400);
+  await assert.rejects(
+    () => serviceB.getDomainValidation(submitted.run.id, domainReview.id),
+    /not found/i,
+    "a validation detail must remain hidden from a foreign workspace service",
+  );
+  console.log("ok - only admin/owner sessions author immutable reviews while members read them");
 
   const retentionUpload = await uploadDirect(serviceA, {
     studyId: study.id,
@@ -842,6 +1023,123 @@ try {
     actorId: foreignOwner.id,
   });
 
+  const queueBytesA = Buffer.from("workspace A admin queue quarantine");
+  const queueArtifactA = await serviceA.createArtifact({
+    studyId: study.id,
+    logicalName: "admin-action-queue-a.bin",
+    kind: "dataset",
+    format: "binary",
+    actorId: admin.id,
+  });
+  const queueUploadA = await serviceA.beginUpload({
+    artifactId: queueArtifactA.id,
+    expectedSizeBytes: queueBytesA.length,
+    expectedSha256: "0".repeat(64),
+    actorId: admin.id,
+  });
+  await assert.rejects(
+    () => serviceA.writeUpload(
+      queueUploadA.uploadToken,
+      Readable.from([queueBytesA]),
+      admin.id,
+    ),
+    /checksum|sha-?256/i,
+  );
+
+  const queueBytesB = Buffer.from("workspace B admin queue quarantine");
+  const queueArtifactB = await serviceB.createArtifact({
+    studyId: foreignStudy.id,
+    logicalName: "admin-action-queue-b.bin",
+    kind: "dataset",
+    format: "binary",
+    actorId: foreignOwner.id,
+  });
+  const queueUploadB = await serviceB.beginUpload({
+    artifactId: queueArtifactB.id,
+    expectedSizeBytes: queueBytesB.length,
+    expectedSha256: "1".repeat(64),
+    actorId: foreignOwner.id,
+  });
+  await assert.rejects(
+    () => serviceB.writeUpload(
+      queueUploadB.uploadToken,
+      Readable.from([queueBytesB]),
+      foreignOwner.id,
+    ),
+    /checksum|sha-?256/i,
+  );
+
+  responseJson(await app.inject({
+    method: "GET",
+    url: "/api/science/admin/action-queue",
+    headers: { cookie: memberCookie },
+  }), 403);
+  responseJson(await app.inject({
+    method: "GET",
+    url: "/api/science/admin/action-queue",
+    headers: { cookie: builderCookie },
+  }), 403);
+  const adminActionQueue = responseJson(await app.inject({
+    method: "GET",
+    url: "/api/science/admin/action-queue?offset=0&limit=10",
+    headers: { cookie: adminCookie },
+  }), 200);
+  assert.deepEqual(
+    adminActionQueue.items.map((item) => item.id),
+    [queueUploadA.upload.id],
+    "admin queue must include only the authenticated workspace",
+  );
+  const queueProjection = JSON.stringify(adminActionQueue);
+  for (const forbidden of [
+    queueUploadA.uploadToken,
+    queueUploadA.upload.tokenHash,
+    queueUploadA.upload.quarantineKey,
+    queueUploadB.uploadToken,
+    queueUploadB.upload.tokenHash,
+    queueUploadB.upload.quarantineKey,
+    "storageKey",
+    "providerHandle",
+    "audience",
+  ]) {
+    assert.equal(queueProjection.includes(forbidden), false);
+  }
+  await store.discardQuarantine(queueUploadA.upload.quarantineKey);
+  assert.equal(await deleteTerminalScienceUploadAfterDiscard(dbHandle.db, {
+    workspaceId: workspaceAId,
+    uploadId: queueUploadA.upload.id,
+  }), true);
+  const resolvedActionQueue = responseJson(await app.inject({
+    method: "GET",
+    url: "/api/science/admin/action-queue?limit=10",
+    headers: { cookie: adminCookie },
+  }), 200);
+  assert.equal(
+    resolvedActionQueue.items.some((item) => item.id === queueUploadA.upload.id),
+    false,
+    "resolved queue resources must disappear",
+  );
+
+  const memberComparison = responseJson(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/comparison?candidateRunId=${submitted.run.id}`,
+    headers: { cookie: memberCookie },
+  }), 200);
+  assert.equal(memberComparison.leftRunId, submitted.run.id);
+  assert.equal(memberComparison.rightRunId, submitted.run.id);
+  responseJson(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/reproduce`,
+    headers: { cookie: memberCookie },
+    payload: { candidateRunId: submitted.run.id },
+  }), 403);
+  responseJson(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/comparison?candidateRunId=${foreignSubmission.run.id}`,
+    headers: { cookie: memberCookie },
+  }), 404);
+  console.log("ok - admin action queue is role-gated, isolated, redacted, and convergent");
+  console.log("ok - members compare manifests by GET while foreign runs remain hidden");
+
   responseJson(await app.inject({
     method: "GET",
     url: `/api/science/studies/${foreignStudy.id}`,
@@ -939,6 +1237,7 @@ try {
     url: "/api/science/studies",
     headers: { cookie: builderCookie },
     payload: { name: "Builder work after pilot revocation" },
+  }), 503);
   await assert.rejects(
     () => serviceA.quote({
       computeProfileId: profile.id,
@@ -947,7 +1246,6 @@ try {
     /not admitted for this workspace/i,
     "revocation must block provider quote traffic as part of new-work admission",
   );
-  }), 503);
   const postRevokeCleanup = responseJson(await app.inject({
     method: "DELETE",
     url: `/api/science/artifact-versions/${revokeCleanupUpload.version.id}`,
@@ -982,6 +1280,7 @@ try {
     "science.artifact.upload.begin",
     "science.artifact.upload.complete",
     "science.artifact.version.expire",
+    "science.domain-validation.create",
     "science.run.submit",
     "science.run.approval",
     "science.workspace.admission.update",
@@ -997,6 +1296,14 @@ try {
       entry.detail?.admitted === false
     ),
     "admission changes must retain initiating admin, bounded reason, and decision",
+  );
+  assert.ok(
+    audits.some((entry) =>
+      entry.action === "science.domain-validation.create" &&
+      entry.actorId === admin.id &&
+      entry.target === `science_domain_validations:${domainReview.id}`
+    ),
+    "the immutable review insert and initiating admin attribution must commit atomically",
   );
   assert.ok(audits.length >= 10);
   for (const entry of audits) assertNoForbiddenAuditKeys(entry.detail);

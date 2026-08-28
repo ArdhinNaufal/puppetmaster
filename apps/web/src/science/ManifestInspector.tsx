@@ -2,13 +2,16 @@ import { useEffect, useState } from "react";
 import { Chip, HoldButton } from "@puppetmaster/ui";
 import type {
   ScienceManifest,
+  ScienceManifestResult,
   ScienceRun,
   ScienceRunComparison,
 } from "../api.js";
+import { DomainValidationPanel } from "./DomainValidationPanel.js";
 import { fmtBytes, shortHash } from "./science-utils.js";
 
 export function ManifestInspector(props: {
   manifest: ScienceManifest | null;
+  assessment: Pick<ScienceManifestResult, "complete" | "gaps"> | null;
   manifestHash: string | null;
   loading: boolean;
   error: string | null;
@@ -19,6 +22,8 @@ export function ManifestInspector(props: {
   comparison: ScienceRunComparison | null;
   comparisonLoading: boolean;
   comparisonError: string | null;
+  isAdmin: boolean;
+  runState: ScienceRun["state"] | null;
   onCompare: (candidateRunId: string) => void;
   onReproduce: () => void;
 }) {
@@ -38,19 +43,22 @@ export function ManifestInspector(props: {
   if (!props.manifest) return <div className="sci-manifest sci-empty-inline">No manifest is available for this run.</div>;
 
   const manifest = props.manifest;
+  const assessment = props.assessment ?? { complete: false, gaps: [] };
   return (
     <section className="sci-manifest" aria-label="Provenance manifest inspector">
-      <div className={`sci-manifest-verdict ${manifest.complete ? "complete" : "incomplete"}`}>
-        <span>{manifest.complete ? "MANIFEST COMPLETE" : "MANIFEST INCOMPLETE"}</span>
+      <div className={`sci-manifest-verdict ${assessment.complete ? "complete" : "incomplete"}`}>
+        <span>{assessment.complete ? "MANIFEST COMPLETE" : "MANIFEST INCOMPLETE"}</span>
         <b>SHA {shortHash(props.manifestHash, 16)}</b>
       </div>
       <p className="sci-integrity-note">
         This verdict confirms provenance fields, not numerical or bitwise reproducibility.
+        The SHA identifies immutable server-held manifest bytes; sensitive profile fields in
+        this view may be redacted.
       </p>
-      {!manifest.complete && (
+      {!assessment.complete && (
         <ul className="sci-gap-list" aria-label="Manifest completeness gaps">
-          {manifest.gaps.length === 0 && <li>Server reported incomplete without named gaps.</li>}
-          {manifest.gaps.map((gap) => <li key={gap}>{gap}</li>)}
+          {assessment.gaps.length === 0 && <li>Server reported incomplete without named gaps.</li>}
+          {assessment.gaps.map((gap) => <li key={gap}>{gap}</li>)}
         </ul>
       )}
 
@@ -178,6 +186,17 @@ export function ManifestInspector(props: {
         )}
       </section>
 
+      <DomainValidationPanel
+        runId={manifest.runId}
+        isAdmin={props.isAdmin}
+        authoringReady={
+          props.runState === "succeeded" &&
+          Boolean(props.manifestHash) &&
+          manifest.outputs.length > 0
+        }
+        comparisonCandidates={props.comparisonCandidates}
+      />
+
       {manifest.limitations && manifest.limitations.length > 0 && (
         <details>
           <summary>DECLARED LIMITATIONS</summary>
@@ -205,7 +224,7 @@ export function ManifestInspector(props: {
       {props.canBuild && (
         <div className="sci-ceremony">
           <HoldButton
-            disabled={!props.newWorkEnabled || props.busy || !manifest.complete}
+            disabled={!props.newWorkEnabled || props.busy || !assessment.complete}
             onComplete={props.onReproduce}
             title="Hold to submit a new run from this exact manifest"
           >

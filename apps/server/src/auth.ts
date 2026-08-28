@@ -5,6 +5,11 @@ import cookie from "@fastify/cookie";
 import { Role, ROLE_RANK } from "@puppetmaster/shared";
 import { authorizationUrl, exchangeCode, oidcConfig } from "./oidc.js";
 import {
+  authorizationMethod,
+  canonicalRequestPath,
+  InvalidRequestPathError,
+} from "./request-path.js";
+import {
   appendAudit,
   countUsers,
   createSession,
@@ -87,7 +92,9 @@ const POLICY: PolicyRule[] = [
   // Science Operations: reads remain member-visible. Provider/profile
   // configuration is admin-only; study, artifact, run, and renderer mutation
   // is builder+. Domain repositories still re-check workspace ownership.
+  { methods: ["GET"], path: /^\/api\/science\/admin\/action-queue$/, role: "admin" },
   { methods: ["PATCH"], path: /^\/api\/science\/workspace-admission$/, role: "admin" },
+  { methods: ["POST"], path: /^\/api\/science\/runs\/[^/]+\/validations$/, role: "admin" },
   { methods: ["POST", "PATCH", "PUT", "DELETE"], path: /^\/api\/science\/compute-profiles(\/|$)/, role: "admin" },
   { methods: ["DELETE"], path: /^\/api\/science\/artifact-versions\/[^/]+$/, role: "admin" },
   { methods: ["POST", "PATCH", "PUT", "DELETE"], path: /^\/api\/science(\/|$)/, role: "builder" },
@@ -171,7 +178,13 @@ export async function registerAuth(
   // Gateway hook: resolve the session and enforce the RBAC policy for every
   // /api route (including the WebSocket upgrade) except the public allowlist.
   app.addHook("onRequest", async (req: FastifyRequest, reply: FastifyReply) => {
-    const path = req.url.split("?")[0] ?? req.url;
+    let path: string;
+    try {
+      path = canonicalRequestPath(req.url);
+    } catch (error) {
+      if (!(error instanceof InvalidRequestPathError)) throw error;
+      return reply.code(400).send({ error: "invalid request path" });
+    }
     if (!path.startsWith("/api")) return;
     if (PUBLIC.some((p) => p.test(path))) return;
     if (SIGNED_ARTIFACT_CONTENT.test(path)) {
@@ -188,7 +201,7 @@ export async function registerAuth(
     const role = Role.catch("member").parse(membership.role);
     req.authUser = { id: session.user.id, email: session.user.email, name: session.user.name, role };
 
-    const needed = requiredRole(req.method, path);
+    const needed = requiredRole(authorizationMethod(req.method), path);
     if (needed && ROLE_RANK[role] < ROLE_RANK[needed]) {
       return reply.code(403).send({ error: `requires ${needed} role`, role });
     }

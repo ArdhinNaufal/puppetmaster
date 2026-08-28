@@ -774,6 +774,8 @@ const SCIENCE_DDL: readonly string[] = [
        CHECK (state IN ('pending', 'uploading', 'finalizing', 'completed', 'quarantined', 'expired')),
      error text,
      transfer_lease_id uuid,
+     transfer_lease_expires_at timestamptz,
+     external_transfer boolean NOT NULL DEFAULT false,
      finalization_lease_id uuid,
      cleanup_attempts integer NOT NULL DEFAULT 0,
      cleanup_not_before timestamptz,
@@ -788,6 +790,8 @@ const SCIENCE_DDL: readonly string[] = [
      ON science_uploads(workspace_id, state, expires_at)`,
   `CREATE INDEX IF NOT EXISTS science_uploads_artifact_idx
      ON science_uploads(artifact_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS science_uploads_external_transfer_idx
+     ON science_uploads(workspace_id, external_transfer, state, transfer_lease_expires_at)`,
   `CREATE TABLE IF NOT EXISTS science_compute_profiles (
      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
      workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -1132,6 +1136,48 @@ const SCIENCE_ATOMIC_AUDIT_DDL: readonly string[] = [
        CASE TG_TABLE_NAME
           WHEN 'science_workspace_admissions' THEN
             audit_workspace_id := (row_data ->> 'workspace_id')::uuid;
+         WHEN 'science_domain_validations' THEN
+           audit_workspace_id := (row_data ->> 'workspace_id')::uuid;
+           SELECT scope.workspace_id
+             INTO related_workspace_id
+             FROM audit_subject_scope AS scope
+            WHERE scope.domain_table = 'science_runs'
+              AND scope.target_id = (row_data ->> 'run_id')::uuid;
+           IF related_workspace_id IS DISTINCT FROM audit_workspace_id THEN
+             RAISE EXCEPTION 'science domain validation run workspace is inconsistent'
+               USING ERRCODE = '23514';
+           END IF;
+           IF row_data ->> 'baseline_run_id' IS NOT NULL THEN
+             SELECT scope.workspace_id
+               INTO related_workspace_id
+               FROM audit_subject_scope AS scope
+              WHERE scope.domain_table = 'science_runs'
+                AND scope.target_id = (row_data ->> 'baseline_run_id')::uuid;
+             IF related_workspace_id IS DISTINCT FROM audit_workspace_id THEN
+               RAISE EXCEPTION 'science domain validation baseline workspace is inconsistent'
+                 USING ERRCODE = '23514';
+             END IF;
+           END IF;
+         WHEN 'science_domain_validation_heads' THEN
+           audit_workspace_id := (row_data ->> 'workspace_id')::uuid;
+           SELECT scope.workspace_id
+             INTO related_workspace_id
+             FROM audit_subject_scope AS scope
+            WHERE scope.domain_table = 'science_runs'
+              AND scope.target_id = (row_data ->> 'run_id')::uuid;
+           IF related_workspace_id IS DISTINCT FROM audit_workspace_id THEN
+             RAISE EXCEPTION 'science domain validation head run workspace is inconsistent'
+               USING ERRCODE = '23514';
+           END IF;
+           SELECT scope.workspace_id
+             INTO related_workspace_id
+             FROM audit_subject_scope AS scope
+            WHERE scope.domain_table = 'science_runs'
+              AND scope.target_id = (row_data ->> 'scope_baseline_run_id')::uuid;
+           IF related_workspace_id IS DISTINCT FROM audit_workspace_id THEN
+             RAISE EXCEPTION 'science domain validation head baseline workspace is inconsistent'
+               USING ERRCODE = '23514';
+           END IF;
          WHEN 'science_studies' THEN
            audit_workspace_id := (row_data ->> 'workspace_id')::uuid;
          WHEN 'science_artifacts' THEN
@@ -1284,9 +1330,11 @@ const SCIENCE_ATOMIC_AUDIT_DDL: readonly string[] = [
          IF TG_TABLE_NAME = 'science_uploads'
             AND (prior_data
                    - 'expires_at'
+                   - 'transfer_lease_expires_at'
                    - 'updated_at')
                 = (row_data
                    - 'expires_at'
+                   - 'transfer_lease_expires_at'
                    - 'updated_at') THEN
            emit_audit := false;
          END IF;
@@ -1405,8 +1453,16 @@ const SCIENCE_ATOMIC_AUDIT_DDL: readonly string[] = [
            'operation', lower(TG_OP),
            'table', TG_TABLE_NAME,
            'state', audit_state,
-            'admitted', CASE WHEN TG_TABLE_NAME = 'science_workspace_admissions'
+           'admitted', CASE WHEN TG_TABLE_NAME = 'science_workspace_admissions'
               THEN (row_data ->> 'admitted')::boolean ELSE NULL END,
+           'validationId', CASE WHEN TG_TABLE_NAME = 'science_domain_validation_heads'
+              THEN row_data ->> 'validation_id' ELSE NULL END,
+           'revision', CASE WHEN TG_TABLE_NAME = 'science_domain_validation_heads'
+              THEN (row_data ->> 'revision')::integer ELSE NULL END,
+           'recordHash', CASE WHEN TG_TABLE_NAME = 'science_domain_validation_heads'
+              THEN row_data ->> 'record_hash' ELSE NULL END,
+           'headHash', CASE WHEN TG_TABLE_NAME = 'science_domain_validation_heads'
+              THEN row_data ->> 'head_hash' ELSE NULL END,
            'reason', audit_reason
          ))
        );
@@ -1512,6 +1568,18 @@ const SCIENCE_UPLOAD_TRANSFER_FENCE_DDL: readonly string[] = [
      ADD COLUMN IF NOT EXISTS transfer_lease_id uuid`,
 ];
 
+const SCIENCE_EXTERNAL_UPLOAD_STREAM_FENCE_DDL: readonly string[] = [
+  `ALTER TABLE science_uploads
+     ADD COLUMN IF NOT EXISTS transfer_lease_expires_at timestamptz`,
+  `ALTER TABLE science_uploads
+     ADD COLUMN IF NOT EXISTS external_transfer boolean NOT NULL DEFAULT false`,
+  `CREATE INDEX IF NOT EXISTS science_uploads_external_transfer_idx
+     ON science_uploads(workspace_id, external_transfer, state, transfer_lease_expires_at)`,
+  SCIENCE_ATOMIC_AUDIT_DDL.find((statement) =>
+    statement.includes("CREATE OR REPLACE FUNCTION science_audit_domain_mutation()")
+  )!,
+];
+
 const SCIENCE_ACTOR_ATTRIBUTED_AUDIT_DDL: readonly string[] = [
   SCIENCE_ATOMIC_AUDIT_DDL.find((statement) =>
     statement.includes("CREATE OR REPLACE FUNCTION science_audit_domain_mutation()")
@@ -1533,6 +1601,636 @@ const SCIENCE_WORKSPACE_ADMISSION_DDL: readonly string[] = [
   `CREATE TRIGGER science_domain_audit_mutation
      BEFORE INSERT OR UPDATE OR DELETE ON science_workspace_admissions
      FOR EACH ROW EXECUTE FUNCTION science_audit_domain_mutation()`,
+];
+
+const SCIENCE_DOMAIN_VALIDATION_DDL: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS science_domain_validations (
+     id uuid PRIMARY KEY,
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+     run_id uuid NOT NULL REFERENCES science_runs(id) ON DELETE RESTRICT,
+     revision integer NOT NULL,
+     baseline_run_id uuid REFERENCES science_runs(id) ON DELETE RESTRICT,
+     kind text NOT NULL,
+     metric text NOT NULL,
+     tolerance double precision NOT NULL,
+     observed_value double precision NOT NULL,
+     units text NOT NULL,
+     method_protocol_id text NOT NULL,
+     decision boolean NOT NULL,
+     limitations_reason text NOT NULL,
+     reviewer_id uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+     reviewer_role text NOT NULL,
+     run_manifest_hash text NOT NULL,
+     run_output_checksums jsonb NOT NULL,
+     baseline_manifest_hash text,
+     baseline_output_checksums jsonb,
+     created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+     record_hash text NOT NULL UNIQUE,
+     CONSTRAINT science_domain_validations_run_revision_unique
+       UNIQUE (run_id, revision),
+     CONSTRAINT science_domain_validations_revision_check
+       CHECK (revision > 0),
+     CONSTRAINT science_domain_validations_kind_check
+       CHECK (kind IN ('domain-validation', 'numerical-equivalence')),
+     CONSTRAINT science_domain_validations_metric_check
+       CHECK (char_length(btrim(metric)) BETWEEN 1 AND 200),
+     CONSTRAINT science_domain_validations_tolerance_check
+       CHECK (tolerance >= 0 AND tolerance < 'Infinity'::double precision),
+     CONSTRAINT science_domain_validations_observed_check
+       CHECK (observed_value > '-Infinity'::double precision
+              AND observed_value < 'Infinity'::double precision),
+     CONSTRAINT science_domain_validations_units_check
+       CHECK (char_length(btrim(units)) BETWEEN 1 AND 100),
+     CONSTRAINT science_domain_validations_protocol_check
+       CHECK (char_length(btrim(method_protocol_id)) BETWEEN 1 AND 300),
+     CONSTRAINT science_domain_validations_limitations_check
+       CHECK (char_length(btrim(limitations_reason)) BETWEEN 1 AND 2000),
+     CONSTRAINT science_domain_validations_reviewer_role_check
+       CHECK (reviewer_role IN ('admin', 'owner')),
+     CONSTRAINT science_domain_validations_run_manifest_hash_check
+       CHECK (run_manifest_hash ~ '^[0-9a-f]{64}$'),
+     CONSTRAINT science_domain_validations_record_hash_check
+       CHECK (record_hash ~ '^[0-9a-f]{64}$'),
+     CONSTRAINT science_domain_validations_outputs_check
+       CHECK (jsonb_typeof(run_output_checksums) = 'array'
+              AND jsonb_array_length(run_output_checksums) > 0),
+     CONSTRAINT science_domain_validations_baseline_check CHECK (
+       (kind = 'domain-validation'
+        AND baseline_run_id IS NULL
+        AND baseline_manifest_hash IS NULL
+        AND baseline_output_checksums IS NULL)
+       OR
+       (kind = 'numerical-equivalence'
+        AND baseline_run_id IS NOT NULL
+        AND baseline_run_id <> run_id
+        AND baseline_manifest_hash ~ '^[0-9a-f]{64}$'
+        AND jsonb_typeof(baseline_output_checksums) = 'array'
+        AND jsonb_array_length(baseline_output_checksums) > 0)
+     )
+   )`,
+  `CREATE INDEX IF NOT EXISTS science_domain_validations_run_revision_idx
+     ON science_domain_validations(run_id, revision DESC)`,
+  `CREATE INDEX IF NOT EXISTS science_domain_validations_comparison_idx
+     ON science_domain_validations(run_id, baseline_run_id, kind, revision DESC)`,
+  `CREATE OR REPLACE FUNCTION science_domain_validation_guard()
+   RETURNS trigger
+   LANGUAGE plpgsql
+   AS $science_domain_validation_guard$
+   DECLARE
+     run_workspace_id uuid;
+     run_state text;
+     current_manifest_hash text;
+     current_outputs jsonb;
+     baseline_workspace_id uuid;
+     baseline_state text;
+     current_baseline_manifest_hash text;
+     current_baseline_outputs jsonb;
+     current_reviewer_role text;
+     expected_revision integer;
+   BEGIN
+     IF TG_OP <> 'INSERT' THEN
+       RAISE EXCEPTION 'science domain validation records are append-only'
+         USING ERRCODE = '55000';
+     END IF;
+
+     SELECT study.workspace_id, run.state, run.manifest_hash, run.manifest -> 'outputs'
+       INTO run_workspace_id, run_state, current_manifest_hash, current_outputs
+       FROM science_runs AS run
+       JOIN science_studies AS study ON study.id = run.study_id
+      WHERE run.id = NEW.run_id
+      FOR UPDATE OF run;
+     IF run_workspace_id IS NULL
+        OR run_workspace_id IS DISTINCT FROM NEW.workspace_id
+        OR run_state <> 'succeeded'
+        OR current_manifest_hash IS NULL
+        OR current_manifest_hash IS DISTINCT FROM NEW.run_manifest_hash
+        OR current_outputs IS DISTINCT FROM NEW.run_output_checksums THEN
+       RAISE EXCEPTION 'science domain validation must bind the current succeeded run manifest and outputs'
+         USING ERRCODE = '23514';
+     END IF;
+
+     SELECT COALESCE(MAX(validation.revision), 0) + 1
+       INTO expected_revision
+       FROM science_domain_validations AS validation
+      WHERE validation.run_id = NEW.run_id;
+     IF NEW.revision <> expected_revision THEN
+       RAISE EXCEPTION 'science domain validation revision must be the next candidate-run revision'
+         USING ERRCODE = '23514';
+     END IF;
+
+     SELECT membership.role
+       INTO current_reviewer_role
+       FROM memberships AS membership
+      WHERE membership.workspace_id = NEW.workspace_id
+        AND membership.user_id = NEW.reviewer_id;
+     IF current_reviewer_role NOT IN ('admin', 'owner')
+        OR current_reviewer_role IS DISTINCT FROM NEW.reviewer_role THEN
+       RAISE EXCEPTION 'science domain validation reviewer must be a current admin or owner'
+         USING ERRCODE = '42501';
+     END IF;
+
+     IF NEW.kind = 'numerical-equivalence' THEN
+       SELECT study.workspace_id, run.state, run.manifest_hash, run.manifest -> 'outputs'
+         INTO baseline_workspace_id, baseline_state,
+              current_baseline_manifest_hash, current_baseline_outputs
+         FROM science_runs AS run
+         JOIN science_studies AS study ON study.id = run.study_id
+        WHERE run.id = NEW.baseline_run_id;
+       IF baseline_workspace_id IS NULL
+          OR baseline_workspace_id IS DISTINCT FROM NEW.workspace_id
+          OR baseline_state <> 'succeeded'
+          OR current_baseline_manifest_hash IS NULL
+          OR current_baseline_manifest_hash IS DISTINCT FROM NEW.baseline_manifest_hash
+          OR current_baseline_outputs IS DISTINCT FROM NEW.baseline_output_checksums THEN
+         RAISE EXCEPTION 'numerical equivalence must bind the current succeeded baseline manifest and outputs'
+           USING ERRCODE = '23514';
+       END IF;
+     END IF;
+     NEW.created_at := transaction_timestamp();
+     RETURN NEW;
+   END
+   $science_domain_validation_guard$`,
+  `DROP TRIGGER IF EXISTS science_domain_validation_guard ON science_domain_validations`,
+  `CREATE TRIGGER science_domain_validation_guard
+     BEFORE INSERT OR UPDATE OR DELETE ON science_domain_validations
+     FOR EACH ROW EXECUTE FUNCTION science_domain_validation_guard()`,
+  SCIENCE_ATOMIC_AUDIT_DDL.find((statement) =>
+    statement.includes("CREATE OR REPLACE FUNCTION science_audit_domain_mutation()")
+  )!,
+  `DROP TRIGGER IF EXISTS science_domain_audit_mutation ON science_domain_validations`,
+  `CREATE TRIGGER science_domain_audit_mutation
+     BEFORE INSERT OR UPDATE OR DELETE ON science_domain_validations
+     FOR EACH ROW EXECUTE FUNCTION science_audit_domain_mutation()`,
+];
+
+const SCIENCE_DOMAIN_VALIDATION_HEAD_DDL: readonly string[] = [
+  `DO $science_domain_validation_v12_drift$
+   BEGIN
+     IF NOT EXISTS (
+       SELECT 1
+         FROM schema_migrations
+        WHERE version = 12
+          AND name = 'science-append-only-domain-validation'
+     ) OR to_regclass('public.science_domain_validations') IS NULL THEN
+       RAISE EXCEPTION 'science migration 13 schema drift: rewritten migration 12 ledger/table is missing'
+         USING ERRCODE = '55000';
+     END IF;
+
+     IF NOT EXISTS (
+       SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'science_domain_validations'
+          AND column_name = 'revision'
+          AND data_type = 'integer'
+          AND is_nullable = 'NO'
+     ) OR NOT EXISTS (
+       SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'science_domain_validations'
+          AND column_name = 'created_at'
+          AND data_type = 'timestamp with time zone'
+          AND is_nullable = 'NO'
+     ) OR NOT EXISTS (
+       SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'science_domain_validations'
+          AND column_name = 'record_hash'
+          AND data_type = 'text'
+          AND is_nullable = 'NO'
+     ) THEN
+       RAISE EXCEPTION 'science migration 13 schema drift: migration 12 lacks rewritten revision/created_at/record_hash columns; recreate or explicitly repair the unreleased v12 database'
+         USING ERRCODE = '55000';
+     END IF;
+
+     IF NOT EXISTS (
+       SELECT 1
+         FROM pg_constraint AS constraint_row
+         JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public'
+          AND relation.relname = 'science_domain_validations'
+          AND constraint_row.conname = 'science_domain_validations_run_revision_unique'
+          AND constraint_row.contype = 'u'
+          AND pg_get_constraintdef(constraint_row.oid) LIKE 'UNIQUE (run_id, revision)%'
+     ) OR NOT EXISTS (
+       SELECT 1
+         FROM pg_constraint AS constraint_row
+         JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public'
+          AND relation.relname = 'science_domain_validations'
+          AND constraint_row.conname = 'science_domain_validations_revision_check'
+          AND constraint_row.contype = 'c'
+          AND pg_get_constraintdef(constraint_row.oid) LIKE '%revision > 0%'
+     ) THEN
+       RAISE EXCEPTION 'science migration 13 schema drift: migration 12 lacks rewritten positive unique run revision constraints; recreate or explicitly repair the unreleased v12 database'
+         USING ERRCODE = '55000';
+     END IF;
+
+     IF to_regclass('public.science_domain_validation_heads') IS NOT NULL THEN
+       RAISE EXCEPTION 'science migration 13 schema drift: validation head table exists without the migration-13 ledger row'
+         USING ERRCODE = '55000';
+     END IF;
+   END
+   $science_domain_validation_v12_drift$`,
+  `CREATE TABLE science_domain_validation_heads (
+     id uuid PRIMARY KEY,
+     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+     run_id uuid NOT NULL REFERENCES science_runs(id) ON DELETE RESTRICT,
+     kind text NOT NULL,
+     scope_baseline_run_id uuid NOT NULL REFERENCES science_runs(id) ON DELETE RESTRICT,
+     validation_id uuid NOT NULL UNIQUE REFERENCES science_domain_validations(id) ON DELETE RESTRICT,
+     revision integer NOT NULL,
+     record_hash text NOT NULL,
+     head_hash text NOT NULL,
+     updated_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+     CONSTRAINT science_domain_validation_heads_scope_unique
+       UNIQUE (workspace_id, run_id, kind, scope_baseline_run_id),
+     CONSTRAINT science_domain_validation_heads_revision_check
+       CHECK (revision > 0),
+     CONSTRAINT science_domain_validation_heads_kind_check
+       CHECK (kind IN ('domain-validation', 'numerical-equivalence')),
+     CONSTRAINT science_domain_validation_heads_scope_check CHECK (
+       (kind = 'domain-validation' AND scope_baseline_run_id = run_id)
+       OR
+       (kind = 'numerical-equivalence' AND scope_baseline_run_id <> run_id)
+     ),
+     CONSTRAINT science_domain_validation_heads_record_hash_check
+       CHECK (record_hash ~ '^[0-9a-f]{64}$'),
+     CONSTRAINT science_domain_validation_heads_head_hash_check
+       CHECK (head_hash ~ '^[0-9a-f]{64}$')
+   )`,
+  `CREATE INDEX science_domain_validation_heads_lookup_idx
+     ON science_domain_validation_heads(
+       workspace_id,
+       run_id,
+       kind,
+       scope_baseline_run_id
+     )`,
+  `CREATE OR REPLACE FUNCTION science_domain_validation_head_guard()
+   RETURNS trigger
+   LANGUAGE plpgsql
+   AS $science_domain_validation_head_guard$
+   DECLARE
+     record_workspace_id uuid;
+     record_run_id uuid;
+     record_kind text;
+     record_baseline_run_id uuid;
+     record_revision integer;
+     current_record_hash text;
+     latest_scope_revision integer;
+     scope_id_hash text;
+     expected_head_id uuid;
+     expected_head_hash text;
+   BEGIN
+     IF TG_OP = 'DELETE' THEN
+       RAISE EXCEPTION 'science domain validation heads cannot be deleted'
+         USING ERRCODE = '55000';
+     END IF;
+
+     IF TG_OP = 'UPDATE' THEN
+       IF NEW.id IS DISTINCT FROM OLD.id
+          OR NEW.workspace_id IS DISTINCT FROM OLD.workspace_id
+          OR NEW.run_id IS DISTINCT FROM OLD.run_id
+          OR NEW.kind IS DISTINCT FROM OLD.kind
+          OR NEW.scope_baseline_run_id IS DISTINCT FROM OLD.scope_baseline_run_id THEN
+         RAISE EXCEPTION 'science domain validation head scope is immutable'
+           USING ERRCODE = '55000';
+       END IF;
+       IF NEW.revision <= OLD.revision THEN
+         RAISE EXCEPTION 'science domain validation heads advance monotonically'
+           USING ERRCODE = '55000';
+       END IF;
+     END IF;
+
+     scope_id_hash := encode(sha256(convert_to(concat_ws('|',
+       'science-domain-validation-head-id-v1',
+       NEW.workspace_id::text,
+       NEW.run_id::text,
+       NEW.kind,
+       NEW.scope_baseline_run_id::text
+     ), 'UTF8')), 'hex');
+     expected_head_id := (
+       substr(scope_id_hash, 1, 8) || '-' ||
+       substr(scope_id_hash, 9, 4) || '-8' ||
+       substr(scope_id_hash, 14, 3) || '-8' ||
+       substr(scope_id_hash, 18, 3) || '-' ||
+       substr(scope_id_hash, 21, 12)
+     )::uuid;
+     IF NEW.id IS DISTINCT FROM expected_head_id THEN
+       RAISE EXCEPTION 'science domain validation head identity must match its canonical scope'
+         USING ERRCODE = '23514';
+     END IF;
+
+     SELECT validation.workspace_id,
+            validation.run_id,
+            validation.kind,
+            validation.baseline_run_id,
+            validation.revision,
+            validation.record_hash
+       INTO record_workspace_id,
+            record_run_id,
+            record_kind,
+            record_baseline_run_id,
+            record_revision,
+            current_record_hash
+       FROM science_domain_validations AS validation
+      WHERE validation.id = NEW.validation_id;
+
+     IF record_workspace_id IS NULL
+        OR record_workspace_id IS DISTINCT FROM NEW.workspace_id
+        OR record_run_id IS DISTINCT FROM NEW.run_id
+        OR record_kind IS DISTINCT FROM NEW.kind
+        OR COALESCE(record_baseline_run_id, record_run_id)
+             IS DISTINCT FROM NEW.scope_baseline_run_id
+        OR record_revision IS DISTINCT FROM NEW.revision
+        OR current_record_hash IS DISTINCT FROM NEW.record_hash THEN
+       RAISE EXCEPTION 'science domain validation head must bind its exact record and canonical scope'
+         USING ERRCODE = '23514';
+     END IF;
+
+     SELECT MAX(validation.revision)
+       INTO latest_scope_revision
+       FROM science_domain_validations AS validation
+      WHERE validation.workspace_id = NEW.workspace_id
+        AND validation.run_id = NEW.run_id
+        AND validation.kind = NEW.kind
+        AND COALESCE(validation.baseline_run_id, validation.run_id)
+              = NEW.scope_baseline_run_id;
+     IF latest_scope_revision IS DISTINCT FROM NEW.revision THEN
+       RAISE EXCEPTION 'science domain validation head must point to the latest exact-scope revision'
+         USING ERRCODE = '23514';
+     END IF;
+
+     expected_head_hash := encode(sha256(convert_to(concat_ws('|',
+       'science-domain-validation-head-v1',
+       NEW.id::text,
+       NEW.workspace_id::text,
+       NEW.run_id::text,
+       NEW.kind,
+       NEW.scope_baseline_run_id::text,
+       NEW.validation_id::text,
+       NEW.revision::text,
+       NEW.record_hash
+     ), 'UTF8')), 'hex');
+     IF NEW.head_hash IS DISTINCT FROM expected_head_hash THEN
+       RAISE EXCEPTION 'science domain validation head anchor hash is invalid'
+         USING ERRCODE = '23514';
+     END IF;
+
+     NEW.updated_at := transaction_timestamp();
+     RETURN NEW;
+   END
+   $science_domain_validation_head_guard$`,
+  `CREATE TRIGGER science_domain_validation_head_guard
+     BEFORE INSERT OR UPDATE OR DELETE ON science_domain_validation_heads
+     FOR EACH ROW EXECUTE FUNCTION science_domain_validation_head_guard()`,
+  SCIENCE_ATOMIC_AUDIT_DDL.find((statement) =>
+    statement.includes("CREATE OR REPLACE FUNCTION science_audit_domain_mutation()")
+  )!,
+  `CREATE TRIGGER science_domain_audit_mutation
+     BEFORE INSERT OR UPDATE OR DELETE ON science_domain_validation_heads
+     FOR EACH ROW EXECUTE FUNCTION science_audit_domain_mutation()`,
+  `WITH latest AS (
+     SELECT DISTINCT ON (
+              validation.workspace_id,
+              validation.run_id,
+              validation.kind,
+              COALESCE(validation.baseline_run_id, validation.run_id)
+            )
+            validation.workspace_id,
+            validation.run_id,
+            validation.kind,
+            COALESCE(validation.baseline_run_id, validation.run_id) AS scope_baseline_run_id,
+            validation.id AS validation_id,
+            validation.revision,
+            validation.record_hash
+       FROM science_domain_validations AS validation
+      ORDER BY validation.workspace_id,
+               validation.run_id,
+               validation.kind,
+               COALESCE(validation.baseline_run_id, validation.run_id),
+               validation.revision DESC,
+               validation.id DESC
+   ), hashed AS (
+     SELECT encode(sha256(convert_to(concat_ws('|',
+              'science-domain-validation-head-id-v1',
+              latest.workspace_id::text,
+              latest.run_id::text,
+              latest.kind,
+              latest.scope_baseline_run_id::text
+            ), 'UTF8')), 'hex') AS id_hash,
+            latest.*
+       FROM latest
+   ), prepared AS (
+     SELECT (
+              substr(hashed.id_hash, 1, 8) || '-' ||
+              substr(hashed.id_hash, 9, 4) || '-8' ||
+              substr(hashed.id_hash, 14, 3) || '-8' ||
+              substr(hashed.id_hash, 18, 3) || '-' ||
+              substr(hashed.id_hash, 21, 12)
+            )::uuid AS id,
+            hashed.workspace_id,
+            hashed.run_id,
+            hashed.kind,
+            hashed.scope_baseline_run_id,
+            hashed.validation_id,
+            hashed.revision,
+            hashed.record_hash
+       FROM hashed
+   )
+   INSERT INTO science_domain_validation_heads (
+     id,
+     workspace_id,
+     run_id,
+     kind,
+     scope_baseline_run_id,
+     validation_id,
+     revision,
+     record_hash,
+     head_hash
+   )
+   SELECT prepared.id,
+          prepared.workspace_id,
+          prepared.run_id,
+          prepared.kind,
+          prepared.scope_baseline_run_id,
+          prepared.validation_id,
+          prepared.revision,
+          prepared.record_hash,
+          encode(sha256(convert_to(concat_ws('|',
+            'science-domain-validation-head-v1',
+            prepared.id::text,
+            prepared.workspace_id::text,
+            prepared.run_id::text,
+            prepared.kind,
+            prepared.scope_baseline_run_id::text,
+            prepared.validation_id::text,
+            prepared.revision::text,
+            prepared.record_hash
+          ), 'UTF8')), 'hex')
+     FROM prepared`,
+];
+
+/**
+ * One durable suspension record per workflow node. Science terminalization
+ * changes `pending` waits to `ready` inside the same database transaction;
+ * queue jobs are recoverable notifications, never the source of truth.
+ */
+const WORKFLOW_DEFERRED_WAIT_DDL: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS workflow_waits (
+     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+     mission_id uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+     node_id text NOT NULL,
+     kind text NOT NULL,
+     target_run_id uuid NOT NULL REFERENCES science_runs(id) ON DELETE RESTRICT,
+     state text NOT NULL DEFAULT 'pending',
+     generation integer NOT NULL DEFAULT 0,
+     claim_token uuid,
+     claim_expires_at timestamptz,
+     created_at timestamptz NOT NULL DEFAULT now(),
+     updated_at timestamptz NOT NULL DEFAULT now(),
+     CONSTRAINT workflow_waits_mission_node_unique UNIQUE (mission_id, node_id),
+     CONSTRAINT workflow_waits_kind_check CHECK (kind = 'science_run_terminal'),
+     CONSTRAINT workflow_waits_state_check CHECK (
+       state IN ('pending', 'ready', 'claimed', 'consumed', 'cancelled')
+     ),
+     CONSTRAINT workflow_waits_generation_check CHECK (generation >= 0),
+     CONSTRAINT workflow_waits_claim_check CHECK (
+       (state = 'claimed' AND claim_token IS NOT NULL AND claim_expires_at IS NOT NULL)
+       OR (state <> 'claimed' AND claim_token IS NULL AND claim_expires_at IS NULL)
+     )
+   )`,
+  `CREATE INDEX IF NOT EXISTS workflow_waits_target_state_idx
+     ON workflow_waits(target_run_id, state)`,
+  `CREATE INDEX IF NOT EXISTS workflow_waits_recovery_idx
+     ON workflow_waits(state, claim_expires_at, updated_at)`,
+];
+
+/** Replay-safe, exact-source render admission. Existing rows receive a
+ * deterministic legacy identity; only migration-15 clients can replay them. */
+const SCIENCE_RENDER_REPLAY_DDL: readonly string[] = [
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS request_key_hash text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS intent_fingerprint text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS provider_kind text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS mode text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS source_sha256 text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS source_media_type text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS source_size_bytes bigint`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS source_logical_name text`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS launch_lease_id uuid`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS launch_lease_expires_at timestamptz`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS replay_expires_at timestamptz`,
+  `ALTER TABLE science_render_sessions ADD COLUMN IF NOT EXISTS closed_at timestamptz`,
+  `UPDATE science_render_sessions AS session
+      SET request_key_hash = COALESCE(
+            session.request_key_hash,
+            encode(sha256(convert_to('science-render-legacy-request-v1|' || session.id::text, 'UTF8')), 'hex')
+          ),
+          provider_kind = COALESCE(
+            session.provider_kind,
+            CASE
+              WHEN session.provider_handle LIKE 'science-render:%:%:%'
+                OR session.provider_handle LIKE 'science-render-attempt:%:%:%'
+                THEN split_part(session.provider_handle, ':', 2)
+              ELSE 'static'
+            END
+          ),
+          mode = COALESCE(
+            session.mode,
+            CASE
+              WHEN split_part(COALESCE(session.provider_handle, ''), ':', 2) = 'static'
+                THEN 'static'
+              ELSE 'remote'
+            END
+          ),
+          source_sha256 = COALESCE(session.source_sha256, version.sha256, repeat('0', 64)),
+          source_media_type = COALESCE(session.source_media_type, version.media_type, 'application/octet-stream'),
+          source_size_bytes = COALESCE(session.source_size_bytes, version.size_bytes, 0),
+          source_logical_name = COALESCE(session.source_logical_name, artifact.logical_name, 'legacy-render-source'),
+          replay_expires_at = COALESCE(session.replay_expires_at, session.expires_at + interval '24 hours')
+     FROM science_artifact_versions AS version
+     LEFT JOIN science_artifacts AS artifact ON artifact.id = version.artifact_id
+    WHERE session.artifact_version_id = version.id`,
+  `UPDATE science_render_sessions AS session
+      SET request_key_hash = COALESCE(
+            session.request_key_hash,
+            encode(sha256(convert_to('science-render-legacy-request-v1|' || session.id::text, 'UTF8')), 'hex')
+          ),
+          provider_kind = COALESCE(session.provider_kind, 'static'),
+          mode = COALESCE(session.mode, 'static'),
+          source_sha256 = COALESCE(session.source_sha256, repeat('0', 64)),
+          source_media_type = COALESCE(session.source_media_type, 'application/octet-stream'),
+          source_size_bytes = COALESCE(session.source_size_bytes, 0),
+          source_logical_name = COALESCE(session.source_logical_name, 'legacy-render-source'),
+          replay_expires_at = COALESCE(session.replay_expires_at, session.expires_at + interval '24 hours')
+    WHERE session.request_key_hash IS NULL
+       OR session.provider_kind IS NULL
+       OR session.mode IS NULL
+       OR session.source_sha256 IS NULL
+       OR session.source_media_type IS NULL
+       OR session.source_size_bytes IS NULL
+       OR session.source_logical_name IS NULL
+       OR session.replay_expires_at IS NULL`,
+  `UPDATE science_render_sessions
+      SET intent_fingerprint = COALESCE(
+        intent_fingerprint,
+        encode(sha256(convert_to(concat_ws('|',
+          'science-render-legacy-intent-v1', workspace_id::text, owner_id::text,
+          COALESCE(run_id::text, ''), COALESCE(artifact_version_id::text, ''),
+          mode, provider_kind, source_sha256, source_media_type,
+          source_size_bytes::text, source_logical_name
+        ), 'UTF8')), 'hex')
+      )`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN request_key_hash SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN intent_fingerprint SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN provider_kind SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN mode SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN source_sha256 SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN source_media_type SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN source_size_bytes SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN source_logical_name SET NOT NULL`,
+  `ALTER TABLE science_render_sessions ALTER COLUMN replay_expires_at SET NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS science_render_sessions_workspace_owner_request_unique
+     ON science_render_sessions(workspace_id, owner_id, request_key_hash)`,
+  `DO $science_render_replay_constraints$
+   BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_request_key_hash_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_request_key_hash_check CHECK (request_key_hash ~ '^[0-9a-f]{64}$');
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_intent_fingerprint_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_intent_fingerprint_check CHECK (intent_fingerprint ~ '^[0-9a-f]{64}$');
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_source_sha256_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_source_sha256_check CHECK (source_sha256 ~ '^[0-9a-f]{64}$');
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_mode_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_mode_check CHECK (mode IN ('client', 'remote', 'static'));
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_provider_kind_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_provider_kind_check CHECK (provider_kind ~ '^[A-Za-z0-9_-]{1,80}$');
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_source_metadata_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_source_metadata_check CHECK (
+         source_size_bytes >= 0
+         AND char_length(source_media_type) BETWEEN 1 AND 200
+         AND char_length(source_logical_name) BETWEEN 1 AND 500
+       );
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_replay_horizon_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_replay_horizon_check CHECK (replay_expires_at >= expires_at);
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'science_render_sessions_launch_lease_check') THEN
+       ALTER TABLE science_render_sessions ADD CONSTRAINT science_render_sessions_launch_lease_check CHECK (
+         (launch_lease_id IS NULL AND launch_lease_expires_at IS NULL)
+         OR (launch_lease_id IS NOT NULL AND launch_lease_expires_at IS NOT NULL)
+       );
+     END IF;
+   END
+   $science_render_replay_constraints$`,
 ];
 
 
@@ -1601,6 +2299,36 @@ export const SCHEMA_MIGRATIONS = [
     version: 11,
     name: "science-workspace-pilot-admission",
     statements: SCIENCE_WORKSPACE_ADMISSION_DDL,
+    allowUnavailableVector: false,
+  },
+  {
+    version: 12,
+    name: "science-append-only-domain-validation",
+    statements: SCIENCE_DOMAIN_VALIDATION_DDL,
+    allowUnavailableVector: false,
+  },
+  {
+    version: 13,
+    name: "science-domain-validation-scope-heads",
+    statements: SCIENCE_DOMAIN_VALIDATION_HEAD_DDL,
+    allowUnavailableVector: false,
+  },
+  {
+    version: 14,
+    name: "workflow-durable-science-run-waits",
+    statements: WORKFLOW_DEFERRED_WAIT_DDL,
+    allowUnavailableVector: false,
+  },
+  {
+    version: 15,
+    name: "science-render-replay-safe-static",
+    statements: SCIENCE_RENDER_REPLAY_DDL,
+    allowUnavailableVector: false,
+  },
+  {
+    version: 16,
+    name: "science-external-upload-stream-fence",
+    statements: SCIENCE_EXTERNAL_UPLOAD_STREAM_FENCE_DDL,
     allowUnavailableVector: false,
   },
 ] as const;

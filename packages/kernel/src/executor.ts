@@ -1,4 +1,5 @@
 import vm from "node:vm";
+import { randomUUID } from "node:crypto";
 import {
   ActionConfig,
   AgentNodeConfig,
@@ -6,6 +7,8 @@ import {
   CodeConfig,
   VerifyNodeConfig,
   LogicConfig,
+  ScienceManifest,
+  ScienceRunState,
   WorkflowGraph,
   type MissionStatus,
   type StepStatus,
@@ -13,15 +16,22 @@ import {
 } from "@puppetmaster/shared";
 import {
   beginNodeExecution,
+  claimScienceRunTerminalWorkflowWait,
+  commitClaimedWorkflowWaitStatus,
   commitNodeExecution,
   createApproval,
   findApprovalForNode,
   findCommittedExecution,
+  finishClaimedWorkflowWaitMission,
   getMission,
   getMissionSteps,
+  getWorkflowWaitForMission,
   createEvidence,
   getWorkflowVersionById,
   insertStep,
+  registerScienceRunTerminalWait,
+  releaseWorkflowWaitClaim,
+  renewWorkflowWaitClaim,
   updateMission,
   updateStep,
   type Db,
@@ -35,6 +45,40 @@ import { wrapUntrusted } from "./untrusted.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date();
+const WORKFLOW_WAIT_CLAIM_LEASE_MS = 90_000;
+const WORKFLOW_WAIT_HEARTBEAT_MS = 20_000;
+
+const DEFERRED_SCIENCE_STATUS = Symbol("deferred-science-status");
+interface DeferredScienceStatusResult {
+  readonly [DEFERRED_SCIENCE_STATUS]: true;
+  readonly runId: string;
+  readonly state: typeof ScienceRunState._type;
+  readonly manifestComplete: boolean;
+  readonly result: unknown;
+}
+
+function isDeferredScienceStatusResult(value: unknown): value is DeferredScienceStatusResult {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    (value as Partial<DeferredScienceStatusResult>)[DEFERRED_SCIENCE_STATUS] === true,
+  );
+}
+
+interface ActiveWorkflowWaitClaim {
+  waitId: string;
+  nodeId: string;
+  claimToken: string;
+  generation: number;
+  lost: boolean;
+}
+
+class WorkflowWaitOwnershipLostError extends Error {
+  constructor() {
+    super("durable workflow wait ownership was lost; continuation stopped for recovery");
+    this.name = "WorkflowWaitOwnershipLostError";
+  }
+}
 
 /** Evaluate an edge/branch expression in a locked-down vm context. */
 function evalExpression(expr: string, out: unknown, context: Record<string, unknown>): unknown {
@@ -111,6 +155,7 @@ export class WorkflowExecutor {
   private readonly audit: AuditSink | null;
   private readonly checkRunner: CheckRunner | null;
   private agentInvoker: AgentInvoker | null = null;
+  private readonly waitClaims = new Map<string, ActiveWorkflowWaitClaim>();
 
   constructor(deps: ExecutorDeps) {
     this.db = deps.db;
@@ -136,6 +181,33 @@ export class WorkflowExecutor {
   }
 
   async runMission(missionId: string): Promise<MissionStatus> {
+    let heartbeat: NodeJS.Timeout | null = null;
+    try {
+      return await this.runMissionBody(missionId, (claim) => {
+        this.waitClaims.set(missionId, claim);
+        heartbeat = setInterval(() => {
+          void renewWorkflowWaitClaim(this.db, {
+            waitId: claim.waitId,
+            claimToken: claim.claimToken,
+            claimExpiresAt: new Date(Date.now() + WORKFLOW_WAIT_CLAIM_LEASE_MS),
+          }).then((owned) => {
+            if (!owned) claim.lost = true;
+          }).catch(() => {
+            claim.lost = true;
+          });
+        }, WORKFLOW_WAIT_HEARTBEAT_MS);
+        heartbeat.unref?.();
+      });
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      this.waitClaims.delete(missionId);
+    }
+  }
+
+  private async runMissionBody(
+    missionId: string,
+    onWaitClaim: (claim: ActiveWorkflowWaitClaim) => void,
+  ): Promise<MissionStatus> {
     const mission = await getMission(this.db, missionId);
     if (!mission) throw new Error(`mission ${missionId} not found`);
     if (["succeeded", "failed", "cancelled"].includes(mission.status)) {
@@ -147,7 +219,37 @@ export class WorkflowExecutor {
     if (!versionRow) throw new Error(`workflow version ${mission.workflowVersionId} not found`);
     const graph = WorkflowGraph.parse(versionRow.graph);
 
-    const resuming = mission.status === "awaiting_approval";
+    const durableWait = await getWorkflowWaitForMission(this.db, missionId);
+    let claimedWait: ActiveWorkflowWaitClaim | null = null;
+    if (durableWait && ["pending", "ready", "claimed"].includes(durableWait.state)) {
+      const claimToken = randomUUID();
+      const claimed = await claimScienceRunTerminalWorkflowWait(this.db, {
+        missionId,
+        claimToken,
+        claimExpiresAt: new Date(Date.now() + WORKFLOW_WAIT_CLAIM_LEASE_MS),
+      });
+      if (!claimed) throw new Error("workflow wait disappeared before claim");
+      if (claimed.status === "pending") return "waiting";
+      if (claimed.status === "busy") return "running";
+      if (claimed.status === "cancelled") return "cancelled";
+      if (claimed.status === "terminal") {
+        const terminal = await getMission(this.db, missionId);
+        return (terminal?.status ?? "failed") as MissionStatus;
+      }
+      if (claimed.status === "consumed") {
+        throw new Error("an active workflow wait unexpectedly became consumed while claiming");
+      }
+      claimedWait = {
+        waitId: claimed.wait.id,
+        nodeId: claimed.wait.nodeId,
+        claimToken,
+        generation: claimed.wait.generation,
+        lost: false,
+      };
+      onWaitClaim(claimedWait);
+    }
+
+    const resuming = mission.status === "awaiting_approval" || claimedWait !== null;
     if (!resuming) {
       await updateMission(this.db, missionId, { status: "running", startedAt: now() });
       await this.bus.publish({
@@ -182,6 +284,10 @@ export class WorkflowExecutor {
     for (const node of order) {
       if (completed.has(node.id) || skipped.has(node.id)) continue;
 
+      if (claimedWait) {
+        await this.assertWorkflowWaitOwnership(claimedWait, node.timeoutMs ?? 30_000);
+      }
+
       // Cooperative cancellation (Stage 2): honour a cancel request between
       // nodes — the granularity at which the cursor is durable.
       const fresh = await getMission(this.db, missionId);
@@ -213,12 +319,25 @@ export class WorkflowExecutor {
       // Approval gate — halt and persist, or resume past a decided approval.
       if (node.kind === "approval") {
         const cfg = ApprovalConfig.parse(node.config);
+        let approvalPrompt: string;
+        try {
+          approvalPrompt = resolveApprovalPrompt(cfg.prompt, nodeInput);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await this.recordStep(missionId, node, "failed", 0, nodeInput ?? null, null, message, stepIdByNode);
+          return this.finishMission(missionId, "failed", null, message);
+        }
         const existing = await findApprovalForNode(this.db, missionId, node.id);
+        if (existing && existing.prompt !== approvalPrompt) {
+          const message = "approval prompt no longer matches the durable node input";
+          await this.recordStep(missionId, node, "failed", 0, nodeInput ?? null, null, message, stepIdByNode);
+          return this.finishMission(missionId, "failed", null, message);
+        }
         if (!existing || existing.status === "pending") {
           const approval = existing ?? (await createApproval(this.db, {
             missionId,
             nodeId: node.id,
-            prompt: cfg.prompt,
+            prompt: approvalPrompt,
             tier: cfg.tier,
           }));
           await this.recordStep(missionId, node, "awaiting_approval", 0, nodeInput ?? null, null, null, stepIdByNode);
@@ -229,7 +348,7 @@ export class WorkflowExecutor {
             missionId,
             nodeId: node.id,
             approvalId: approval.id,
-            prompt: cfg.prompt,
+            prompt: approvalPrompt,
             at: now().toISOString(),
           });
           return "awaiting_approval";
@@ -381,17 +500,116 @@ export class WorkflowExecutor {
       let output: unknown;
       let ok = false;
       for (; attempt <= retries; attempt++) {
+        if (claimedWait) {
+          await this.assertWorkflowWaitOwnership(claimedWait, node.timeoutMs ?? 30_000);
+        }
         await this.recordStep(missionId, node, "running", attempt, nodeInput ?? null, null, null, stepIdByNode);
         try {
-          output = await withTimeout(
+          const candidate = await withTimeout(
             this.executeNode(node, nodeInput, outputs, missionId, triggerMode, attempt),
             node.timeoutMs ?? 30_000,
             `node ${node.id}`,
           );
+          if (claimedWait) {
+            await this.assertWorkflowWaitOwnership(claimedWait, node.timeoutMs ?? 30_000);
+          }
+          output = candidate;
           ok = true;
           break;
         } catch (err) {
+          if (err instanceof WorkflowWaitOwnershipLostError) throw err;
           lastError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      if (ok && isDeferredScienceStatusResult(output)) {
+        const deferred = output;
+        if (!["succeeded", "failed", "cancelled"].includes(deferred.state)) {
+          if (claimedWait) {
+            await releaseWorkflowWaitClaim(this.db, {
+              missionId,
+              claimToken: claimedWait.claimToken,
+            });
+          } else {
+            const registered = await registerScienceRunTerminalWait(this.db, {
+              missionId,
+              nodeId: node.id,
+              targetRunId: deferred.runId,
+            });
+            if (registered.cancelled) {
+              await this.bus.publish({
+                type: "mission.step",
+                missionId,
+                nodeId: node.id,
+                kind: node.kind,
+                status: "skipped",
+                attempt,
+                error: "cancelled by operator",
+                at: now().toISOString(),
+              });
+              await this.bus.publish({
+                type: "mission.finished",
+                missionId,
+                status: "cancelled",
+                at: now().toISOString(),
+              });
+              return "cancelled";
+            }
+          }
+          await this.recordStep(
+            missionId,
+            node,
+            "waiting",
+            claimedWait?.generation ?? attempt,
+            nodeInput ?? null,
+            null,
+            null,
+            stepIdByNode,
+          );
+          return "waiting";
+        }
+        if (deferred.state !== "succeeded") {
+          ok = false;
+          lastError = `Science run ${deferred.runId} ended ${deferred.state}`;
+        } else if (!deferred.manifestComplete) {
+          ok = false;
+          lastError = `Science run ${deferred.runId} succeeded without a complete manifest`;
+        } else {
+          output = deferred.result;
+          if (claimedWait) {
+            const persistedOutput = output ?? null;
+            const nextCursor = { ...outputs, [node.id]: persistedOutput };
+            await commitClaimedWorkflowWaitStatus(this.db, {
+              missionId,
+              nodeId: node.id,
+              claimToken: claimedWait.claimToken,
+              cursor: nextCursor,
+              output: persistedOutput,
+              attempt: claimedWait.generation,
+              claimExpiresAt: new Date(Date.now() + WORKFLOW_WAIT_CLAIM_LEASE_MS),
+            });
+            outputs[node.id] = persistedOutput;
+            completed.add(node.id);
+            await this.bus.publish({
+              type: "mission.step",
+              missionId,
+              nodeId: node.id,
+              kind: node.kind,
+              status: "succeeded",
+              attempt: claimedWait.generation,
+              at: now().toISOString(),
+            });
+            await this.recordAudit({
+              workspaceId: mission.workspaceId,
+              actorKind: "system",
+              actorLabel: "workflow",
+              missionId,
+              action: "tool.call",
+              target: "science.run.status",
+              detail: { node: node.id, status: "succeeded", deferred: true },
+            });
+            continue;
+          }
         }
       }
 
@@ -428,6 +646,32 @@ export class WorkflowExecutor {
     return this.finishMission(missionId, "succeeded", result, null);
   }
 
+  private async assertWorkflowWaitOwnership(
+    claim: ActiveWorkflowWaitClaim,
+    boundedOperationMs: number,
+  ): Promise<void> {
+    if (claim.lost) throw new WorkflowWaitOwnershipLostError();
+    const leaseMs = Math.max(
+      WORKFLOW_WAIT_CLAIM_LEASE_MS,
+      boundedOperationMs + WORKFLOW_WAIT_CLAIM_LEASE_MS,
+    );
+    try {
+      const owned = await renewWorkflowWaitClaim(this.db, {
+        waitId: claim.waitId,
+        claimToken: claim.claimToken,
+        claimExpiresAt: new Date(Date.now() + leaseMs),
+      });
+      if (!owned) {
+        claim.lost = true;
+        throw new WorkflowWaitOwnershipLostError();
+      }
+    } catch (error) {
+      claim.lost = true;
+      if (error instanceof WorkflowWaitOwnershipLostError) throw error;
+      throw new WorkflowWaitOwnershipLostError();
+    }
+  }
+
   private async executeNode(
     node: WorkflowNode,
     input: unknown,
@@ -441,7 +685,53 @@ export class WorkflowExecutor {
         return input ?? null;
       case "action": {
         const cfg = ActionConfig.parse(node.config);
-        const args = resolveArgs(cfg.args, input);
+        const args = resolveWorkflowActionArgs(cfg.args, input, outputs);
+        if (cfg.defer) {
+          const info = this.tools.info(cfg.server, cfg.tool);
+          if (
+            cfg.defer.kind !== "science_run_terminal" ||
+            cfg.server !== "science" ||
+            cfg.tool !== "run.status" ||
+            info?.tier !== "read_auto"
+          ) {
+            throw new Error(
+              "durable workflow defer is restricted to the registered read-only science.run.status tool",
+            );
+          }
+          const runId = args.runId;
+          if (typeof runId !== "string" || !runId.trim()) {
+            throw new Error("deferred science.run.status requires an exact runId argument");
+          }
+          // Deliberately bypass the side-effect ledger: this exact tool is a
+          // repeatable read, and a non-terminal observation must never become
+          // a committed output that suppresses the terminal re-read.
+          const result = await this.tools.callTool(cfg.server, cfg.tool, args, { input, missionId });
+          const resultRecord = result && typeof result === "object"
+            ? result as Record<string, unknown>
+            : null;
+          const runRecord = resultRecord?.run && typeof resultRecord.run === "object"
+            ? resultRecord.run as Record<string, unknown>
+            : null;
+          if (!runRecord || runRecord.id !== runId) {
+            throw new Error("science.run.status returned a different or missing run identity");
+          }
+          const state = ScienceRunState.safeParse(runRecord.state);
+          if (!state.success) {
+            throw new Error("science.run.status returned an invalid run state");
+          }
+          return {
+            [DEFERRED_SCIENCE_STATUS]: true,
+            runId,
+            state: state.data,
+            manifestComplete: (() => {
+              const parsedManifest = ScienceManifest.safeParse(runRecord.manifest);
+              return state.data === "succeeded" &&
+                parsedManifest.success &&
+                parsedManifest.data.complete;
+            })(),
+            result,
+          } satisfies DeferredScienceStatusResult;
+        }
         // Idempotency (Stage 2, G4): a retried mission reuses the committed
         // output of a side-effectful call instead of re-executing it. The
         // ledger row is written *before* the call so a crash mid-call is
@@ -500,12 +790,23 @@ export class WorkflowExecutor {
     output: unknown,
     error: string | null,
   ): Promise<MissionStatus> {
-    await updateMission(this.db, missionId, {
-      status,
-      output: output === undefined ? null : output,
-      error,
-      finishedAt: now(),
-    });
+    const claim = this.waitClaims.get(missionId);
+    if (claim && ["succeeded", "failed", "cancelled"].includes(status)) {
+      await finishClaimedWorkflowWaitMission(this.db, {
+        missionId,
+        claimToken: claim.claimToken,
+        status: status as "succeeded" | "failed" | "cancelled",
+        output,
+        error,
+      });
+    } else {
+      await updateMission(this.db, missionId, {
+        status,
+        output: output === undefined ? null : output,
+        error,
+        finishedAt: now(),
+      });
+    }
     await this.bus.publish({ type: "mission.finished", missionId, status, at: now().toISOString() });
     return status;
   }
@@ -561,22 +862,175 @@ export class WorkflowExecutor {
 
 /** Resolve one templatable string (verify-node config fields). */
 function resolveTemplate(value: string, input: unknown): string {
-  const resolved = resolveArgs({ v: value }, input).v;
+  const resolved = resolveWorkflowActionArgs({ v: value }, input, {}).v;
   return resolved == null ? "" : String(resolved);
 }
 
-/** Replace `{{input}}` / `{{input.path}}` placeholders in string args. */
-function resolveArgs(args: Record<string, unknown>, input: unknown): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(args)) {
-    if (typeof v === "string") {
-      const m = v.match(/^\{\{\s*input(?:\.([\w.]+))?\s*\}\}$/);
-      if (m) {
-        out[k] = m[1] ? m[1].split(".").reduce<unknown>((acc, key) => (acc as any)?.[key], input) : input;
-        continue;
-      }
-    }
-    out[k] = v;
+const EXACT_DYNAMIC_APPROVAL_PROMPT = "{{input.approvalPrompt}}";
+const MAX_DYNAMIC_APPROVAL_PROMPT_CHARACTERS = 1_024;
+const MAX_DYNAMIC_APPROVAL_PROMPT_BYTES = 2_048;
+const APPROVAL_PROMPT_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+/**
+ * Resolve the one deliberately supported dynamic approval prompt. Requiring
+ * the entire value to be `{{input.approvalPrompt}}` prevents mixed template
+ * text from disguising what the operator is approving. Static prompts are
+ * returned byte-for-byte for backward compatibility.
+ */
+export function resolveApprovalPrompt(prompt: string, input: unknown): string {
+  if (!prompt.includes("{{") && !prompt.includes("}}")) return prompt;
+  if (prompt !== EXACT_DYNAMIC_APPROVAL_PROMPT) {
+    throw new Error(
+      "dynamic approval prompt must be exactly {{input.approvalPrompt}}",
+    );
   }
-  return out;
+
+  const resolved = resolveWorkflowActionArgs({ prompt }, input, {}).prompt;
+  if (typeof resolved !== "string" || resolved.length === 0 || resolved.trim().length === 0) {
+    throw new Error("dynamic approval prompt must resolve to a nonempty plain string");
+  }
+  if (resolved.length > MAX_DYNAMIC_APPROVAL_PROMPT_CHARACTERS) {
+    throw new Error(
+      `dynamic approval prompt exceeds ${MAX_DYNAMIC_APPROVAL_PROMPT_CHARACTERS} characters`,
+    );
+  }
+  if (Buffer.byteLength(resolved, "utf8") > MAX_DYNAMIC_APPROVAL_PROMPT_BYTES) {
+    throw new Error(`dynamic approval prompt exceeds ${MAX_DYNAMIC_APPROVAL_PROMPT_BYTES} UTF-8 bytes`);
+  }
+  if (APPROVAL_PROMPT_CONTROL_CHARACTERS.test(resolved)) {
+    throw new Error("dynamic approval prompt contains forbidden control characters");
+  }
+  return resolved;
+}
+
+const WORKFLOW_REFERENCE = /^\{\{\s*(input|steps\.([A-Za-z0-9_-]+))(?:\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*))?\s*\}\}$/;
+const UNSAFE_REFERENCE_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+const MAX_ACTION_ARG_DEPTH = 32;
+const MAX_ACTION_ARG_VALUES = 10_000;
+
+function ownPath(root: unknown, path: string | undefined, label: string): unknown {
+  if (!path) return root;
+  let current = root;
+  for (const segment of path.split(".")) {
+    if (UNSAFE_REFERENCE_SEGMENTS.has(segment)) {
+      throw new Error(`workflow reference ${label} contains a forbidden path segment`);
+    }
+    if ((typeof current !== "object" && typeof current !== "function") || current === null) {
+      throw new Error(`workflow reference ${label} does not exist`);
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(current, segment);
+    // Tool results are JSON values. Refuse prototypes and accessors rather
+    // than invoking code while resolving a workflow definition.
+    if (!descriptor || !("value" in descriptor)) {
+      throw new Error(`workflow reference ${label} does not exist`);
+    }
+    current = descriptor.value;
+  }
+  return current;
+}
+
+function resolveWorkflowReference(
+  value: string,
+  input: unknown,
+  steps: Readonly<Record<string, unknown>>,
+): { matched: boolean; value: unknown } {
+  const match = value.match(WORKFLOW_REFERENCE);
+  if (!match) {
+    if (/^\{\{\s*steps\./.test(value)) {
+      throw new Error(
+        "invalid workflow step reference; use {{steps.<node-id>.<property>}} " +
+          "with letters, numbers, underscores, or hyphens",
+      );
+    }
+    return { matched: false, value };
+  }
+  if (match[1] === "input") {
+    // Preserve the legacy input-placeholder behavior: a missing optional
+    // input field resolves to undefined and the called tool's schema decides
+    // whether it is required.
+    try {
+      return { matched: true, value: ownPath(input, match[3], `input${match[3] ? `.${match[3]}` : ""}`) };
+    } catch (error) {
+      if (error instanceof Error && / does not exist$/.test(error.message)) {
+        return { matched: true, value: undefined };
+      }
+      throw error;
+    }
+  }
+
+  const nodeId = match[2]!;
+  if (!Object.prototype.hasOwnProperty.call(steps, nodeId)) {
+    throw new Error(`workflow reference steps.${nodeId} is not a completed prior step`);
+  }
+  const root = Object.getOwnPropertyDescriptor(steps, nodeId);
+  if (!root || !("value" in root)) {
+    throw new Error(`workflow reference steps.${nodeId} is not a data property`);
+  }
+  return {
+    matched: true,
+    value: ownPath(root.value, match[3], `steps.${nodeId}${match[3] ? `.${match[3]}` : ""}`),
+  };
+}
+
+/**
+ * Resolve action arguments without evaluating expressions. Exact
+ * `{{input...}}` and `{{steps.<node-id>...}}` placeholders retain their JSON
+ * type, including nested arrays and objects. Literal strings are unchanged.
+ *
+ * Resolution recursively clones the JSON argument tree, refuses accessors and
+ * prototype traversal, and fails closed when a referenced prior step/property
+ * is absent. The bounded traversal prevents a hostile workflow definition
+ * from expanding executor work without limit.
+ */
+export function resolveWorkflowActionArgs(
+  args: Record<string, unknown>,
+  input: unknown,
+  steps: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  let values = 0;
+  const active = new WeakSet<object>();
+
+  const visit = (value: unknown, depth: number, resolveReferences = true): unknown => {
+    values++;
+    if (values > MAX_ACTION_ARG_VALUES) {
+      throw new Error(`workflow action arguments exceed ${MAX_ACTION_ARG_VALUES} values`);
+    }
+    if (depth > MAX_ACTION_ARG_DEPTH) {
+      throw new Error(`workflow action arguments exceed depth ${MAX_ACTION_ARG_DEPTH}`);
+    }
+    if (typeof value === "string" && resolveReferences) {
+      const resolved = resolveWorkflowReference(value, input, steps);
+      return resolved.matched
+        ? visit(resolved.value, depth + 1, false)
+        : value;
+    }
+    if (value === null || typeof value !== "object") return value;
+    if (active.has(value)) throw new Error("workflow action arguments contain a cycle");
+    active.add(value);
+    try {
+      if (Array.isArray(value)) {
+        return value.map((entry) => visit(entry, depth + 1, resolveReferences));
+      }
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new Error("workflow action arguments must contain only JSON objects");
+      }
+      const output: Record<string, unknown> = {};
+      for (const key of Object.keys(value)) {
+        if (UNSAFE_REFERENCE_SEGMENTS.has(key)) {
+          throw new Error("workflow action arguments contain a forbidden object key");
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || !("value" in descriptor)) {
+          throw new Error("workflow action arguments must not contain accessors");
+        }
+        output[key] = visit(descriptor.value, depth + 1, resolveReferences);
+      }
+      return output;
+    } finally {
+      active.delete(value);
+    }
+  };
+
+  return visit(args, 0) as Record<string, unknown>;
 }

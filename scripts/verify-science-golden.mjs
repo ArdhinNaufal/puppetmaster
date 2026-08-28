@@ -48,6 +48,29 @@ const suites = [
     ],
   },
   {
+    id: "deployment-preflight",
+    script: "scripts/verify-science-deployment.mjs",
+    markers: [
+      {
+        label: "fail-closed production deployment configuration",
+        pattern:
+          /^SCIENCE DEPLOYMENT PASS: production preflight, read-only rollback, runtime admission, same-origin web delivery, and Compose environment parity$/m,
+        evidence: ["deployment-preflight", "same-origin-web-delivery"],
+      },
+    ],
+    sourceRequirements: [
+      /assertScienceProductionDeploymentEnv/,
+      /SCIENCE_READ_ONLY/,
+      /SCIENCE_STORAGE_DRIVER=s3/,
+      /contract_fixture/,
+      /docker\/docker-compose\.yml/,
+      /assert\.equal\(configuredServer\.ports, undefined\)/,
+      /configuredCompose\.networks\.web_gateway\.internal/,
+      /connect-src 'self';/,
+      /same-origin web gateway serves the SPA/,
+    ],
+  },
+  {
     id: "lifecycle",
     script: "scripts/verify-science-lifecycle.mjs",
     markers: [
@@ -63,6 +86,12 @@ const suites = [
       /acquireScienceRunLease/,
       /getScienceRunForWorkspace\(handle\.db,\s*workspaceB\.id/,
       /manifestHash/,
+      /createScienceDomainValidation/,
+      /\[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\]/,
+      /maxConcurrentExternalStreamsPerWorkspace/,
+      /renderReplayFields/,
+      /replayExpiresAt/,
+      /tombstoneTerminalScienceRenderSessionAfterClose/,
       /racingUploads = await Promise\.allSettled/,
     ],
   },
@@ -73,8 +102,12 @@ const suites = [
       {
         label: "database-atomic mutation audit",
         pattern:
-          /^SCIENCE ATOMIC AUDIT PASS: migration rollback\/serialization, 10 table triggers, actor-attributed workspace admission and commit\/rollback\/context reset, bounded event\/run\/upload-lease\/cleanup auditing, and committed semantic insert\/update\/cascade-delete audits$/m,
-        evidence: ["atomic-audit", "workspace-admission"],
+          /^SCIENCE ATOMIC AUDIT PASS: migration rollback\/serialization, 12 table triggers including append-only validation plus monotonic scope heads, actor-attributed workspace admission and commit\/rollback\/context reset, bounded event\/run\/upload-lease\/cleanup auditing, and committed semantic insert\/update\/cascade-delete audits$/m,
+        evidence: [
+          "atomic-audit",
+          "workspace-admission",
+          "domain-validation-head-integrity",
+        ],
       },
     ],
     sourceRequirements: [
@@ -82,6 +115,9 @@ const suites = [
       /Promise\.all/,
       /science_domain_audit_mutation/,
       /science_workspace_admissions/,
+      /science_domain_validations/,
+      /science_domain_validation_heads/,
+      /science domain validation heads advance monotonically/,
       /deliberate science mutation rollback/,
     ],
   },
@@ -138,9 +174,201 @@ const suites = [
     ],
   },
   {
+    id: "workflow-reviewed-run",
+    script: "scripts/verify-science-workflow.mjs",
+    markers: [
+      {
+        label: "reviewed workflow through exact static result",
+        pattern:
+          /^SCIENCE WORKFLOW PASS: reviewed run intent, durable terminal wait, bounded checksummed PNG selection, exact visible static approval, stable replay key, exact render references, and complete manifest result$/m,
+        evidence: ["workflow-reviewed-submission"],
+      },
+    ],
+    sourceRequirements: [
+      /submission must consume the exact human-reviewed evidence record/,
+      /config\.defer, \{ kind: "science_run_terminal" \}/,
+      /assert\.equal\(authorizeRenderNode\?\.config\.prompt, "\{\{input\.approvalPrompt\}\}"\)/,
+      /must be exactly \\\{\\\{input\\\.approvalPrompt\\\}\\\}/,
+      /exceeds 1024 characters/,
+      /exceeds 2048 UTF-8 bytes/,
+      /forbidden control characters/,
+      /approval inbox stored the wrong prompt/,
+      /approval\.requested did not publish the exact visible source prompt/,
+      /malformed dynamic prompt created an approval record/,
+      /MAX_STATIC_BYTES = 8 \* 1024 \* 1024/,
+      /exact released 8 MiB static-render ceiling must remain admissible/,
+      /does not authorize remote or Trame/,
+      /static render must have no path that bypasses its exact-source approval/,
+      /reviewed run key must derive the same render idempotency key on replay/,
+      /render source does not match/,
+      /not the exact bounded same-origin gateway path/,
+    ],
+  },
+  {
+    id: "workflow-deferred-resume",
+    script: "scripts/verify-workflow-deferred-resume.mjs",
+    markers: [
+      {
+        label: "durable workflow terminal wait and recovery",
+        pattern:
+          /^WORKFLOW DEFERRED RESUME PASS: migration14 atomic readiness, exact read-only defer, waiting\/claim\/heartbeat recovery, crash-after-cursor continuation, split-brain fail-stop, terminal fail-closed, atomic cancel-retry reactivation, stale retry-owner fencing, parent-child cancel isolation, and keyed wake coalescing$/m,
+        evidence: ["durable-workflow-wait"],
+      },
+    ],
+    sourceRequirements: [
+      /terminal readiness rollback sentinel/,
+      /cursor commit must retain the continuation claim/,
+      /ownership was lost/,
+      /without a complete manifest/,
+      /cancelWorkflowMissionWait/,
+      /resetMissionForRetry/,
+      /cannot be retried from status waiting/,
+      /pre-retry owner must not execute downstream work/,
+      /keyedDispatches/,
+    ],
+  },
+  {
+    id: "workflow-workspace-isolation",
+    script: "scripts/verify-workflow-workspace-isolation.mjs",
+    markers: [
+      {
+        label: "workspace-scoped workflow recovery and dispatch",
+        pattern:
+          /^WORKFLOW WORKSPACE ISOLATION PASS: scoped ready\/recovery queries, bounded queued workflow\/agent\/Claude namespace migration, fail-closed start\/dispatch, namespaced Redis queue and cron identities, owned workflow routes, and owned template sources$/m,
+        evidence: ["workflow-workspace-isolation"],
+      },
+    ],
+    sourceRequirements: [
+      /workspace A listed workspace B's ready wait/,
+      /workspace A recovered workspace B's expired claim/,
+      /foreign dispatch reached the workspace A executor/,
+      /startup recovery omitted Claude or admitted foreign, Science, approval-paused, or cancel-requested work/,
+      /foreign webhook ownership must fail before secret verification/,
+      /WORKFLOW_REDIS_URL/,
+      /two workspace-bound QueueRunner instances consumed only their own mission/,
+    ],
+    additionalSources: [
+      {
+        path: "packages/db/src/durability-repo.ts",
+        requirements: [
+          /listQueuedGenericMissionsForRecovery/,
+          /eq\(missions\.workspaceId, input\.workspaceId\)/,
+          /inArray\(missions\.kind, \["workflow", "agent", "claude"\]\)/,
+        ],
+      },
+      {
+        path: "packages/kernel/src/orchestrator.ts",
+        requirements: [
+          /createWorkspaceMissionDispatcher/,
+          /mission\.workspaceId !== workspaceId/,
+          /wf\.workflow\.workspaceId !== input\.workspaceId/,
+        ],
+      },
+      {
+        path: "packages/kernel/src/queue.ts",
+        requirements: [
+          /workflowQueueName/,
+          /workflowQueueConnectionOptions/,
+          /workflowCronSchedulerId/,
+          /new Queue\(queueName/,
+          /new Worker\(\s*queueName/,
+        ],
+      },
+      {
+        path: "apps/server/src/main.ts",
+        requirements: [
+          /recoverQueuedWorkspaceMissions/,
+          /new QueueRunner\(REDIS_URL, \{ run: dispatch, db, workspaceId \}\)/,
+          /getWorkspaceWorkflowWithGraph/,
+          /wf\.workflow\.workspaceId !== workspaceId/,
+          /agent\.workspaceId !== workspaceId/,
+        ],
+      },
+    ],
+  },
+  {
+    id: "jupyter-gateway-prerequisite",
+    script: "scripts/verify-science-jupyter-gateway.mjs",
+    markers: [
+      {
+        label: "fail-closed Jupyter Enterprise Gateway prerequisite",
+        pattern:
+          /^SCIENCE JEG PREREQUISITE PASS: authenticated HTTPS, >=3\.3\.0, exact instance fence, immutable kernelspec\/image allowlist, bounded control responses, recovery correlation, read-only orphan inventory, exact-handle cancellation, and secret redaction$/m,
+        evidence: ["jupyter-gateway-prerequisite"],
+      },
+      {
+        label: "Jupyter Enterprise Gateway live-execution nonproof",
+        pattern:
+          /^LIVE JEG EXECUTION: NOT PROVEN; submit\/channels\/output collection remain fail-closed and the prerequisite is not registered as ComputeProvider$/m,
+        evidence: [],
+      },
+    ],
+    sourceRequirements: [
+      /JUPYTER_ENTERPRISE_GATEWAY_EXECUTION_BLOCKERS/,
+      /createComputeProvidersFromEnv/,
+      /read-only orphan inventory/,
+      /exact-handle cancellation/,
+      /not registered as ComputeProvider/,
+    ],
+  },
+  {
+    id: "oci-executor-candidate",
+    script: "scripts/run-science-oci-executor-verifier.mjs",
+    markers: [
+      {
+        label: "deterministic OCI executor candidate",
+        pattern:
+          /^SCIENCE OCI EXECUTOR CANDIDATE PASS: canonical pinned rootless endpoint policy, exclusive state ownership, restrictive seccomp, secure argv, aggregate state quota, parallel cancellable staging, idempotency, fencing, fail-closed recovery, bounded outputs, timeout, tombstones, HTTP bounds, and exact cleanup$/m,
+        evidence: ["oci-executor-candidate"],
+      },
+      {
+        label: "OCI live-execution nonproof",
+        pattern:
+          /^LIVE OCI EXECUTION: NOT PROVEN \(no real rootless engine or notebook corpus in this lane\)$/m,
+        evidence: [],
+      },
+    ],
+    sourceRequirements: [
+      /verify-science-oci-executor\.py/,
+      /PUPPETMASTER_PYTHON/,
+      /spawnSync/,
+    ],
+    additionalSources: [
+      {
+        path: "scripts/verify-science-oci-executor.py",
+        requirements: [
+          /def verify_config_and_command/,
+          /def verify_engine_adapter_counterexamples/,
+          /def verify_state_ownership_quota_and_sweep/,
+          /def verify_lifecycle/,
+          /def verify_cancel_timeout_recovery/,
+          /def verify_start_cancel_crash_convergence/,
+          /def verify_fail_closed_health/,
+          /def verify_health_retention_and_endpoint_policy/,
+          /def verify_http_contract/,
+          /verify_config_and_command\(root \/ "command"\)/,
+          /verify_engine_adapter_counterexamples\(root \/ "engine-adapter"\)/,
+          /verify_state_ownership_quota_and_sweep\(root \/ "state"\)/,
+          /verify_lifecycle\(root \/ "lifecycle"\)/,
+          /verify_cancel_timeout_recovery\(root \/ "recovery"\)/,
+          /verify_start_cancel_crash_convergence\(root \/ "crash-convergence"\)/,
+          /verify_fail_closed_health\(root \/ "closed"\)/,
+          /verify_health_retention_and_endpoint_policy\(root \/ "policy"\)/,
+          /verify_http_contract\(root \/ "http"\)/,
+          /rootful engine was admitted/,
+          /same semantic replay bypassed the retained tombstone/,
+          /LIVE OCI EXECUTION: NOT PROVEN/,
+        ],
+      },
+    ],
+  },
+  {
     id: "service",
     script: "scripts/verify-science-service.mjs",
-    minimumOkLines: 43,
+    // Five remote-render acceptance cases were deliberately retired when
+    // client/Trame modes became explicit no-go paths; two released-scope
+    // cases replaced them (admin reconciliation and exact static replay).
+    minimumOkLines: 41,
     markers: [
       {
         label: "declared format refusal",
@@ -159,6 +387,12 @@ const suites = [
         pattern:
           /^ok - scheduler drives approved run to checksummed outputs and complete manifest$/m,
         evidence: ["approval-gate", "manifest-completeness"],
+      },
+      {
+        label: "immutable code provenance",
+        pattern:
+          /^ok - manifest completeness requires a linked immutable code input$/m,
+        evidence: ["verified-code-provenance", "manifest-completeness"],
       },
       {
         label: "public tool projection and selection",
@@ -183,6 +417,12 @@ const suites = [
         pattern:
           /^ok - cancellation after an ambiguous submit recovers and cancels the same execution$/m,
         evidence: ["submit-attempt-fencing"],
+      },
+      {
+        label: "ambiguous-submit admin reconciliation",
+        pattern:
+          /^ok - repeated lost submit responses enter the admin queue and recover exact execution$/m,
+        evidence: ["submit-attempt-fencing", "admin-action-queue"],
       },
       {
         label: "honest provenance comparison",
@@ -227,6 +467,24 @@ const suites = [
         evidence: ["service-lifecycle"],
       },
       {
+        label: "bounded fail-open Redis advisory publishing",
+        pattern:
+          /^ok - stalled Redis advisory publish is bounded across API and terminal run paths$/m,
+        evidence: ["service-lifecycle"],
+      },
+      {
+        label: "exact-source static render replay",
+        pattern:
+          /^ok - static render is exact-source, replay-safe, bounded, and tombstoned$/m,
+        evidence: ["exact-static-render-replay-source"],
+      },
+      {
+        label: "explicit append-only numerical review",
+        pattern:
+          /^ok - append-only numerical review is explicit and leaves manifests unchanged$/m,
+        evidence: ["member-comparison", "manifest-completeness", "atomic-audit"],
+      },
+      {
         label: "service acceptance completion",
         pattern:
           /^SCIENCE SERVICE PASS: upload, quarantine, signed ranges, execution, provenance, reproduction, cancellation, fencing, restart recovery, isolation, render, and tool redaction$/m,
@@ -245,6 +503,15 @@ const suites = [
       /toolSubmission\.run\.state,\s*"awaiting_approval"/,
       /storageKey\|providerHandle\|leaseOwner/,
       /quota-rejected provider quarantine must be discarded/,
+      /sourceRevision:\s*"deadbee"/,
+      /manifest\.sourceRevision\.unverified/,
+      /concurrent replay must start one provider/,
+      /lost-response replay must not start again/,
+      /idempotency key\.\*different request intent/,
+      /not released\.\*no implicit static downgrade/,
+      /writerOptions\.enableOfflineQueue, false/,
+      /return new Promise\(\(\) => \{\}\)/,
+      /assert\.equal\(terminal\.state, "succeeded"\)/,
     ],
   },
   {
@@ -295,10 +562,28 @@ const suites = [
         evidence: ["approval-gate", "manifest-completeness"],
       },
       {
+        label: "real-session immutable review authorization",
+        pattern:
+          /^ok - only admin\/owner sessions author immutable reviews while members read them$/m,
+        evidence: ["authorization", "member-comparison", "atomic-audit"],
+      },
+      {
         label: "audit payload redaction",
         pattern:
           /^ok - durable audit entries exist without paths, tokens, handles, or binary payloads$/m,
         evidence: ["no-raw-data-through-tools"],
+      },
+      {
+        label: "admin action queue contract",
+        pattern:
+          /^ok - admin action queue is role-gated, isolated, redacted, and convergent$/m,
+        evidence: ["admin-action-queue"],
+      },
+      {
+        label: "member-readable manifest comparison",
+        pattern:
+          /^ok - members compare manifests by GET while foreign runs remain hidden$/m,
+        evidence: ["member-comparison"],
       },
       {
         label: "workspace predicate isolation",
@@ -332,12 +617,23 @@ const suites = [
           /^science fui workspace admission acceptance: 12\/12 assertions passed\.$/m,
         evidence: ["workspace-admission-ui"],
       },
+      {
+        label: "FUI local release boundary",
+        pattern:
+          /^science fui local release acceptance: 10\/10 assertions passed\.$/m,
+        evidence: ["fui-local-release", "domain-review-ui"],
+      },
     ],
     sourceRequirements: [
       /count\(view, "newWorkEnabled=\{newWorkEnabled\}"\) === 6/,
       /admin admission changes require bounded reason/,
       /purge cancel comparison and render close remain outside admission gate/,
       /HoldButton cancels on disable and unmount with timeout-side stale guard/,
+      /static render preserves exact source, request replay, and close replay identity/,
+      /members receive paginated immutable summaries and checksum-bound detail/,
+      /admin or owner authoring is deliberate, session-attributed, bounded, and independent of pilot admission/,
+      /validation ledger preserves the Science type floor and visible keyboard focus/,
+      /admin action queue is admin-only, redacted, bounded, and navigates typed internal context/,
     ],
   },
   {
@@ -386,6 +682,7 @@ const suites = [
 
 const requiredEvidence = new Set([
   "malformed-contract-refusal",
+  "deployment-preflight",
   "unsafe-input-refusal",
   "database-predicates",
   "scheduler-durability",
@@ -394,6 +691,7 @@ const requiredEvidence = new Set([
   "no-raw-data-through-tools",
   "approval-gate",
   "manifest-completeness",
+  "verified-code-provenance",
   "service-lifecycle",
   "authorization",
   "cold-backup-restore",
@@ -405,6 +703,18 @@ const requiredEvidence = new Set([
   "geometry-preview",
   "workspace-admission",
   "workspace-admission-ui",
+  "admin-action-queue",
+  "member-comparison",
+  "fui-local-release",
+  "domain-validation-head-integrity",
+  "domain-review-ui",
+  "workflow-reviewed-submission",
+  "durable-workflow-wait",
+  "workflow-workspace-isolation",
+  "jupyter-gateway-prerequisite",
+  "oci-executor-candidate",
+  "exact-static-render-replay-source",
+  "same-origin-web-delivery",
 ]);
 
 function outputTail(value, maxLines = 80) {
@@ -412,13 +722,22 @@ function outputTail(value, maxLines = 80) {
 }
 
 async function assertSuiteSource(suite) {
-  const source = await readFile(join(repositoryRoot, suite.script), "utf8");
-  for (const pattern of suite.sourceRequirements ?? []) {
-    assert.match(
-      source,
-      pattern,
-      `${suite.id} verifier no longer contains required assertion source ${pattern}`,
-    );
+  const sources = [
+    {
+      path: suite.script,
+      requirements: suite.sourceRequirements ?? [],
+    },
+    ...(suite.additionalSources ?? []),
+  ];
+  for (const sourceSpec of sources) {
+    const source = await readFile(join(repositoryRoot, sourceSpec.path), "utf8");
+    for (const pattern of sourceSpec.requirements ?? []) {
+      assert.match(
+        source,
+        pattern,
+        `${suite.id} source ${sourceSpec.path} no longer contains required assertion ${pattern}`,
+      );
+    }
   }
 }
 
@@ -437,6 +756,16 @@ function deterministicEnvironment() {
     "SCIENCE_RENDER_URL",
     "SCIENCE_ARTIFACT_ROOT",
     "SCIENCE_STORAGE_DRIVER",
+    "SCIENCE_TEST_REDIS_URL",
+    "SCIENCE_TEST_REDIS_ALLOW_SCOPED_DELETE",
+    "WORKFLOW_REDIS_URL",
+    "WORKFLOW_REDIS_ALLOW_SCOPED_DELETE",
+    "SCIENCE_TEST_S3_ENDPOINT",
+    "SCIENCE_TEST_S3_BUCKET",
+    "SCIENCE_TEST_S3_REGION",
+    "SCIENCE_TEST_S3_ACCESS_KEY_ID",
+    "SCIENCE_TEST_S3_SECRET_ACCESS_KEY",
+    "SCIENCE_TEST_S3_ALLOW_DELETE",
   ]) {
     delete env[name];
   }

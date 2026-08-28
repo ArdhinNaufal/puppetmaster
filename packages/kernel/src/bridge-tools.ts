@@ -27,9 +27,14 @@ const TERMINAL: MissionStatus[] = ["succeeded", "failed", "cancelled"];
  * an agent can launch or draft workflows. Child missions carry the caller's
  * mission id, nesting the traces.
  */
-export function createAgentInvoker(deps: { db: Db; runtime: AgentRuntime }): AgentInvoker {
+export function createAgentInvoker(deps: {
+  db: Db;
+  workspaceId: string;
+  runtime: AgentRuntime;
+}): AgentInvoker {
   return async ({ agentId, message, parentMissionId }) => {
     const mission = await startAgentTick(deps.db, {
+      workspaceId: deps.workspaceId,
       agentId,
       trigger: { mode: "workflow" },
       payload: { message },
@@ -98,7 +103,7 @@ export function registerBridgeTools(
     async (args, ctx) => {
       let id = String(args.workflowId ?? "");
       const direct = await getWorkflowWithGraph(deps.db, id).catch(() => null);
-      if (!direct) {
+      if (!direct || direct.workflow.workspaceId !== deps.workspaceId) {
         const byName = (await listWorkflows(deps.db, deps.workspaceId)).find(
           (w) => w.name === id,
         );
@@ -106,6 +111,7 @@ export function registerBridgeTools(
         id = byName.id;
       }
       const mission = await startWorkflow(deps.db, {
+        workspaceId: deps.workspaceId,
         workflowId: id,
         trigger: { mode: "agent" },
         payload: args.input ?? {},

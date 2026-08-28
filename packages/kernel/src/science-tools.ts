@@ -249,12 +249,19 @@ export function registerScienceTools(
         runId: Uuid,
         eventLimit: z.number().int().min(1).max(50).optional(),
       }).strict(), args);
-      const dossier = await deps.service.getRunDossier(
-        input.runId,
-        input.eventLimit ?? 20,
-      );
+      const [dossier, manifest] = await Promise.all([
+        deps.service.getRunDossier(input.runId, input.eventLimit ?? 20),
+        deps.service.getManifest(input.runId),
+      ]);
       return {
         run: publicRun(dossier.run),
+        // Keep immutable manifest bytes on the run projection, but never make
+        // their historical completeness claim the operational verdict.
+        manifestAssessment: {
+          complete: manifest.complete,
+          gaps: manifest.gaps,
+          manifestHash: manifest.manifestHash,
+        },
         events: dossier.events,
         outputs: dossier.outputs.map((entry) => ({
           ...entry,
@@ -329,14 +336,16 @@ export function registerScienceTools(
         runId: { type: "string", format: "uuid" },
         artifactVersionId: { type: "string", format: "uuid" },
         mode: { type: "string", enum: ["client", "remote", "static"] },
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200 },
       },
-      required: ["runId"],
+      required: ["runId", "artifactVersionId", "mode", "idempotencyKey"],
     },
     async (args, ctx) => {
       const input = parse(z.object({
         runId: Uuid,
-        artifactVersionId: Uuid.optional(),
-        mode: z.enum(["client", "remote", "static"]).optional(),
+        artifactVersionId: Uuid,
+        mode: z.enum(["client", "remote", "static"]),
+        idempotencyKey: z.string().trim().min(1).max(200),
       }).strict(), args);
       const rendered = await deps.service.createRender({
         ...input,
@@ -346,6 +355,8 @@ export function registerScienceTools(
         renderSessionId: rendered.session.id,
         state: rendered.session.state,
         mode: rendered.mode,
+        provider: rendered.provider,
+        source: rendered.source,
         url: rendered.url,
         expiresAt: rendered.expiresAt,
       };

@@ -5,6 +5,7 @@ import {
   type ScienceArtifact,
   type ScienceRenderSession,
   type ScienceRun,
+  type ScienceRunArtifactRef,
 } from "../api.js";
 import { fmtBytes, shortHash } from "./science-utils.js";
 import {
@@ -15,6 +16,13 @@ import {
 
 export type ScienceFallbackMode = "auto" | "static" | "table";
 type SciencePalette = "cividis" | "viridis" | "coolwarm" | "grayscale";
+
+const INLINE_STATIC_MEDIA_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
 
 function metadataRows(artifact: ScienceArtifact | null, run: ScienceRun | null): [string, string][] {
   const version = artifact?.latestVersion ?? null;
@@ -35,6 +43,20 @@ function metadataRows(artifact: ScienceArtifact | null, run: ScienceRun | null):
     if (value !== undefined) rows.push([key.replace(/[A-Z]/g, (c) => ` ${c}`).toUpperCase(), typeof value === "string" ? value : JSON.stringify(value)]);
   }
   return rows;
+}
+
+function renderSourceRows(session: ScienceRenderSession): [string, string][] {
+  return [
+    ["RENDER SOURCE", session.source.logicalName],
+    ["ARTIFACT VERSION ID", session.source.artifactVersionId ?? "N/A"],
+    ["SHA-256", session.source.sha256],
+    ["SIZE", fmtBytes(session.source.sizeBytes)],
+    ["MEDIA TYPE", session.source.mediaType],
+    ["MODE", session.mode.toUpperCase()],
+    ["PROVIDER", session.provider.toUpperCase()],
+    ["RUN", session.runId ?? "N/A"],
+    ["SESSION STATE", session.state.toUpperCase()],
+  ];
 }
 
 function sameOriginRenderUrl(value: string | null | undefined): string | null {
@@ -136,6 +158,9 @@ export function ScienceViewport(props: {
   artifact: ScienceArtifact | null;
   run: ScienceRun | null;
   session: ScienceRenderSession | null;
+  eligibleRenderOutputs: ScienceRunArtifactRef[];
+  selectedRenderOutputId: string | null;
+  onRenderOutputChange: (artifactVersionId: string) => void;
   mode: ScienceFallbackMode;
   onModeChange: (mode: ScienceFallbackMode) => void;
   canBuild: boolean;
@@ -156,7 +181,9 @@ export function ScienceViewport(props: {
   const geometryAbort = useRef<AbortController | null>(null);
   const geometryWorker = useRef<Worker | null>(null);
   const version = props.artifact?.latestVersion ?? null;
-  const image = version?.mediaType?.startsWith("image/") === true;
+  const mediaType = version?.mediaType?.trim().toLowerCase() ?? "";
+  const declaredImage = mediaType.startsWith("image/");
+  const image = INLINE_STATIC_MEDIA_TYPES.has(mediaType);
   const format = props.artifact?.format?.trim().toUpperCase() ?? "";
   const geometryCandidate =
     props.artifact?.kind === "geometry" || ["VTK", "STL", "STEP", "STP"].includes(format);
@@ -165,15 +192,30 @@ export function ScienceViewport(props: {
   const geometryReady =
     geometry?.versionId === version?.id && geometry?.state === "ready" && !!geometry?.model;
   const contentUrl = version ? scienceApi.artifactContentUrl(version.id) : null;
-  const remoteUrl = sameOriginRenderUrl(props.session?.url);
-  const remoteReady = props.session?.state === "ready" && remoteUrl !== null;
-  const remoteRejected = props.session?.state === "ready" && !!props.session.url && remoteUrl === null;
-  const rows = useMemo(() => metadataRows(props.artifact, props.run), [props.artifact, props.run]);
+  const renderUrl = sameOriginRenderUrl(props.session?.url);
+  const staticSessionReady =
+    props.session?.state === "ready" &&
+    props.session.mode === "static" &&
+    props.session.provider === "static" &&
+    props.session.source.artifactVersionId === props.session.artifactVersionId &&
+    props.session.source.mediaType.toLowerCase() === "image/png" &&
+    renderUrl !== null;
+  const remoteReady =
+    props.session?.state === "ready" && props.session.mode === "remote" && renderUrl !== null;
+  const renderUrlRejected =
+    props.session?.state === "ready" && !!props.session.url && renderUrl === null;
+  const hasRenderableOutput = props.eligibleRenderOutputs.length > 0;
+  const rows = useMemo(
+    () => props.session
+      ? renderSourceRows(props.session)
+      : metadataRows(props.artifact, props.run),
+    [props.artifact, props.run, props.session],
+  );
   const mode = props.mode === "auto"
-    ? remoteReady ? "remote" : geometryReady ? "geometry" : staticReady ? "static" : "table"
+    ? staticSessionReady ? "static" : remoteReady ? "remote" : geometryReady ? "geometry" : staticReady ? "static" : "table"
     : props.mode;
   const paletteApplies = mode === "geometry";
-  const metadata = version?.metadata ?? {};
+  const metadata = props.session ? {} : version?.metadata ?? {};
   const legend = {
     field: typeof metadata.field === "string" ? metadata.field : "N/A",
     units: typeof metadata.units === "string" ? metadata.units : "N/A",
@@ -303,12 +345,13 @@ export function ScienceViewport(props: {
 
       <div
         className={`sci-viewport sci-palette-${palette}`}
+        role="region"
         tabIndex={0}
         aria-label={`${mode} scientific viewport. Use the toolbar to select a non-WebGL fallback.`}
       >
-        {mode === "remote" && remoteUrl && (
+        {mode === "remote" && props.session?.mode === "remote" && renderUrl && (
           <iframe
-            src={remoteUrl}
+            src={renderUrl}
             title="Isolated remote scientific renderer"
             sandbox="allow-scripts allow-forms allow-pointer-lock"
             referrerPolicy="no-referrer"
@@ -317,7 +360,18 @@ export function ScienceViewport(props: {
         {mode === "geometry" && geometry?.model && (
           <GeometryPreview model={geometry.model} />
         )}
-        {mode === "static" && staticReady && !staticFailed && contentUrl && (
+        {mode === "static" && staticSessionReady && renderUrl && props.session && (
+          <figure>
+            <img
+              src={renderUrl}
+              alt={`${props.session.source.logicalName} static visualization`}
+            />
+            <figcaption>
+              {props.session.source.logicalName} · {fmtBytes(props.session.source.sizeBytes)} · SHA {shortHash(props.session.source.sha256)}
+            </figcaption>
+          </figure>
+        )}
+        {mode === "static" && !props.session && staticReady && !staticFailed && contentUrl && (
           <figure>
             <img
               src={contentUrl}
@@ -329,13 +383,19 @@ export function ScienceViewport(props: {
             </figcaption>
           </figure>
         )}
-        {mode === "static" && image && !staticReady && (
+        {mode === "static" && props.session?.state === "starting" && (
+          <div className="sci-viewport-empty">
+            <span>STATIC SESSION STARTING</span>
+            <p>The exact source reservation is converging. No alternate output will be selected.</p>
+          </div>
+        )}
+        {mode === "static" && !props.session && image && !staticReady && (
           <div className="sci-viewport-empty">
             <span>STATIC CONTENT NOT LOADED</span>
             <p>Use LOAD STATIC PREVIEW to explicitly fetch this immutable artifact version.</p>
           </div>
         )}
-        {mode === "static" && staticFailed && (
+        {mode === "static" && !props.session && staticFailed && (
           <div className="sci-viewport-empty">
             <span>STATIC PREVIEW FAILED</span>
             <p>The content request failed. Retry the explicit preview or use the structured table.</p>
@@ -350,14 +410,29 @@ export function ScienceViewport(props: {
             </Chip>
           </div>
         )}
-        {mode === "static" && !image && (
+        {mode === "static" && props.session?.state === "ready" && !staticSessionReady && (
+          <div className="sci-viewport-empty">
+            <span>STATIC SESSION SOURCE REFUSED</span>
+            <p>The session did not resolve to the exact same-origin PNG source recorded at admission.</p>
+          </div>
+        )}
+        {mode === "static" && !props.session && !image && (
           <div className="sci-viewport-empty">
             <span>STATIC FALLBACK UNAVAILABLE</span>
-            <p>The selected artifact is not an image. Switch to the structured table or start an authorized renderer.</p>
+            <p>
+              {declaredImage
+                ? "This image media type is attachment-only and is not admitted for inline preview."
+                : "The selected artifact is not an image."}{" "}
+              Switch to the structured table or start an authorized renderer.
+            </p>
           </div>
         )}
         {mode === "table" && (props.artifact || props.run) && (
-          <div className="sci-fallback-table-wrap">
+          <div
+            className="sci-fallback-table-wrap"
+            tabIndex={0}
+            aria-label="Scrollable structured artifact and run summary"
+          >
             <table className="sci-fallback-table">
               <caption>Structured non-WebGL artifact and run summary</caption>
               <tbody>
@@ -376,12 +451,25 @@ export function ScienceViewport(props: {
         )}
       </div>
 
-      <footer className="sci-legend" aria-label="Scientific visualization legend">
-        <span className="sci-legend-scope">ARTIFACT METADATA <b>NOT PIXEL-DERIVED</b></span>
-        <span>FIELD <b>{legend.field}</b></span>
-        <span>UNITS <b>{legend.units}</b></span>
-        <span>RANGE <b>{legend.range}</b></span>
-        <span>MISSING <b>{legend.missing}</b></span>
+      <footer className="sci-legend" role="region" aria-label="Scientific visualization legend">
+        <span className="sci-legend-scope">
+          {props.session ? "EXACT SESSION SOURCE" : "ARTIFACT METADATA"} <b>NOT PIXEL-DERIVED</b>
+        </span>
+        {props.session ? (
+          <>
+            <span>SOURCE <b>{props.session.source.logicalName}</b></span>
+            <span>MEDIA <b>{props.session.source.mediaType}</b></span>
+            <span>SIZE <b>{fmtBytes(props.session.source.sizeBytes)}</b></span>
+            <span>SHA <b>{shortHash(props.session.source.sha256)}</b></span>
+          </>
+        ) : (
+          <>
+            <span>FIELD <b>{legend.field}</b></span>
+            <span>UNITS <b>{legend.units}</b></span>
+            <span>RANGE <b>{legend.range}</b></span>
+            <span>MISSING <b>{legend.missing}</b></span>
+          </>
+        )}
         {paletteApplies ? (
           <>
             <span>CLIENT WIREFRAME MAP <b>{palette.toUpperCase()}</b></span>
@@ -391,7 +479,7 @@ export function ScienceViewport(props: {
           <span>DISPLAY MAP <b>NOT CLAIMED FOR {mode.toUpperCase()}</b></span>
         )}
       </footer>
-      {remoteRejected && (
+      {renderUrlRejected && (
         <p className="sci-error" role="alert">
           Renderer URL rejected: Science render sessions must stay on the Puppetmaster origin.
         </p>
@@ -402,18 +490,34 @@ export function ScienceViewport(props: {
 
       {!props.session && props.canBuild && props.run && (
         <div className="sci-render-ceremony">
+          <label className="sci-render-source-select">
+            <span>EXACT READY PNG OUTPUT</span>
+            <select
+              aria-label="Exact ready PNG render output"
+              value={props.selectedRenderOutputId ?? ""}
+              disabled={!hasRenderableOutput || props.busy}
+              onChange={(event) => props.onRenderOutputChange(event.target.value)}
+            >
+              {props.eligibleRenderOutputs.map((output) => (
+                <option key={output.artifactVersionId} value={output.artifactVersionId}>
+                  {output.logicalName ?? output.semanticRole} · {fmtBytes(output.sizeBytes)} · SHA {shortHash(output.sha256)}
+                </option>
+              ))}
+              {!hasRenderableOutput && <option value="">NO ELIGIBLE PNG OUTPUT</option>}
+            </select>
+          </label>
           <HoldButton
             tiny
-            disabled={!props.newWorkEnabled || props.busy || !version}
+            disabled={!props.newWorkEnabled || props.busy || !hasRenderableOutput}
             onComplete={props.onStartSession}
             title="Hold to start a short-lived isolated render session"
           >
             HOLD TO START RENDER
           </HoldButton>
           <span>
-            Client geometry is fetched only on request, parsed in a disposable worker, and bounded to
-            {" "}{fmtBytes(SCIENCE_GEOMETRY_PREVIEW_MAX_BYTES)}. Rich or large geometry uses a short-lived,
-            same-origin sandboxed renderer.
+            {hasRenderableOutput
+              ? "The static session is bound to the selected immutable PNG version and checksum."
+              : "No ready PNG output within the inline size cap is linked to this run; rendering is refused."}
           </span>
         </div>
       )}

@@ -103,7 +103,7 @@ export function RunDossier(props: {
               <Chip tiny onClick={props.onRefresh} disabled={props.runsLoading}>↻ REFRESH</Chip>
             </div>
             {props.runsError && <p className="sci-error" role="alert">{props.runsError}</p>}
-            <div className="sci-run-list" aria-label="Scientific runs">
+            <div className="sci-run-list" role="group" aria-label="Scientific runs">
               {props.runs.map((item) => (
                 <button
                   key={item.id}
@@ -171,7 +171,7 @@ export function RunDossier(props: {
 
               <section className="sci-event-log" aria-label="Recent bounded run events">
                 <h4>RECENT EVENTS</h4>
-                <ol>
+                <ol tabIndex={0} aria-label="Scrollable recent run events">
                   {(run.recentEvents ?? []).slice(-40).reverse().map((event) => (
                     <li key={event.sequence}>
                       <time dateTime={event.createdAt}>{fmtClock(event.createdAt)}</time>

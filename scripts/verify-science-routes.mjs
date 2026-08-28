@@ -9,6 +9,7 @@ import { createRequire } from "node:module";
 import {
   createDb,
   createUser,
+  deferScienceUploadCleanup,
   ensureDefaultWorkspace,
   migrate,
   upsertMembership,
@@ -129,6 +130,9 @@ try {
       maxUploadBytes: 8 * 1024 * 1024,
       maxWorkspaceStorageBytes: 64 * 1024 * 1024,
       uploadTtlSeconds: 600,
+      externalUploadAbsoluteTimeoutMs: 60_000,
+      externalUploadIdleTimeoutMs: 10_000,
+      maxConcurrentExternalUploadStreamsPerWorkspace: 4,
       renderTtlSeconds: 300,
       maxConcurrentRunsPerWorkspace: 2,
       maxConcurrentRenderSessionsPerWorkspace: 8,
@@ -417,7 +421,7 @@ try {
   assert.equal(dossier.state, "succeeded");
   assert.equal(dossier.providerHandle, null);
   assert.equal(dossier.inputs.length, 1);
-  assert.equal(dossier.outputs.length, 2);
+  assert.equal(dossier.outputs.length, 3);
   assert.ok(dossier.recentEvents.length > 0);
   assert.equal(
     JSON.stringify(dossier).includes(artifactRoot.replaceAll("\\", "\\\\")),
@@ -429,7 +433,7 @@ try {
     url: `/api/science/runs/${submitted.run.id}/manifest`,
   })).manifest;
   assert.equal(manifest.complete, true);
-  assert.equal(manifest.outputs.length, 2);
+  assert.equal(manifest.outputs.length, 3);
 
   const reproduced = json(await app.inject({
     method: "POST",
@@ -448,10 +452,12 @@ try {
     if (["succeeded", "failed", "cancelled"].includes(current.state)) break;
     await service.tick(current.id, null);
   }
+  const completedSourceRun = await service.getRun(submitted.run.id);
+  const completedReproductionRun = await service.getRun(reproduced.run.id);
+  assert.equal(completedReproductionRun.state, "succeeded");
   const comparison = json(await app.inject({
-    method: "POST",
-    url: `/api/science/runs/${submitted.run.id}/reproduce`,
-    payload: { candidateRunId: reproduced.run.id },
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/comparison?candidateRunId=${reproduced.run.id}`,
   }));
   assert.equal(comparison.leftRunId, submitted.run.id);
   assert.equal(comparison.rightRunId, reproduced.run.id);
@@ -461,15 +467,234 @@ try {
   assert.equal(comparison.comparison.sameOutputs, false);
   assert.equal(comparison.comparison.numericallyEquivalent, null);
   assert.equal(comparison.comparison.numericalValidation, null);
+  assert.equal((await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${reproduced.run.id}/validations`,
+    payload: {
+      kind: "numerical-equivalence",
+      baselineRunId: submitted.run.id,
+      metric: "synthetic-relative-l2",
+      tolerance: 1e-6,
+      observedValue: 4.2e-7,
+      units: "dimensionless",
+      methodProtocolId: "synthetic-route-protocol/v1",
+      decision: true,
+      limitationsReason: "Synthetic route fixture; not release or domain evidence.",
+      reviewerId: other.id,
+    },
+  })).statusCode, 400, "reviewer identity must not be accepted from the client body");
+  const validation = json(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${reproduced.run.id}/validations`,
+    payload: {
+      kind: "numerical-equivalence",
+      baselineRunId: submitted.run.id,
+      metric: "synthetic-relative-l2",
+      tolerance: 1e-6,
+      observedValue: 4.2e-7,
+      units: "dimensionless",
+      methodProtocolId: "synthetic-route-protocol/v1",
+      decision: true,
+      limitationsReason: "Synthetic route fixture; not release or domain evidence.",
+    },
+  })).validation;
+  assert.equal(validation.reviewerId, owner.id);
+  assert.equal(validation.reviewerRole, "owner");
+  assert.equal(validation.revision, 1);
+  assert.equal(validation.runManifestHash, completedReproductionRun.manifestHash);
+  assert.equal(validation.baselineManifestHash, completedSourceRun.manifestHash);
+  assert.match(validation.recordHash, /^[0-9a-f]{64}$/);
+  const validationList = json(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${reproduced.run.id}/validations?limit=10`,
+  }));
+  assert.deepEqual(validationList.items.map((entry) => entry.id), [validation.id]);
+  assert.deepEqual(
+    Object.keys(validationList.items[0]).sort(),
+    [
+      "baselineManifestHash",
+      "baselineRunId",
+      "createdAt",
+      "decision",
+      "id",
+      "kind",
+      "limitationsReason",
+      "methodProtocolId",
+      "metric",
+      "observedValue",
+      "recordHash",
+      "reviewerId",
+      "reviewerRole",
+      "revision",
+      "runId",
+      "runManifestHash",
+      "tolerance",
+      "units",
+    ].sort(),
+    "validation list responses must be strict bounded summaries",
+  );
+  assert.equal(JSON.stringify(validationList).includes("OutputChecksums"), false);
+  const validationDetail = json(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${reproduced.run.id}/validations/${validation.id}`,
+  })).validation;
+  assert.deepEqual(validationDetail.runOutputChecksums, validation.runOutputChecksums);
+  assert.deepEqual(validationDetail.baselineOutputChecksums, validation.baselineOutputChecksums);
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/validations/${validation.id}`,
+  })).statusCode, 404, "detail identity must be bound to the candidate run path");
+  for (const query of ["limit=101", "limit=0", "offset=-1", "limit=1&unexpected=true"]) {
+    assert.equal((await app.inject({
+      method: "GET",
+      url: `/api/science/runs/${reproduced.run.id}/validations?${query}`,
+    })).statusCode, 400, `validation page must reject ${query}`);
+  }
+  const reviewedComparison = json(await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${submitted.run.id}/comparison?candidateRunId=${reproduced.run.id}`,
+  }));
+  assert.equal(reviewedComparison.comparison.numericallyEquivalent, true);
+  assert.equal(reviewedComparison.comparison.numericalValidation.recordId, validation.id);
+  activeUser = other;
+  assert.equal((await app.inject({
+    method: "GET",
+    url: `/api/science/runs/${reproduced.run.id}/validations`,
+  })).statusCode, 200, "member-tier reads include immutable reviews");
+  assert.equal((await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${reproduced.run.id}/validations`,
+    payload: {
+      kind: "domain-validation",
+      metric: "synthetic-output-count",
+      tolerance: 0,
+      observedValue: 2,
+      units: "count",
+      methodProtocolId: "synthetic-route-protocol/v1",
+      decision: true,
+      limitationsReason: "Synthetic route fixture; not release or domain evidence.",
+    },
+  })).statusCode, 403, "builder-tier sessions cannot author domain review records");
+  activeUser = owner;
+  const legacyComparison = json(await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/reproduce`,
+    payload: { candidateRunId: reproduced.run.id },
+  }));
+  assert.deepEqual(legacyComparison, reviewedComparison);
 
-  const rendered = json(await app.inject({
+  const queueArtifact = json(await app.inject({
+    method: "POST",
+    url: `/api/science/studies/${study.id}/artifacts`,
+    payload: {
+      logicalName: "admin-action-queue-invalid.bin",
+      kind: "dataset",
+      format: "binary",
+    },
+  })).artifact;
+  const invalidQueueBytes = Buffer.from("admin action queue quarantine fixture");
+  const queueUpload = json(await app.inject({
+    method: "POST",
+    url: `/api/science/artifacts/${queueArtifact.id}/uploads`,
+    payload: {
+      expectedSizeBytes: invalidQueueBytes.length,
+      expectedSha256: "0".repeat(64),
+      mediaType: "application/octet-stream",
+    },
+  }));
+  const rejectedQueueUpload = await app.inject({
+    method: "PUT",
+    url: queueUpload.uploadUrl,
+    headers: { "content-type": "application/octet-stream" },
+    payload: invalidQueueBytes,
+  });
+  assert.equal(rejectedQueueUpload.statusCode, 409);
+  const queueRetryAt = new Date(Date.now() + 60_000);
+  assert.equal(await deferScienceUploadCleanup(handle.db, {
+    workspaceId,
+    uploadId: queueUpload.upload.id,
+    retryAt: queueRetryAt,
+  }), true);
+  const actionQueue = json(await app.inject({
+    method: "GET",
+    url: "/api/science/admin/action-queue?offset=0&limit=1",
+  }));
+  assert.equal(actionQueue.items.length, 1);
+  assert.equal(actionQueue.nextOffset, null);
+  assert.equal(actionQueue.items[0].id, queueUpload.upload.id);
+  assert.equal(actionQueue.items[0].kind, "upload_reservation");
+  assert.equal(actionQueue.items[0].state, "quarantined");
+  assert.equal(actionQueue.items[0].reason, "upload_quarantined");
+  assert.equal(typeof actionQueue.items[0].nextRetryAt, "string");
+  assert.equal(Date.parse(actionQueue.items[0].nextRetryAt), queueRetryAt.getTime());
+  assert.equal(actionQueue.items[0].attempts, 1);
+  assert.deepEqual(
+    Object.keys(actionQueue.items[0]).sort(),
+    ["ageSeconds", "attempts", "id", "kind", "links", "nextRetryAt", "reason", "state"],
+  );
+  assert.deepEqual(
+    actionQueue.items[0].links.map((link) => link.rel),
+    ["study", "artifact_versions"],
+  );
+  const serializedActionQueue = JSON.stringify(actionQueue);
+  for (const forbidden of [
+    queueUpload.uploadToken,
+    artifactRoot,
+    "storageKey",
+    "quarantineKey",
+    "tokenHash",
+    "providerHandle",
+    "audience",
+  ]) {
+    assert.equal(serializedActionQueue.includes(forbidden), false);
+  }
+  for (const query of ["limit=0", "limit=201", "offset=-1", "limit=1&unexpected=true"]) {
+    assert.equal((await app.inject({
+      method: "GET",
+      url: `/api/science/admin/action-queue?${query}`,
+    })).statusCode, 400);
+  }
+
+  const renderOutput = dossier.outputs.find((output) => output.mediaType === "image/png");
+  assert.ok(renderOutput);
+  const renderPayload = {
+    artifactVersionId: renderOutput.artifactVersionId,
+    mode: "static",
+    idempotencyKey: "route-static-render-replay",
+  };
+  const renderResponse = await app.inject({
     method: "POST",
     url: `/api/science/runs/${submitted.run.id}/render-sessions`,
-    payload: { artifactVersionId: dossier.outputs[1].artifactVersionId },
-  }));
+    payload: renderPayload,
+  });
+  assert.equal(renderResponse.statusCode, 201);
+  const rendered = json(renderResponse);
   assert.match(rendered.renderUrl, new RegExp(`^/api/science/render-sessions/${rendered.session.id}/gateway$`));
+  assert.equal(rendered.mode, "static");
+  assert.equal(rendered.provider, "static");
+  assert.equal(rendered.source.artifactVersionId, renderOutput.artifactVersionId);
+  assert.equal(rendered.source.sha256, renderOutput.sha256);
+  assert.equal(rendered.source.mediaType, "image/png");
+  assert.deepEqual(rendered.session.source, rendered.source);
   assert.equal("providerHandle" in rendered.session, false);
   assert.equal("audience" in rendered.session, false);
+  assert.equal("requestKeyHash" in rendered.session, false);
+  assert.equal("intentFingerprint" in rendered.session, false);
+  assert.equal("launchLeaseId" in rendered.session, false);
+  const replayResponse = await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/render-sessions`,
+    payload: renderPayload,
+  });
+  assert.equal(replayResponse.statusCode, 200);
+  assert.equal(json(replayResponse).session.id, rendered.session.id);
+  for (const mode of ["client", "remote"]) {
+    assert.equal((await app.inject({
+      method: "POST",
+      url: `/api/science/runs/${submitted.run.id}/render-sessions`,
+      payload: { ...renderPayload, mode, idempotencyKey: `route-${mode}-refused` },
+    })).statusCode, 409);
+  }
 
   activeUser = other;
   const foreignGateway = await app.inject({
@@ -538,6 +763,22 @@ try {
   })).admission;
   assert.equal(disabledAdmission.admitted, false);
   assert.equal("updatedBy" in disabledAdmission, false);
+  const rollbackReplay = await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/render-sessions`,
+    payload: renderPayload,
+  });
+  assert.equal(rollbackReplay.statusCode, 200);
+  assert.equal(json(rollbackReplay).session.id, rendered.session.id);
+  activeUser = other;
+  const foreignRollbackReplay = await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/render-sessions`,
+    payload: renderPayload,
+  });
+  assert.equal(foreignRollbackReplay.statusCode, 503);
+  assert.equal(foreignRollbackReplay.body.includes(rendered.session.id), false);
+  activeUser = owner;
   assert.equal(json(await app.inject({
     method: "GET",
     url: `/api/science/studies/${study.id}`,
@@ -555,7 +796,7 @@ try {
   assert.equal((await app.inject({
     method: "POST",
     url: `/api/science/runs/${submitted.run.id}/render-sessions`,
-    payload: { artifactVersionId: dossier.outputs[1].artifactVersionId },
+    payload: { ...renderPayload, idempotencyKey: "blocked-render-after-revoke" },
   })).statusCode, 503);
   assert.equal((await app.inject({
     method: "PATCH",
@@ -603,10 +844,26 @@ try {
     },
   }));
   assert.equal(cancelled.run.state, "cancelled");
+  assert.ok(audits.some((entry) =>
+    entry.action === "science.run.cancel" &&
+    entry.target === blockedApprovalCandidate.run.id &&
+    entry.detail?.reason === "cleanup after rejected post-revoke approval"));
   assert.equal(json(await app.inject({
     method: "DELETE",
     url: `/api/science/render-sessions/${rendered.session.id}`,
   })).session.state, "revoked");
+  assert.equal(json(await app.inject({
+    method: "DELETE",
+    url: `/api/science/render-sessions/${rendered.session.id}`,
+  })).session.state, "revoked", "lost close response must be replayable by session ID");
+  const closedReplay = await app.inject({
+    method: "POST",
+    url: `/api/science/runs/${submitted.run.id}/render-sessions`,
+    payload: renderPayload,
+  });
+  assert.equal(closedReplay.statusCode, 200);
+  assert.equal(json(closedReplay).session.id, rendered.session.id);
+  assert.equal(json(closedReplay).session.state, "revoked");
   assert.equal(json(await app.inject({
     method: "GET",
     url: `/api/science/runs/${submitted.run.id}/manifest`,

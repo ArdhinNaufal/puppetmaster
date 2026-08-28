@@ -19,6 +19,7 @@ export const VERIFY_CHECK_NAMES = [
 export type StepStatus =
   | "pending"
   | "running"
+  | "waiting"
   | "succeeded"
   | "failed"
   | "skipped"
@@ -419,6 +420,36 @@ export interface ScienceWorkspaceAdmission {
   updatedAt: string | null;
 }
 
+export type ScienceAdminActionKind =
+  | "run"
+  | "upload_reservation"
+  | "artifact_version"
+  | "render_session";
+
+export type ScienceAdminActionReason =
+  | "compute_reconciliation_required"
+  | "upload_quarantined"
+  | "upload_cleanup_retry_pending"
+  | "artifact_version_quarantined"
+  | "artifact_version_cleanup_retry_pending"
+  | "render_session_cleanup_pending";
+
+export interface ScienceAdminActionLink {
+  rel: "study" | "run" | "artifact_versions" | "artifact_version";
+  href: string;
+}
+
+export interface ScienceAdminActionQueueItem {
+  id: string;
+  kind: ScienceAdminActionKind;
+  state: string;
+  ageSeconds: number;
+  attempts: number;
+  nextRetryAt: string | null;
+  reason: ScienceAdminActionReason;
+  links: ScienceAdminActionLink[];
+}
+
 export type ScienceRunState =
   | "draft"
   | "awaiting_approval"
@@ -530,6 +561,8 @@ export interface ScienceRunArtifactRef {
   semanticRole: string;
   sha256?: string | null;
   sizeBytes?: number | null;
+  mediaType?: string | null;
+  format?: string | null;
   createdAt?: string;
 }
 
@@ -615,6 +648,20 @@ export interface ScienceManifest {
   limitations: string[];
 }
 
+/**
+ * Immutable stored manifest plus the server's current trust assessment.
+ * `complete` and `gaps` can be stricter than the historical values embedded in
+ * `manifest`; callers must use these top-level fields for release/re-run UX.
+ */
+export interface ScienceManifestResult {
+  runId: string;
+  state: ScienceRunState;
+  manifest: ScienceManifest;
+  manifestHash: string | null;
+  complete: boolean;
+  gaps: string[];
+}
+
 export interface ScienceRunComparison {
   leftRunId: string;
   rightRunId: string;
@@ -632,8 +679,60 @@ export interface ScienceRunComparison {
       tolerance: number | string | Record<string, number | string> | null;
       observed: number | string | null;
       units: string | null;
+      methodProtocolId: string;
+      limitationsReason: string;
+      recordId: string;
+      revision: number;
+      reviewerId: string;
+      createdAt: string;
+      recordHash: string;
     } | null;
   };
+}
+
+export interface ScienceDomainValidationSummary {
+  id: string;
+  runId: string;
+  revision: number;
+  baselineRunId: string | null;
+  kind: "domain-validation" | "numerical-equivalence";
+  metric: string;
+  tolerance: number;
+  observedValue: number;
+  units: string;
+  methodProtocolId: string;
+  decision: boolean;
+  limitationsReason: string;
+  reviewerId: string;
+  reviewerRole: "admin" | "owner";
+  runManifestHash: string;
+  baselineManifestHash: string | null;
+  createdAt: string;
+  recordHash: string;
+}
+
+export interface ScienceValidationOutputChecksum {
+  artifactVersionId: string;
+  semanticRole: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface ScienceDomainValidationDetail extends ScienceDomainValidationSummary {
+  runOutputChecksums: ScienceValidationOutputChecksum[];
+  baselineOutputChecksums: ScienceValidationOutputChecksum[] | null;
+}
+
+export interface ScienceDomainValidationInput {
+  kind: ScienceDomainValidationSummary["kind"];
+  baselineRunId?: string | null;
+  metric: string;
+  tolerance: number;
+  observedValue: number;
+  units: string;
+  methodProtocolId: string;
+  decision: boolean;
+  limitationsReason: string;
 }
 
 export interface ScienceRenderSession {
@@ -642,6 +741,15 @@ export interface ScienceRenderSession {
   runId: string | null;
   artifactVersionId: string | null;
   state: "starting" | "ready" | "expired" | "failed" | "revoked" | string;
+  mode: "client" | "remote" | "static";
+  provider: string;
+  source: {
+    artifactVersionId: string | null;
+    sha256: string;
+    mediaType: string;
+    sizeBytes: number;
+    logicalName: string;
+  };
   /** Authorized same-origin projection; never persisted in the session row. */
   url: string | null;
   expiresAt: string;
@@ -705,15 +813,31 @@ async function scienceEntity<T>(res: Response, key: string): Promise<T> {
   return body as T;
 }
 
-async function scienceManifest(res: Response): Promise<ScienceManifest> {
+async function scienceManifest(res: Response): Promise<ScienceManifestResult> {
   const body = await json<
-    ScienceManifest | { manifest: ScienceManifest | null; manifestHash?: string | null }
+    ScienceManifest | {
+      runId: string;
+      state: ScienceRunState;
+      manifest: ScienceManifest | null;
+      manifestHash: string | null;
+      complete: boolean;
+      gaps: string[];
+    }
   >(res);
   if ("manifest" in body) {
-    if (body.manifest) return body.manifest;
+    if (body.manifest) return { ...body, manifest: body.manifest };
     throw new ApiError(404, "No provenance manifest is available for this run.", body);
   }
-  return body;
+  // Compatibility with an older server shape. Current servers always return
+  // the envelope above, which can reassess pre-hardening immutable manifests.
+  return {
+    runId: body.runId,
+    state: "succeeded",
+    manifest: body,
+    manifestHash: null,
+    complete: body.complete,
+    gaps: body.gaps,
+  };
 }
 
 async function scienceRenderSession(res: Response): Promise<ScienceRenderSession> {
@@ -747,6 +871,15 @@ export const scienceApi = {
     })
       .then(json<{ admission: ScienceWorkspaceAdmission }>)
       .then(({ admission }) => admission),
+  adminActionQueue: (
+    input: { offset?: number; cursor?: string | null; limit?: number } = {},
+  ) => {
+    const cursor = input.cursor ??
+      (input.offset === undefined ? null : String(input.offset));
+    return fetch(
+      `/api/science/admin/action-queue${scienceQuery({ cursor, limit: input.limit })}`,
+    ).then(sciencePage<ScienceAdminActionQueueItem>);
+  },
   studies: (input: { cursor?: string | null; limit?: number } = {}) =>
     fetch(`/api/science/studies${scienceQuery(input)}`).then(sciencePage<ScienceStudy>),
   createStudy: (input: { name: string; classification?: string; workshopProjectId?: string }) =>
@@ -865,14 +998,35 @@ export const scienceApi = {
       (res) => scienceEntity<ScienceRun>(res, "run"),
     ),
   compareRuns: (runId: string, candidateRunId: string) =>
-    post(`/api/science/runs/${encodeURIComponent(runId)}/reproduce`, {
-      candidateRunId,
-    }).then(json<ScienceRunComparison>),
-  createRenderSession: (runId: string, input: { artifactVersionId?: string } = {}) =>
-    post(`/api/science/runs/${encodeURIComponent(runId)}/render-sessions`, {
-      ...input,
-      audience: globalThis.location?.origin ?? "puppetmaster-web",
-    }).then(scienceRenderSession),
+    fetch(
+      `/api/science/runs/${encodeURIComponent(runId)}/comparison` +
+      `?candidateRunId=${encodeURIComponent(candidateRunId)}`,
+    ).then(json<ScienceRunComparison>),
+  domainValidations: (
+    runId: string,
+    input: { cursor?: string | null; limit?: number } = {},
+  ) =>
+    fetch(
+      `/api/science/runs/${encodeURIComponent(runId)}/validations${scienceQuery(input)}`,
+    ).then(sciencePage<ScienceDomainValidationSummary>),
+  domainValidation: (runId: string, validationId: string) =>
+    fetch(
+      `/api/science/runs/${encodeURIComponent(runId)}/validations/` +
+      encodeURIComponent(validationId),
+    ).then((res) => scienceEntity<ScienceDomainValidationDetail>(res, "validation")),
+  createDomainValidation: (runId: string, input: ScienceDomainValidationInput) =>
+    post(`/api/science/runs/${encodeURIComponent(runId)}/validations`, input).then(
+      (res) => scienceEntity<ScienceDomainValidationDetail>(res, "validation"),
+    ),
+  createRenderSession: (runId: string, input: {
+    artifactVersionId: string;
+    mode: "static";
+    idempotencyKey: string;
+  }) =>
+    post(
+      `/api/science/runs/${encodeURIComponent(runId)}/render-sessions`,
+      input,
+    ).then(scienceRenderSession),
   renewRenderSession: (sessionId: string) =>
     post(`/api/science/render-sessions/${encodeURIComponent(sessionId)}/renew`, {}).then(
       scienceRenderSession,

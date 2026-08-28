@@ -5,8 +5,18 @@
 These procedures match the current control-plane behavior. A deterministic
 cold PGlite/filesystem recovery verifier passes, but the disaster-recovery and
 production-provider procedures are not demonstrated on target infrastructure;
-execute and retain that drill before admitting writes. The current post-v11
-aggregate/root reruns are also pending.
+execute and retain that drill before admitting writes. Enabled production
+startup fails closed without PostgreSQL, Redis, and S3; writable production
+also requires runtime URL/token/public base and explicit runtime admission.
+Current deterministic local evidence is
+`SCIENCE GOLDEN PASS^3: 18 isolated deterministic suites; 34 evidence classes verified on every pass`.
+Fresh recursive typecheck/build and the installed-browser Science journey
+(4/4) also pass. Dedicated loopback PostgreSQL (migrations 1-16), Redis/AOF
+including a process-restart sentinel, MinIO/S3, and hardened same-origin nginx
+lanes pass. These results do not replace a real rootless/notebook executor,
+executable JEG, trame/OCCT, named domain review, target TLS/load/HA/SLO/CVE/DR,
+or production-provider evidence; the original MVP and production release
+remain **NOT MET**.
 
 Never repair Science by manually changing a run state, generation, manifest
 hash, artifact checksum, or render-session owner in the database. Those fields
@@ -29,6 +39,8 @@ are lifecycle fences and evidence.
    - affected workspace/study/run/version/session IDs;
    - run generation and recent persisted events;
    - provider kind/version and queue mode from `/api/bootstrap`;
+   - the admin-only, redacted `/api/science/admin/action-queue` page for the
+     affected workspace;
    - redacted server/provider logs.
 3. Do not copy provider handles, signed URLs, tokens, storage keys, or raw
    scientific data into tickets or chat.
@@ -126,26 +138,71 @@ global SLO yet, so do not use an invented fixed threshold.
    `cancelling` using persisted generation/handle identity. It must not
    resubmit a persisted provider handle or duplicate already committed
    finalization outputs. Do not delete the queue job or clear the handle. This
-   seven-state deterministic matrix exists in source assertions, but its
-   current post-v11 aggregate/root rerun remains pending; live Redis/provider
-   interruption is still a separate gate.
+   seven-state deterministic matrix is part of the current focused service
+   verifier. Redis/AOF restart has separate loopback evidence; real provider
+   interruption is still an external gate.
 5. If cancellation is required, use the authenticated cancel API with the
    observed generation:
 
    ```json
-   { "generation": 3 }
+   { "generation": 3, "reason": "INC-1234 stop affected execution" }
    ```
 
    The public REST field is `generation`; the service maps it to its internal
-   expected-generation fence. A stale generation returns conflict.
-   `cancelling` is expected until the provider proves the exact execution
-   terminal.
+   expected-generation fence. A stale generation returns conflict. The optional
+   trimmed reason is 1-1000 characters and is retained in the run event,
+   semantic audit context, and wrapped atomic-audit context, including
+   awaiting-approval cancellation. The semantic sink is best-effort; the atomic
+   trigger record commits with the mutation. `cancelling` is expected until the
+   provider proves the exact execution terminal.
 6. If provider calls remain unreachable, keep the run `cancelling`, isolate the
    provider, and use the orphan procedure. Do not force `cancelled`.
 
 Escalate when a healthy provider reports a different generation, output
 receipts change across identical status calls, or a terminal run still has a
 live provider execution.
+
+## Workflow mission remains `waiting`
+
+The built-in Science workflow suspends durably on one exact Science run. A
+`waiting` mission is therefore normal while that run is non-terminal; it is not
+a request to add a timer or manually advance the workflow.
+
+1. Read the parent mission and target run. A failed/cancelled run must make the
+   workflow fail, and a succeeded run without a complete manifest must also
+   fail closed.
+2. Inspect only bounded wait metadata:
+
+   ```sql
+   SELECT mission_id, node_id, target_run_id, state, generation,
+          claim_expires_at, updated_at
+   FROM workflow_waits
+   WHERE mission_id = '<mission-uuid>';
+   ```
+
+3. Interpret states as follows:
+   - `pending`: the target run is not terminal;
+   - `ready`: the terminal database transaction committed and a worker may
+     claim continuation;
+   - `claimed`: one worker owns a renewable continuation lease;
+   - `consumed`: the continuation was incorporated into terminal parent-mission
+     progress;
+   - `cancelled`: the parent mission was cancelled.
+4. If `claimed` is past `claim_expires_at`, restart one server instance or let
+   periodic recovery reclaim it. Do not clear the claim manually. Recovery
+   reuses the stored step cursor and does not re-run completed downstream nodes.
+5. If the parent mission is cancelled, leave the Science run independent; the
+   workflow cancellation removes only its wait. Cancel the Science run
+   separately, using its exact generation, only when that is the intended
+   operational decision.
+6. Escalate a `ready`/expired-claim row that does not converge after startup and
+   periodic recovery. Retain the mission ID, node ID, target run ID, generation,
+   and timestamps; do not expose claim tokens in ordinary incident records.
+
+Migration 14 proves atomic terminal readiness, claim/heartbeat recovery,
+crash-after-cursor continuation, split-brain fail-stop, terminal failure
+handling, parent-cancel isolation, and keyed wake coalescing in the deterministic
+gate. It does not prove a target queue/failover SLO.
 
 ## Orphan compute handle
 
@@ -181,10 +238,18 @@ through a replacement instance.
 6. Keep any produced bytes quarantined until their run/generation/checksum can
    be proven. Do not attach orphan output to another run.
 
-The current UI has no aggregated admin orphan queue. Use the run dossier and
-restricted audit log to identify known cases, then provider-side discovery to
-find executions that never obtained a database row. A retained cleanup drill
-is required before production admission.
+Use the admin-only, workspace-scoped, paginated
+`GET /api/science/admin/action-queue` to triage known run-reconciliation,
+upload-reservation, artifact-version, and render-cleanup actions. The response
+is deliberately redacted and links back to safe Science resources; it exposes
+no provider handle, storage/quarantine key, raw error, or event payload. The
+admin-only FUI queue renders the same bounded items and navigates their safe
+typed links; its source checks and fresh installed-browser journey pass.
+Offset pagination is not a point-in-time snapshot: actions can resolve or
+appear between page requests, shifting later offsets. Refresh from the first
+page and reconcile by typed item ID before acting. Provider-side discovery is
+still required for an execution that never obtained a database row. A retained
+cleanup drill is required before production admission.
 
 ## Interrupted or corrupt artifact
 
@@ -192,6 +257,29 @@ is required before production admission.
 
 - Do not resume by appending to the quarantine object. Current semantics require
   a new upload intent and a full restart.
+- An accepted external byte stream has two independent limits. The absolute
+  deadline is `SCIENCE_EXTERNAL_UPLOAD_ABSOLUTE_TIMEOUT_MS` (default 3600000 ms,
+  maximum 86400000 ms) and never resets. The idle deadline is
+  `SCIENCE_EXTERNAL_UPLOAD_IDLE_TIMEOUT_MS` (default 60000 ms, maximum 3600000
+  ms), resets only after a body chunk advances, and must not exceed the absolute
+  value. `SCIENCE_MAX_CONCURRENT_EXTERNAL_UPLOAD_STREAMS` defaults to 4 and
+  permits 1-128 live streams per workspace.
+- That concurrency limit is enforced by the database across all server
+  instances. A workspace-row lock serializes count-and-claim, and only external
+  `uploading` rows with an unexpired transfer lease occupy a slot. Do not add a
+  proxy/process counter and treat it as equivalent; proxies may impose a tighter
+  safety limit, but the database remains authoritative.
+- On an absolute or idle timeout, expect Puppetmaster to cancel the request
+  body/iterator and storage write, stop the transfer heartbeat, wait for the
+  storage writer to settle, and then durably quarantine the upload. Only after
+  that settlement does it clear the transfer lease/cap slot and make the
+  partial object immediately eligible for exact cleanup. The cleanup worker
+  discards the quarantine object before deleting its reservation; a discard
+  failure leaves the row visible and workspace-quota charged for retry.
+- Rejected, foreign, expired, already-claimed, and completed-replay upload
+  requests also cancel an unconsumed request body. A size, checksum, or parsed
+  format failure is quarantined but retains its normal evidence TTL; do not
+  assume every quarantined upload is immediately cleanup eligible.
 - Upload transfer first claims and renews an ownership-fenced transfer lease.
   Do not expire/discard an `uploading` row while that lease is live. Provider
   output keeps its reservation/lease through pending-version promotion and the
@@ -320,10 +408,12 @@ Cleanup retry is bounded and single-flight inside startup/periodic full
 reconciliation. trame remains no-go because this does not prove
 remote process/memory cleanup or WebSocket behavior.
 
-After an exact provider close succeeds, Puppetmaster deletes the terminal
-render-session row. That closed session no longer blocks an otherwise eligible
-artifact-version purge. If close fails, the row/handle remains discoverable and
-continues to protect the artifact until cleanup is proven.
+After an exact close succeeds, Puppetmaster retains a terminal replay tombstone
+through the bounded replay horizon and clears its provider handle. The
+tombstone does not consume render quota or retain the artifact bytes, so it
+does not block an otherwise eligible exact-checksum purge. If close fails, the
+row/handle remains discoverable and continues to protect the artifact until
+cleanup is proven.
 
 If the stored provider handle is a launch-attempt marker, do not send it to the
 renderer as though it were an actual handle. The marker was persisted before
@@ -420,6 +510,17 @@ backup capacity; the allowed range is 1 byte through 1 TiB.
 - Revoke the affected workspace for a scoped provider incident; enter global
   read-only mode for a broad outage. Neither action force-terminates accepted
   work.
+- Separate the two Redis paths during diagnosis. `puppetmaster:bus` is an
+  approximately 10000-entry advisory event stream: Science state commits to the
+  database first, and its event publish settles on success, Redis failure, or
+  the current 1500 ms timeout. BullMQ is the distinct scheduler queue for
+  deterministic run/generation jobs. An event-stream append is not proof of a
+  BullMQ enqueue, and a BullMQ job is not a replay cursor for UI notifications.
+- Event subscribers start at Redis ID `$` and keep their cursor only in the
+  running process. There is no durable consumer cursor, consumer group, or
+  `Last-Event-ID` replay contract. After a disconnect/restart, refresh the
+  database-backed run dossier/action queue and reconcile persisted state; do
+  not diagnose a missing notification as missing database work.
 - Redis loss does not make the database state disappear. Restore Redis and
   restart the server; startup reconciliation re-enqueues recoverable runs, and
   the same DB-to-queue repair repeats on the periodic full reconciliation
@@ -429,9 +530,11 @@ backup capacity; the allowed range is 1 byte through 1 TiB.
   blocking semantics. If HTTP readiness hangs beyond the five-second cache
   fill rather than returning 503, treat that as a defect and retain a network
   trace.
-- Queue jobs use deterministic run/generation IDs, and the focused scheduler
-  verifier proves deterministic IDs plus transient retry for the inline path.
-  This is not live Redis durability evidence.
+- Queue jobs use deterministic run/generation IDs. The focused scheduler
+  verifier proves deterministic IDs and transient retry; a dedicated loopback
+  Redis/BullMQ lane proves queue behavior, and a sentinel survived `WAITAOF`
+  plus an exact Redis process restart. Target replication/failover/latency is
+  still unproved.
 - Do not replay submit with a new idempotency key. The persisted run and its
   original provider identity are authoritative.
 - A provider health failure while submissions are enabled makes Science health
@@ -440,19 +543,67 @@ backup capacity; the allowed range is 1 byte through 1 TiB.
   Reconcile receipts, generation, checksums, and run events; otherwise fail the
   incident honestly and retain the orphan data.
 
+## Manifest reports incomplete provenance
+
+A provider can complete successfully while the manifest remains
+provenance-incomplete. Do not edit the manifest or promote a user-entered
+revision string to close the gap.
+
+1. Inspect the manifest's input links and `codeArtifactVersionId`. Completeness
+   requires that ID to identify an immutable `ready` input in the same run and
+   study, with artifact kind `notebook`, normalized format `ipynb`, a successful
+   notebook parse, and semantic role `code`, `notebook`, or `solver`.
+2. Treat `parameters.sourceRevision` as informational user input only. The
+   current release has no VCS/repository resolver, so top-level
+   `sourceRevision` must remain `null` even when the parameter resembles a Git
+   commit. Without the qualifying notebook, expect
+   `manifest.codeArtifactVersionId`; if a raw revision was supplied, also
+   expect `manifest.sourceRevision.unverified`.
+3. Preserve the completed run as evidence. Upload the correct notebook bytes as
+   a new immutable version and submit a new run with the qualifying semantic
+   role. Never relink or rewrite the historical run to manufacture
+   completeness.
+4. Domain validity remains a separate review. A complete provenance manifest
+   does not prove solver convergence, numerical equivalence, or publication
+   readiness.
+
 ## Unexpected reproduction comparison
 
-Compare two runs only after both manifests exist by posting the candidate run
-ID to `/api/science/runs/:runId/reproduce`. Treat the returned dimensions
-independently: input, parameter, environment, and output identity are exact
-canonical comparisons. They do not establish numerical equivalence.
+Compare two same-workspace runs only after both manifests exist with the
+member-readable
+`GET /api/science/runs/:runId/comparison?candidateRunId=:candidateRunId`.
+The request creates no work and remains available after admission revocation.
+Treat the returned dimensions independently: input, parameter, environment,
+and output identity are exact canonical comparisons. They do not establish
+numerical equivalence.
 
-`numericallyEquivalent=null` and `numericalValidation=null` mean no named
-candidate numerical assessment with a bounded non-empty metric and tolerance
-was recorded. The comparison never borrows numerical evidence from the
-source/left run. Review the returned observed value and units when supplied,
-plus the corresponding domain-review method. Never infer convergence or
-publication readiness from matching hashes alone.
+`numericallyEquivalent=null` and `numericalValidation=null` mean no usable
+explicit baseline-to-candidate numerical record exists. A manifest-embedded
+validation is never treated as later human review. The comparison never
+borrows evidence from the source/left run. It reads only the highest positive
+revision for the exact baseline-to-candidate pair. If that newest record has an
+invalid self-hash, direction, manifest binding, or output-checksum snapshot,
+the result is `null`; an older passing decision is never used as fallback.
+`createdAt` is database-assigned display metadata and never decides precedence.
+
+Inventory candidate reviews with
+`GET /api/science/runs/:candidateRunId/validations`. This page is capped at 100
+records and returns bounded summaries without output-checksum arrays. Inspect
+one exact record, including its checksum bindings, with
+`GET /api/science/runs/:candidateRunId/validations/:validationId`. Both paths
+recheck workspace, run, and record identity. Records are append-only; database
+update and delete are deliberately rejected. An admin/owner may POST a
+correction as the next candidate-run revision, but must not rewrite the old
+decision. Reviewer identity and role come from the authenticated session, so
+reject any client or integration that tries to send reviewer or timestamp
+fields. The Science FUI now provides the deliberate admin/owner append form and
+member-readable immutable history; the API remains available for controlled
+integrations.
+
+Review the named metric, tolerance, observed value, units, method/protocol ID,
+decision, limitations, reviewer, and record hash. Never infer convergence or
+publication readiness from matching hashes alone. Synthetic verifier records
+are explicitly non-release evidence.
 
 ## Signing-secret rotation
 
@@ -478,6 +629,10 @@ pending**. No production RPO/RTO is accepted yet.
 Back up as one named recovery point:
 
 - PostgreSQL database or persistent PGlite directory;
+- migration-12 `science_domain_validations` rows, migration-13
+  `science_domain_validation_heads`, and both tables' atomic audit rows;
+- migration-14 `workflow_waits` rows and migration-15 render replay/source
+  fields and tombstones;
 - filesystem artifact root, or S3 bucket with object versions/checksum metadata;
 - local S3 quarantine root if in-flight upload recovery is required;
 - Redis is not the source of truth, but its loss affects queue latency. The
@@ -507,18 +662,16 @@ Do not put plaintext secrets into the backup manifest.
    disabled.
 2. Restore database, immutable artifact objects, provider state, configuration,
    and the correct secret versions.
-3. Build/run the same application version and confirm `schema_migrations`.
-   The current expected Science-capable ledger runs through version 11
-   (`science-workspace-pilot-admission`), including version 5
-   (`science-domain-atomic-audit`), version 6
-   (`science-quarantine-retention`), version 7
-   (`science-upload-finalization-fence`), version 8
-   (`science-cleanup-retry-backoff`), version 9
-   (`science-upload-transfer-fence`), and version 10
-   (`science-actor-attributed-atomic-audit`). Version 11 adds the unique
-   default-deny workspace-admission row and its atomic audit trigger.
+3. Build/run the same application version and confirm `schema_migrations`
+   contains the complete ordered ledger 1-16. Versions 11-13 add default-deny
+   workspace admission, append-only reviews, and monotonic review heads;
+   version 14 adds durable workflow waits; version 15 adds exact render
+   request/source replay state; and version 16 adds external-upload transfer
+   expiry/classification plus the indexed cross-instance stream fence. The
+   atomic-audit inventory remains 12
+   Science-domain tables because `workflow_waits` is workflow infrastructure.
    Each unapplied migration's DDL and ledger entry commit in one transaction;
-   a failed statement must leave neither the earlier DDL nor its ledger row.
+   a failed statement must leave neither partial DDL nor its ledger row.
    PostgreSQL also uses a transaction-scoped advisory lock, while PGlite
    serializes migrators only within the process.
 4. Verify object existence, sizes, and SHA-256 against artifact-version rows.
@@ -535,5 +688,7 @@ Do not put plaintext secrets into the backup manifest.
     mode. Do not bulk-admit restored workspaces.
 
 Retain timestamps, commands, versions, counts, hash results, and reviewer
-approval. Until this procedure is demonstrated on the target deployment, WP7
-and the MVP definition of done remain pending.
+approval. The loopback PostgreSQL, Redis/AOF, and MinIO lanes are useful
+component evidence, but they are not this coordinated target restore. Until
+this procedure is demonstrated on the target deployment, WP7 and the original
+MVP definition of done remain pending.

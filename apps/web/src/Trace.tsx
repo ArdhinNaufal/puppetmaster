@@ -17,13 +17,14 @@ export interface StepTiming {
 const STATUS_LABEL: Record<StepStatus, string> = {
   pending: "PENDING",
   running: "RUNNING",
+  waiting: "WAIT",
   succeeded: "OK",
   failed: "FAIL",
   skipped: "SKIP",
   awaiting_approval: "GATE",
 };
 
-const LIVE = new Set(["queued", "running", "awaiting_approval"]);
+const LIVE = new Set(["queued", "running", "waiting", "awaiting_approval"]);
 
 function fmtMs(ms: number): string {
   if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;

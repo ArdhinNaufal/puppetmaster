@@ -15,6 +15,8 @@ const SCIENCE_DOMAIN_TABLES = [
   "science_artifact_versions",
   "science_artifacts",
   "science_compute_profiles",
+  "science_domain_validation_heads",
+  "science_domain_validations",
   "science_render_sessions",
   "science_run_artifacts",
   "science_run_events",
@@ -52,6 +54,12 @@ async function verifyMigrationAndMutationAtomicity() {
   );
   const workspaceAdmissionMigration = originalMigrations.find(
     (migration) => migration.version === 11,
+  );
+  const domainValidationMigration = originalMigrations.find(
+    (migration) => migration.version === 12,
+  );
+  const domainValidationHeadMigration = originalMigrations.find(
+    (migration) => migration.version === 13,
   );
   assert.ok(auditMigration, "atomic Science audit migration must be version 5");
   assert.ok(
@@ -98,6 +106,47 @@ async function verifyMigrationAndMutationAtomicity() {
       statement.includes("CREATE OR REPLACE FUNCTION science_audit_domain_mutation()")
     ),
     "version 11 must install default-deny workspace admission with its atomic audit trigger",
+  );
+  assert.ok(
+    domainValidationMigration?.statements.some((statement) =>
+      statement.includes("CREATE TABLE IF NOT EXISTS science_domain_validations")
+        && statement.includes("UNIQUE (run_id, revision)")
+        && statement.includes("CHECK (revision > 0)")
+    ) && domainValidationMigration.statements.some((statement) =>
+      statement.includes("science domain validation records are append-only")
+        && statement.includes("expected_revision")
+        && statement.includes("FOR UPDATE OF run")
+        && statement.includes("NEW.created_at := transaction_timestamp()")
+    ) && domainValidationMigration.statements.some((statement) =>
+      statement.includes("BEFORE INSERT OR UPDATE OR DELETE ON science_domain_validations")
+    ) && domainValidationMigration.statements.some((statement) =>
+      statement.includes("baseline_run_id, kind, revision DESC")
+    ) && domainValidationMigration.statements.some((statement) =>
+      statement.includes("CREATE OR REPLACE FUNCTION science_audit_domain_mutation()")
+    ),
+    "version 12 must install serialized per-run revisions, guarded append-only records, and atomic audit",
+  );
+  assert.ok(
+    domainValidationHeadMigration?.statements.some((statement) =>
+      statement.includes("science migration 13 schema drift")
+        && statement.includes("science_domain_validations_run_revision_unique")
+        && statement.includes("science_domain_validations_revision_check")
+    ) && domainValidationHeadMigration.statements.some((statement) =>
+      statement.includes("CREATE TABLE science_domain_validation_heads")
+        && statement.includes("UNIQUE (workspace_id, run_id, kind, scope_baseline_run_id)")
+        && statement.includes("validation_id uuid NOT NULL UNIQUE")
+    ) && domainValidationHeadMigration.statements.some((statement) =>
+      statement.includes("science domain validation heads advance monotonically")
+        && statement.includes("latest exact-scope revision")
+        && statement.includes("science-domain-validation-head-v1")
+    ) && domainValidationHeadMigration.statements.some((statement) =>
+      statement.includes("BEFORE INSERT OR UPDATE OR DELETE ON science_domain_validation_heads")
+    ) && domainValidationHeadMigration.statements.some((statement) =>
+      statement.includes("SELECT DISTINCT ON")
+        && statement.includes("revision DESC")
+        && statement.includes("sha256")
+    ),
+    "version 13 must reject v12 drift and install exact-scope monotonic hash-anchored audited heads",
   );
 
 
@@ -203,6 +252,24 @@ async function verifyMigrationAndMutationAtomicity() {
       )),
       1,
       "workspace admission and its audit trigger must be installed exactly once",
+    );
+    assert.equal(
+      Number(await scalar(
+        handle.db,
+        sql.raw("SELECT count(*) AS copies FROM schema_migrations WHERE version = 12"),
+        "copies",
+      )),
+      1,
+      "append-only domain validation and its audit trigger must be installed exactly once",
+    );
+    assert.equal(
+      Number(await scalar(
+        handle.db,
+        sql.raw("SELECT count(*) AS copies FROM schema_migrations WHERE version = 13"),
+        "copies",
+      )),
+      1,
+      "validation scope heads and their audit trigger must be installed exactly once",
     );
 
     const triggerResult = await handle.db.execute(sql.raw(
@@ -736,5 +803,5 @@ async function verifyMigrationAndMutationAtomicity() {
 
 await verifyMigrationAndMutationAtomicity();
 console.log(
-  "SCIENCE ATOMIC AUDIT PASS: migration rollback/serialization, 10 table triggers, actor-attributed workspace admission and commit/rollback/context reset, bounded event/run/upload-lease/cleanup auditing, and committed semantic insert/update/cascade-delete audits",
+  "SCIENCE ATOMIC AUDIT PASS: migration rollback/serialization, 12 table triggers including append-only validation plus monotonic scope heads, actor-attributed workspace admission and commit/rollback/context reset, bounded event/run/upload-lease/cleanup auditing, and committed semantic insert/update/cascade-delete audits",
 );

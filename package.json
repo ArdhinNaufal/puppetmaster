@@ -32,9 +32,19 @@
     "verify:science": "pnpm run verify:dist && pnpm run verify:science:safe",
     "verify:science:safe": "node scripts/verify-science-golden.mjs",
     "verify:science:golden": "node scripts/verify-science-golden.mjs",
+    "verify:science:deployment": "pnpm --filter @puppetmaster/kernel build && node scripts/verify-science-deployment.mjs",
     "verify:science:recovery": "node scripts/verify-science-recovery.mjs",
     "verify:science:scheduler": "node scripts/verify-science-scheduler.mjs",
+    "verify:science:workflow": "pnpm --filter @puppetmaster/shared build && pnpm --filter @puppetmaster/kernel build && pnpm --filter @puppetmaster/server build && node scripts/verify-science-workflow.mjs",
+    "verify:science:workflow-resume": "node scripts/verify-workflow-deferred-resume.mjs",
+    "verify:science:workflow-isolation": "node scripts/verify-workflow-workspace-isolation.mjs",
+    "verify:science:redis-live": "pnpm --filter @puppetmaster/kernel build && node scripts/verify-science-redis-live.mjs",
+    "verify:science:jupyter-gateway": "pnpm --filter @puppetmaster/kernel build && node scripts/verify-science-jupyter-gateway.mjs",
+    "verify:science:oci-executor": "node scripts/run-science-oci-executor-verifier.mjs",
     "verify:science:audit": "node scripts/verify-science-audit-atomicity.mjs",
+    "verify:science:browser": "pnpm run verify:dist && playwright test --config=playwright.science.config.ts",
+    "verify:science:browser:headed": "pnpm run verify:dist && playwright test --config=playwright.science.config.ts --headed",
+    "verify:science:browser:list": "playwright test --config=playwright.science.config.ts --list",
     "verify:workbench": "pnpm run verify:dist && node scripts/verify-workbench.mjs",
     "verify:egress": "pnpm run verify:dist && node scripts/verify-egress.mjs",
     "verify:docker": "pnpm run verify:dist && node scripts/verify-workbench.mjs && node scripts/verify-egress.mjs && node scripts/verify-openai-plan-isolation.mjs && node scripts/verify-claude-control-plane.mjs"
@@ -50,6 +60,8 @@
     ]
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.10.2",
+    "@playwright/test": "1.55.0",
     "dependency-cruiser": "^18.0.0"
   }
 }

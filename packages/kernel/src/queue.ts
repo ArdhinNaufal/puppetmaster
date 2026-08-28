@@ -4,14 +4,18 @@ import { startAgentTick, startWorkflow } from "./orchestrator.js";
 
 /** Parse a redis:// URL into BullMQ connection options (its blocking clients
  *  require maxRetriesPerRequest: null). BullMQ owns the resulting connections. */
-function connectionFromUrl(url: string): ConnectionOptions {
+export function workflowQueueConnectionOptions(url: string): ConnectionOptions {
   const u = new URL(url);
+  if (u.protocol !== "redis:" && u.protocol !== "rediss:") {
+    throw new Error("workflow queue URL must use redis:// or rediss://");
+  }
   return {
     host: u.hostname || "127.0.0.1",
     port: u.port ? Number(u.port) : 6379,
     username: u.username || undefined,
     password: u.password || undefined,
     db: u.pathname && u.pathname.length > 1 ? Number(u.pathname.slice(1)) : undefined,
+    tls: u.protocol === "rediss:" ? {} : undefined,
     maxRetriesPerRequest: null,
   };
 }
@@ -28,7 +32,7 @@ export interface WorkflowRunner {
   /** Begin consuming queued work. Queue-backed runners are deliberately
    * constructed paused so startup reconciliation can finish first. */
   start(): Promise<void>;
-  enqueue(missionId: string): Promise<void>;
+  enqueue(missionId: string, dedupeKey?: string): Promise<void>;
   scheduleCron(kind: CronSubjectKind, subjectId: string, cron: string): Promise<void>;
   unscheduleCron(kind: CronSubjectKind, subjectId: string): Promise<void>;
   close(): Promise<void>;
@@ -36,32 +40,68 @@ export interface WorkflowRunner {
 
 export type MissionDispatcher = (missionId: string) => Promise<unknown>;
 
-const QUEUE_NAME = "puppetmaster-workflows";
+const QUEUE_NAME_PREFIX = "puppetmaster-workflows";
+const QUEUE_DEDUPE_KEY = /^[A-Za-z0-9_-]{1,200}$/;
+const QUEUE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function checkedQueueUuid(value: string, label: string): string {
+  if (!QUEUE_UUID.test(value)) throw new Error(`${label} must be a UUID`);
+  return value.toLowerCase();
+}
+
+/** Redis queue namespace owned by one exact workspace. */
+export function workflowQueueName(workspaceId: string): string {
+  return `${QUEUE_NAME_PREFIX}-${checkedQueueUuid(workspaceId, "workspace id")}`;
+}
+
+/** Bounded scheduler identity; also workspace-qualified for diagnostics/export. */
+export function workflowCronSchedulerId(
+  workspaceId: string,
+  kind: CronSubjectKind,
+  subjectId: string,
+): string {
+  const workspace = checkedQueueUuid(workspaceId, "workspace id");
+  const subject = checkedQueueUuid(subjectId, `${kind} id`);
+  return `cron:${workspace}:${kind}:${subject}`;
+}
+
+function checkedDedupeKey(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (!QUEUE_DEDUPE_KEY.test(value)) {
+    throw new Error("workflow queue dedupe key must contain only letters, numbers, underscores, or hyphens");
+  }
+  return value;
+}
 
 export class QueueRunner implements WorkflowRunner {
   private readonly queue: Queue;
   private readonly worker: Worker;
+  private readonly workspaceId: string;
   private started = false;
   private closing = false;
   private runPromise: Promise<void> | null = null;
   private closePromise: Promise<void> | null = null;
 
-  constructor(url: string, deps: { run: MissionDispatcher; db: Db }) {
-    const connection = connectionFromUrl(url);
-    this.queue = new Queue(QUEUE_NAME, { connection });
+  constructor(url: string, deps: { run: MissionDispatcher; db: Db; workspaceId: string }) {
+    const connection = workflowQueueConnectionOptions(url);
+    this.workspaceId = checkedQueueUuid(deps.workspaceId, "workspace id");
+    const queueName = workflowQueueName(this.workspaceId);
+    this.queue = new Queue(queueName, { connection });
     this.worker = new Worker(
-      QUEUE_NAME,
+      queueName,
       async (job: Job) => {
         if (job.name === "cron") {
           const kind = (job.data.kind ?? "workflow") as CronSubjectKind;
           const mission =
             kind === "agent"
               ? await startAgentTick(deps.db, {
+                  workspaceId: this.workspaceId,
                   agentId: job.data.subjectId ?? job.data.workflowId,
                   trigger: { mode: "cron" },
                   payload: {},
                 })
               : await startWorkflow(deps.db, {
+                  workspaceId: this.workspaceId,
                   workflowId: job.data.subjectId ?? job.data.workflowId,
                   trigger: { mode: "cron" },
                   payload: {},
@@ -94,19 +134,34 @@ export class QueueRunner implements WorkflowRunner {
     });
   }
 
-  async enqueue(missionId: string): Promise<void> {
+  async enqueue(missionId: string, dedupeKey?: string): Promise<void> {
     if (this.closing) throw new Error("workflow queue runner is closing");
+    const jobId = checkedDedupeKey(dedupeKey);
+    if (jobId) {
+      const existing = await this.queue.getJob(jobId);
+      if (existing) {
+        const state = await existing.getState();
+        if (state !== "completed" && state !== "failed") return;
+        await existing.remove().catch(() => {});
+      }
+    }
     await this.queue.add(
       "run",
       { missionId },
-      { attempts: 3, backoff: { type: "exponential", delay: 1000 }, removeOnComplete: 500, removeOnFail: 500 },
+      {
+        ...(jobId ? { jobId } : {}),
+        attempts: 3,
+        backoff: { type: "exponential", delay: 1000 },
+        removeOnComplete: 500,
+        removeOnFail: 500,
+      },
     );
   }
 
   async scheduleCron(kind: CronSubjectKind, subjectId: string, cron: string): Promise<void> {
     if (this.closing) throw new Error("workflow queue runner is closing");
     await this.queue.upsertJobScheduler(
-      `cron:${kind}:${subjectId}`,
+      workflowCronSchedulerId(this.workspaceId, kind, subjectId),
       { pattern: cron },
       { name: "cron", data: { kind, subjectId } },
     );
@@ -114,7 +169,9 @@ export class QueueRunner implements WorkflowRunner {
 
   async unscheduleCron(kind: CronSubjectKind, subjectId: string): Promise<void> {
     if (this.closing) throw new Error("workflow queue runner is closing");
-    await this.queue.removeJobScheduler(`cron:${kind}:${subjectId}`);
+    await this.queue.removeJobScheduler(
+      workflowCronSchedulerId(this.workspaceId, kind, subjectId),
+    );
   }
 
   async close(): Promise<void> {
@@ -132,6 +189,7 @@ export class QueueRunner implements WorkflowRunner {
 /** In-process runner for local dev without Redis; cron scheduling is a no-op. */
 export class InlineRunner implements WorkflowRunner {
   private readonly active = new Set<Promise<unknown>>();
+  private readonly activeKeys = new Set<string>();
   private closing = false;
   private closePromise: Promise<void> | null = null;
 
@@ -141,8 +199,11 @@ export class InlineRunner implements WorkflowRunner {
     if (this.closing) throw new Error("inline workflow runner is closing");
   }
 
-  async enqueue(missionId: string): Promise<void> {
+  async enqueue(missionId: string, dedupeKey?: string): Promise<void> {
     if (this.closing) throw new Error("inline workflow runner is closing");
+    const key = checkedDedupeKey(dedupeKey);
+    if (key && this.activeKeys.has(key)) return;
+    if (key) this.activeKeys.add(key);
     // Preserve enqueue's non-blocking handoff semantics while retaining the
     // dispatch promise so close() can drain it before dependencies disappear.
     const dispatch = Promise.resolve().then(() => this.run(missionId));
@@ -153,6 +214,7 @@ export class InlineRunner implements WorkflowRunner {
       })
       .finally(() => {
         this.active.delete(dispatch);
+        if (key) this.activeKeys.delete(key);
       });
   }
 

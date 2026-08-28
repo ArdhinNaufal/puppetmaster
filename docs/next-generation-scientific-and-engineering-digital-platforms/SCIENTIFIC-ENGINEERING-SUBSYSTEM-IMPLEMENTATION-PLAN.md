@@ -213,8 +213,11 @@ become backdoor imports into the web app.
 | `science_runs` | study, required unique mission, profile, provider handle, state, generation, idempotency key, parameters, manifest hash, timestamps, error | State transitions occur only in the repository/service; one idempotency key creates at most one run; stale generations cannot commit. |
 | `science_run_artifacts` | run, artifact version, direction, semantic role | Every input/output relationship is explicit and immutable once the run finalizes. |
 | `science_run_events` | run, monotonic sequence, event type, bounded payload, timestamp | Append-only; unique `(run_id, sequence)`; large logs are stored as artifacts and referenced. |
-| `science_render_sessions` | run/artifact, provider or launch-attempt handle, token hash, state, owner, expiry, heartbeat, cleanup backoff | Short-lived, audience-bound, revocable, and reconciled after restart. `SCIENCE_MAX_CONCURRENT_RENDER_SESSIONS` bounds each workspace (2 default, 64 maximum), including ambiguous/terminal rows that still retain a handle. |
+| `science_render_sessions` | run/artifact, provider or launch-attempt handle, token hash, state, owner, expiry, heartbeat, cleanup backoff, request-key hash, intent fingerprint, provider/mode, exact source snapshot, launch lease, replay expiry, close time | Migration 15 makes static start/close replay-safe and source-bound. Identical owner/workspace/key intent converges; changed intent conflicts. Terminal provider-free tombstones consume no slot and retain no artifact bytes. |
 | `science_workspace_admissions` | unique workspace, admitted decision, updater, timestamp | Persisted by migration 11. Absence is denied; only an admin/owner may change it with a bounded reason. Public/member projection omits row ID and updater. |
+| `science_domain_validations` | candidate run, positive per-run revision, optional baseline run, kind, named metric, tolerance, observed value, units, method/protocol ID, decision, limitations/reason, session-derived reviewer, manifest hashes, output-checksum snapshots, record hash, display timestamp | Persisted by formally unreleased migration 12. Candidate-run locking over canonical UUIDs and unique `(run_id, revision)` serialize corrections; revision is hash-bound and authoritative while database time is display-only. Insert-only and bound to succeeded same-workspace runs. Update/delete are rejected. |
+| `science_domain_validation_heads` | stable head ID, canonical workspace/candidate/kind/baseline scope, exact validation ID, revision, record hash, head-anchor hash, database timestamp | Added by migration 13 only after asserting the exact rewritten-v12 columns and constraints. Deterministic backfill selects the highest revision per scope. Thereafter the actor-audited guard permits only monotonic exact-scope advancement. Numerical comparison follows this exact pointer and verifies head, record selectors, both hashes, manifests, and output checksums; any mismatch returns unknown without scanning older records. |
+| `workflow_waits` | mission, node, exact target run, kind, state, generation, claim token/expiry | Migration 14 durably suspends one workflow node on `science_run_terminal`. Science terminalization marks the wait ready in the same database transaction; claim/heartbeat recovery and ownership checks prevent duplicate continuation. This is workflow infrastructure, not a thirteenth audited Science-domain table. |
 
 Do not create a general provenance graph in v1. The run-input/output join plus immutable manifest
 answers the required lineage questions with real foreign keys. Add a broader graph only when a
@@ -236,7 +239,9 @@ DRAFT -> AWAITING_APPROVAL -> QUEUED -> PROVISIONING -> RUNNING -> FINALIZING
 - Terminal states are `succeeded`, `failed`, and `cancelled`.
 - Rejection moves `awaiting_approval` to `cancelled` with an audit reason.
 - Cancellation is cooperative first, provider termination second, and terminal only after the
-  exact external execution is proven stopped or explicitly marked orphaned for admin action.
+  exact external execution is proven stopped or explicitly marked orphaned for admin action. An
+  optional trimmed reason (1-1000 characters) is retained in run-event, semantic-audit, and
+  wrapped transaction-local atomic-audit context, including awaiting-approval cancellation.
 - Every dispatch claim increments `execution_generation`; completion from an older generation is
   rejected.
 - Startup reconciliation checks non-terminal runs, retention state, and render sessions before
@@ -261,16 +266,26 @@ Canonical JSON, deterministically serialized and SHA-256 hashed, contains:
 
 - study and run IDs;
 - input artifact-version IDs, storage-independent checksums, sizes, and semantic roles;
-- notebook/code artifact and source revision when available;
+- a linked immutable `ready` notebook whose uploaded bytes parsed as `ipynb`
+  under the `code`, `notebook`, or `solver` role; raw
+  `parameters.sourceRevision` is informational and cannot replace it;
 - exact image/kernel digest, provider adapter version, and dependency lock/environment export;
 - normalized parameters, units, random seeds, requested resources, and relevant environment
   variables with secrets redacted;
 - actor, approvals/policy IDs, tool calls, timestamps, and cancellation/retry history;
 - output artifact-version IDs and checksums;
-- validation results and declared limitations.
+- execution-time validation results and declared limitations. Later human/domain reviews are
+  separate append-only records and never rewrite this historical manifest.
 
 The UI must say “manifest complete” or “manifest incomplete”; it must not claim scientific
 reproducibility merely because a job exited successfully.
+
+The stored canonical manifest and its SHA-256 are immutable historical evidence. Manifest reads
+also expose a top-level current structural/relational `complete`/`gaps` assessment. It is computed
+from the immutable bytes plus current run links, artifact metadata, profile snapshot, and output
+receipts; it can fail closed without rewriting the stored manifest/hash. Public FUI, tool, workflow,
+and reproduction decisions must consume this current verdict, not trust a historical nested
+`manifest.complete` flag alone.
 
 ## 6. API, tool, and event contracts
 
@@ -279,6 +294,7 @@ reproducibility merely because a job exited successfully.
 ```text
 GET              /api/science/workspace-admission          # member+; redacted
 PATCH            /api/science/workspace-admission          # admin+; admitted + bounded reason
+GET              /api/science/admin/action-queue           # admin+; paginated/redacted
 GET/POST        /api/science/studies
 GET/PATCH       /api/science/studies/:studyId
 GET/POST        /api/science/studies/:studyId/artifacts
@@ -292,8 +308,12 @@ GET/POST        /api/science/compute-profiles              # POST admin+
 PATCH           /api/science/compute-profiles/:profileId   # admin+
 GET/POST        /api/science/studies/:studyId/runs
 GET             /api/science/runs/:runId
-POST            /api/science/runs/:runId/cancel
+POST            /api/science/runs/:runId/cancel            # exact generation; optional retained reason
 GET             /api/science/runs/:runId/manifest
+GET             /api/science/runs/:runId/validations       # member+; <=100 bounded summaries
+GET             /api/science/runs/:runId/validations/:validationId # member+; one scoped checksum-bound detail
+POST            /api/science/runs/:runId/validations       # admin/owner; reviewer from session
+GET             /api/science/runs/:runId/comparison        # member+; candidateRunId query
 POST            /api/science/runs/:runId/reproduce
 POST            /api/science/runs/:runId/render-sessions
 POST            /api/science/render-sessions/:id/renew
@@ -483,13 +503,16 @@ Deliverables:
   science step kind needed for the trace. This is functional, not cosmetic: approvals, audit,
   mission dossiers, and existing WebSocket filtering depend on it.
 
-Current local slice: the ordered ledger runs through version 11. Version 7 adds the
-upload-finalizer lease fence; version 8 adds persisted cleanup attempts/backoff; version 9 adds the
-renewable upload-transfer fence and durable provider-output reservation through terminal commit;
-version 10 makes initiating actor/action attribution transaction-atomic for wrapped user mutations;
-version 11 adds unique per-workspace, persisted, default-deny pilot admission and its atomic audit
-trigger. Current post-v11 aggregate/root reruns and live PostgreSQL upgrade/fresh-install release
-evidence are still pending.
+Current local slice: the ordered ledger runs through version 16. Versions 1-10 establish the
+domain, lifecycle, atomic audit, cleanup, lease, reservation, and actor-attribution foundations;
+version 11 adds default-deny workspace admission; versions 12-13 add append-only reviews and
+monotonic hash-bound heads; version 14 adds durable workflow waits; version 15 adds exact render
+request/source replay state; and version 16 adds external-upload lease/classification columns and
+the database-authoritative cross-instance external-stream fence. Atomic audit still covers 12
+Science-domain tables because `workflow_waits` is shared workflow infrastructure and versions
+15-16 add no Science-domain table. Fresh PGlite and dedicated loopback PostgreSQL execution pass
+all 16 versions, with PostgreSQL marker `science lifecycle (pg): ok`. Target HA,
+load, backup, and restore remain external.
 
 Exit gate: deterministic lifecycle tests prove every legal transition, reject every illegal/stale
 transition, and exercise the same schema on ephemeral PGlite and PostgreSQL.
@@ -504,6 +527,16 @@ Deliverables:
 - Implement `ArtifactStore` with filesystem and S3-compatible adapters.
 - Stream uploads to quarantine; compute checksum during transfer; atomically promote only after
   declared size/checksum and format checks pass.
+- Bound every external client transfer across the complete artifact-store write with an absolute
+  deadline and a chunk-idle deadline. The shipped defaults are 3,600,000 ms absolute and 60,000 ms
+  idle; allowed ranges are 1-86,400,000 ms and 1-3,600,000 ms respectively, with idle no greater
+  than absolute.
+- Enforce `SCIENCE_MAX_CONCURRENT_EXTERNAL_UPLOAD_STREAMS` per workspace with a
+  database-authoritative cross-instance lease fence (default 4, range 1-128). Internal
+  provider-output ingestion is not charged to this external-client allowance.
+- On deadline, stop lease renewal, cancel the request transport/iterator, wait for the store writer
+  to settle after abort, and retain an immediately cleanup-eligible quarantined reservation. Do not
+  release storage quota until object deletion is proved.
 - Support resumable intent or explicit restart semantics, range download, paginated metadata,
   immutable versions, and cleanup of abandoned uploads.
 - Fence artifact-version quarantine cleanup while a same-artifact, same-checksum upload reservation
@@ -515,10 +548,19 @@ Deliverables:
 - Audit create/upload/finalize/quarantine/expire operations without leaking paths, tokens, or
   credentials.
 
-Current local slice: database triggers provide a bounded atomic mutation record. Migration 10
-adds transaction-local initiating actor/action attribution for wrapped database-only user
-mutations and an explicit system fallback for recovery. The secondary semantic sink remains
-best-effort; its failure neither loses the atomic row nor makes a committed mutation retryable.
+Current local slice: migration 5 installs bounded atomic mutation triggers on the original nine
+Science domain tables; migration 10 adds transaction-local initiating actor/action context and an
+explicit recovery fallback; migration 11 installs the same trigger on default-deny workspace
+admission as the tenth audited table. Migration 12 adds guarded append-only validation as the
+eleventh audited table; migration 13 adds guarded monotonic validation heads as the twelfth.
+Wrapped cancellation carries its optional reason through the
+same context. The trigger record commits or rolls back with the mutation; the secondary semantic
+sink remains best-effort. Migration 16 and deterministic concurrency/deadline tests prove the
+cross-instance external-stream lease fence, whole-store absolute/idle deadlines, body cancellation,
+quarantine convergence, and restart-only semantics. Deterministic filesystem/mock-S3 checks and a
+dedicated unversioned loopback MinIO/S3 lane pass. The validation fixtures are synthetic and are
+not release/domain evidence; target proxy/body behavior, cross-instance load, TLS/IAM/versioning,
+retention, and DR remain external.
 
 Exit gate: interrupted upload never becomes `ready`; checksum mismatch quarantines; duplicate
 completion is idempotent; cross-workspace access returns not-found; range reads and retention
@@ -549,8 +591,11 @@ completion cannot win; cancellation never kills a newer execution.
 Current local source verifier enumerates `draft`, `awaiting_approval`, `queued`,
 `provisioning`, `running`, `finalizing`, and `cancelling`, including persisted-handle resume,
 stale-generation rejection, exact cancellation, and partially committed finalization without
-duplicate outputs. Its current post-v11 aggregate/root rerun is pending; live Redis, provider, and
-process-interruption evidence remains external.
+duplicate outputs. A loopback Redis/BullMQ lane passes, including a sentinel surviving `WAITAOF`
+and an exact Redis process restart. The JEG prerequisite gate passes but is deliberately
+unregistered; submit/channels/output collection are explicitly not proven. The OCI executor passes
+a deterministic candidate gate, but the observed host daemon is not rootless and no real notebook
+corpus ran. Real provider execution/interruption remains external.
 
 ### WP4 — FUI Science Operations shell (L; starts after WP1, parallel with WP2/WP3)
 
@@ -572,6 +617,13 @@ Deliverables:
 - Add responsive layouts, reduced-motion behavior, assistive hold progress, structured fallback,
   and empty/error/loading states.
 
+Current local source includes member-visible admission, reason-required admin hold controls,
+member-readable comparison, an immutable validation ledger with deliberate admin/owner authoring,
+and exact static source/replay handling. Fresh web/monorepo build and typecheck pass. The installed-
+browser Science gate also passes 4/4; exact cases and artifacts are retained in
+`docs/science/browser-release-evidence.md`. Broader target-device/assistive-technology UAT may
+still be required by production policy.
+
 Exit gate: keyboard-only and reduced-motion UAT pass; axe has no serious/critical issues; semantic
 state colors meet contrast; screenshots prove analytical pixels are not altered by global FUI
 overlays; every Science task is reachable from NEXUS and the command palette.
@@ -588,6 +640,17 @@ Deliverables:
   CSP/origin enforcement, heartbeat/TTL, quota, explicit close, and startup cleanup.
 - Bind viewport selection/camera/field controls to Puppetmaster state deliberately; sandbox any
   embedded application and sanitize notebook/HTML output.
+
+Current retained geometry evidence is deliberately narrow: the focused verifier covers bounded
+ASCII VTK/STL diagnostics, STEP point/edge topology, caps, invalid/binary rejection, and explicit
+fallback. It does not prove Web Worker disposal, browser rendering, OCCT tessellation, vtk.js, or
+scientific fidelity.
+
+The released local render path is narrower than the target: one explicit ready, run-linked PNG up
+to 8 MiB, with migration-15 exact source snapshot and owner/workspace request-key replay binding.
+The FUI shows the same source/checksum it opens and retains retry identity through ambiguous start
+or close. `client` and `remote` requests are refused instead of downgraded. trame and OCCT remain
+NO-GO.
 
 Exit gate: corpus assets render through the policy-selected path; two users cannot access each
 other’s session; expiry/close/server restart releases resources; WebGL failure displays a useful
@@ -606,6 +669,21 @@ Deliverables:
 - Add a re-run comparison that distinguishes identical manifest/input from numerically identical
   output and reports tolerances explicitly.
 
+Current source exposes member-readable comparison and an immutable validation ledger with
+admin/owner FUI authoring. Migrations 12-13 retain and anchor the exact review separately from
+manifests. Comparison uses a numerical decision only while the head, record, manifests, and output
+checksum snapshots all match. Fixtures remain explicitly synthetic; no named reviewer or accepted
+workload-specific tolerance has been invented for release.
+
+The built-in template now binds exact inspected input and provider quote into the reviewed
+submission, uses migration-14 durable `science_run_terminal` wait/resume, fails on a non-successful
+run or incomplete manifest, selects one bounded ready run-linked PNG with a 64-hex checksum,
+requests a second human approval naming that exact visible source, opens `mode="static"` with a
+stable replay key derived from the reviewed run key, and verifies both render source and complete
+manifest. The deterministic provider's data-derived PNG is labelled `fixturePreview=true` and
+`productionCompute=false`. This meets the local static workflow acceptance slice; it does not meet
+the original notebook-execution, trame, or named-domain WP6 exit gate.
+
 Exit gate: pass^k target is recorded and met on the deterministic harness; a domain reviewer can
 trace every output to exact inputs and environment; the system never labels an incomplete manifest
 as reproducible.
@@ -617,9 +695,9 @@ Deliverables:
 - Non-root/read-only provider images, resource quotas, image-digest allowlist, default-deny
   network, scoped storage grants, secret redaction, log bounds, rate limits, and per-workspace
   concurrency limits.
-- Database-gated readiness plus artifact, queue, compute, and render health; public detail-free
-  `/api/readyz` with 503 and authenticated detailed `/api/readiness`; OTel spans and measured usage;
-  admin-visible orphan/quarantine queues.
+- Public `/api/health` liveness plus database-gated artifact, queue, compute, and render readiness;
+  public detail-free `/api/readyz` with 503 and authenticated cached `/api/readiness`; OTel spans
+  and measured usage; admin-visible orphan/quarantine queues.
 - Backup/restore and retention tests for metadata plus artifacts; reconciliation and chaos tests
   for database, Redis, provider, and renderer interruption.
 - Feature flag `SCIENCE_ENABLED`; seed/demo data only in development; persisted migration-11
@@ -628,6 +706,16 @@ Deliverables:
   read/export, cancellation, close, cleanup, and accepted-work convergence.
 - Operator runbook covering stuck jobs, orphan provider handles, corrupt artifacts, expired
   sessions, quota exhaustion, and disaster recovery.
+
+Current source adds fail-closed enabled-production preflight: PostgreSQL, Redis, and S3 are
+mandatory; read-only may omit compute; writable mode additionally requires runtime URL/token/public
+base plus explicit admission. Compose forwards the relevant environment, keeps the API private on
+an internal network, and publishes only a hardened same-origin nginx gateway. Deterministic
+deployment checks and a real UID/GID 101 read-only/capability-free/resource-bounded container plus
+installed-Chrome same-origin HTTP/WebSocket lane pass. Dedicated loopback PostgreSQL 16/16,
+Redis/AOF restart, and MinIO/S3 adapter lanes also pass. The admin action queue is implemented in
+API and FUI. Target TLS/load/HA/SLO/CVE/DR, admitted execution, and provider-wide orphan discovery
+remain pending.
 
 Exit gate: threat-model controls are verified, WP0 SLOs pass on target hardware, backup/restore is
 demonstrated, and rollback preserves manifests/artifacts.
@@ -666,18 +754,45 @@ service testing where the existing stack has a real gap.
 | Evals | pass^k golden workflow and agent trajectory assertions, DB-state predicates, manifest completeness. |
 | Operations | Load against WP0 SLOs, chaos/restart, orphan cleanup, backup/restore, feature-disable/rollback drill. |
 
-Planned deterministic scripts:
+Current deterministic source inventory:
 
 ```text
 scripts/verify-science-contracts.mjs
-scripts/verify-science-artifacts.mjs
+scripts/verify-science-geometry.mjs
+scripts/verify-science-deployment.mjs
 scripts/verify-science-lifecycle.mjs
-scripts/verify-science-authz.mjs
-scripts/verify-science-recovery.mjs
+scripts/verify-science-audit-atomicity.mjs
+scripts/verify-science-scheduler.mjs
+scripts/verify-science-artifacts.mjs
 scripts/verify-science-mcp-concurrency.mjs
-scripts/verify-science-render-session.mjs       # Docker/optional live suite
-scripts/verify-science-jupyter-gateway.mjs      # Docker/optional live suite
+scripts/verify-science-workflow.mjs
+scripts/verify-workflow-deferred-resume.mjs
+scripts/verify-science-jupyter-gateway.mjs
+scripts/run-science-oci-executor-verifier.mjs
+scripts/verify-science-service.mjs
+scripts/verify-science-routes.mjs
+scripts/verify-science-authz.mjs
+scripts/verify-science-ui.mjs
+scripts/verify-science-recovery.mjs
+scripts/verify-science-golden.mjs
 ```
+
+Current retained local evidence is:
+
+- direct golden marker:
+  `SCIENCE GOLDEN PASS^3: 18 isolated deterministic suites; 34 evidence classes verified on every pass`;
+- fresh recursive typecheck and production build: PASS;
+- installed-browser Science journey: 4/4 PASS;
+- dedicated loopback PostgreSQL ledger/lifecycle: 16/16 and
+  `science lifecycle (pg): ok`;
+- loopback Redis/BullMQ: live PASS plus a sentinel surviving `WAITAOF` and process restart;
+- dedicated unversioned loopback MinIO/S3 adapter: PASS; and
+- hardened same-origin nginx container plus installed-Chrome HTTP/WebSocket proof: PASS.
+
+These are local deterministic/browser/loopback results. JEG is prerequisite-only and unregistered;
+its live execution marker is explicitly NOT PROVEN. OCI is a deterministic candidate; the host
+daemon did not advertise rootless mode and no notebook corpus ran. trame/OCCT, target TLS/load/HA,
+SLO/CVE/DR, and named scientific-domain review remain pending.
 
 Add deterministic, sandbox-safe checks to `pnpm test`; keep provider/network/Docker live suites
 explicit so missing external infrastructure fails loudly rather than being reported as a pass.
@@ -755,8 +870,13 @@ plan must be re-scoped before WP1 because the domain model and security boundary
 
 The subsystem is done only when all are true:
 
-**Current outcome: NOT MET.** All aggregate and repository-root results after
-migration 11 are pending until the final rerun evidence is retained.
+**Current original-MVP outcome: NOT MET.** The local control-plane/static workflow acceptance
+slice is met: golden PASS^3 covers 18 isolated deterministic suites and 34 evidence classes; fresh
+build/typecheck and browser 4/4 pass; and loopback PostgreSQL 16/16, Redis/AOF restart, MinIO/S3,
+and hardened same-origin nginx lanes pass. This does not satisfy real rootless/notebook or JEG
+execution, trame/OCCT, named scientific review, or target TLS/load/HA/SLO/CVE/DR requirements.
+
+**Production release: NOT MET.**
 
 - One non-admin researcher can complete the full study-to-manifest flow without leaving
   Puppetmaster.

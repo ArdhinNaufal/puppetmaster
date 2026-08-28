@@ -152,6 +152,61 @@ try {
   );
   await filesystem.discardQuarantine(interrupted);
 
+  const preOpenAbort = await filesystem.createQuarantine(randomUUID());
+  const preOpenController = new AbortController();
+  const preOpenReason = new Error("fixture pre-open upload abort");
+  preOpenController.abort(preOpenReason);
+  let preOpenBodyPulls = 0;
+  await assert.rejects(
+    filesystem.writeQuarantine(
+      preOpenAbort,
+      {
+        async *[Symbol.asyncIterator]() {
+          preOpenBodyPulls++;
+          yield Buffer.from("must-not-open");
+        },
+      },
+      { maxBytes: 100, signal: preOpenController.signal },
+    ),
+    /fixture pre-open upload abort/,
+  );
+  assert.equal(preOpenBodyPulls, 0, "an already-aborted write must not pull request bytes");
+  await filesystem.discardQuarantine(preOpenAbort);
+
+  const liveS3Endpoint = process.env.SCIENCE_TEST_S3_ENDPOINT?.trim();
+  if (liveS3Endpoint) {
+    assert.equal(
+      process.env.SCIENCE_TEST_S3_ALLOW_DELETE,
+      "1",
+      "live S3 verification requires SCIENCE_TEST_S3_ALLOW_DELETE=1 and a dedicated disposable bucket",
+    );
+    const liveS3Bucket = process.env.SCIENCE_TEST_S3_BUCKET?.trim();
+    const liveS3AccessKeyId = process.env.SCIENCE_TEST_S3_ACCESS_KEY_ID?.trim();
+    const liveS3SecretAccessKey = process.env.SCIENCE_TEST_S3_SECRET_ACCESS_KEY;
+    assert.ok(liveS3Bucket, "SCIENCE_TEST_S3_BUCKET is required for live S3 verification");
+    assert.ok(
+      liveS3AccessKeyId,
+      "SCIENCE_TEST_S3_ACCESS_KEY_ID is required for live S3 verification",
+    );
+    assert.ok(
+      liveS3SecretAccessKey,
+      "SCIENCE_TEST_S3_SECRET_ACCESS_KEY is required for live S3 verification",
+    );
+    const liveS3 = new S3CompatibleArtifactStore({
+      endpoint: liveS3Endpoint,
+      region: process.env.SCIENCE_TEST_S3_REGION?.trim() || "us-east-1",
+      bucket: liveS3Bucket,
+      accessKeyId: liveS3AccessKeyId,
+      secretAccessKey: liveS3SecretAccessKey,
+      quarantineRoot: join(root, "live-s3-quarantine"),
+      referenceSecret: secret,
+      requestTimeoutMs: 15_000,
+    });
+    assert.equal((await liveS3.health()).ok, true, "live S3 health");
+    await verifyAdapter(liveS3, "live-s3-compatible");
+    console.log("science live S3 (dedicated unversioned bucket): ok");
+  }
+
   const objects = new Map();
   let redirectHealth = false;
   let malformedRange = false;

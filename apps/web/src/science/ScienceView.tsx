@@ -10,12 +10,13 @@ import {
   ApiError,
   prefsApi,
   scienceApi,
+  type ScienceAdminActionQueueItem,
   type ScienceArtifact,
   type ScienceArtifactVersion,
   type ScienceComputeProfile,
   type ScienceComputeProfileInput,
   type ScienceLayout,
-  type ScienceManifest,
+  type ScienceManifestResult,
   type SciencePage,
   type ScienceRenderSession,
   type ScienceRun,
@@ -25,6 +26,7 @@ import {
   type ScienceWorkspaceAdmission,
 } from "../api.js";
 import type { SignalEntry } from "../Signal.js";
+import { AdminActionQueue } from "./AdminActionQueue.js";
 import { ArtifactVersionControl } from "./ArtifactVersionControl.js";
 import { ComputeProfileManager } from "./ComputeProfileManager.js";
 import { ManifestInspector } from "./ManifestInspector.js";
@@ -39,12 +41,51 @@ import {
   randomIdempotencyKey,
   SCIENCE_ACTIVE_RUN_STATES,
   SCIENCE_PAGE_SIZE,
+  SCIENCE_STATIC_RENDER_MAX_BYTES,
   scienceError,
   sha256Blob,
   usePrefersReducedMotion,
 } from "./science-utils.js";
 
 const EMPTY_PAGE = <T,>(): SciencePage<T> => ({ items: [], nextCursor: null });
+type ScienceAdminLink = ScienceAdminActionQueueItem["links"][number];
+
+function adminLinkEntityId(link: ScienceAdminLink): string {
+  let match: RegExpExecArray | null = null;
+  switch (link.rel) {
+    case "study":
+      match = /^\/api\/science\/studies\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(link.href);
+      break;
+    case "run":
+      match = /^\/api\/science\/runs\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(link.href);
+      break;
+    case "artifact_versions":
+      match = /^\/api\/science\/artifacts\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\/versions$/i.exec(link.href);
+      break;
+    case "artifact_version":
+      match = /^\/api\/science\/artifact-versions\/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(link.href);
+      break;
+    default:
+      throw new Error("Science administrator action returned an unsupported link relation.");
+  }
+  if (!match?.[1]) {
+    throw new Error(
+      "Science administrator action returned a link that does not match its typed relation.",
+    );
+  }
+  return match[1];
+}
+
+function adminActionLinkId(
+  item: ScienceAdminActionQueueItem,
+  rel: ScienceAdminLink["rel"],
+): string | null {
+  const links = item.links.filter((link) => link.rel === rel);
+  if (links.length > 1) {
+    throw new Error("Science administrator action returned duplicate typed links.");
+  }
+  return links[0] ? adminLinkEntityId(links[0]) : null;
+}
 
 export function ScienceView(props: {
   canBuild: boolean;
@@ -98,7 +139,7 @@ export function ScienceView(props: {
   const [admissionError, setAdmissionError] = useState<string | null>(null);
   const [admissionReason, setAdmissionReason] = useState("");
   const [admissionBusy, setAdmissionBusy] = useState(false);
-  const [manifest, setManifest] = useState<ScienceManifest | null>(null);
+  const [manifestResult, setManifestResult] = useState<ScienceManifestResult | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [comparison, setComparison] = useState<ScienceRunComparison | null>(null);
@@ -106,6 +147,12 @@ export function ScienceView(props: {
   const [comparisonError, setComparisonError] = useState<string | null>(null);
   const [renderSession, setRenderSession] = useState<ScienceRenderSession | null>(null);
   const renderSessionRef = useRef<ScienceRenderSession | null>(null);
+  const [selectedRenderOutputId, setSelectedRenderOutputId] = useState<string | null>(null);
+  const pendingRenderRequest = useRef<{
+    runId: string;
+    artifactVersionId: string;
+    idempotencyKey: string;
+  } | null>(null);
 
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [dossierCollapsed, setDossierCollapsed] = useState(false);
@@ -125,6 +172,9 @@ export function ScienceView(props: {
   const admissionReadRequest = useRef(0);
   const admissionMutationRequest = useRef(0);
   const admissionMutationPending = useRef(false);
+  const adminNavigationRequest = useRef(0);
+  const adminHydratedStudyId = useRef<string | null>(null);
+  const adminHydratedArtifactId = useRef<string | null>(null);
   const previousConnected = useRef(props.connected);
 
   const selectedStudy = useMemo(
@@ -151,8 +201,21 @@ export function ScienceView(props: {
     [selectedArtifact, selectedArtifactVersion],
   );
   const selectedRun = useMemo(
-    () => runPage.items.find((run) => run.id === selectedRunId) ?? runDetail,
+    () =>
+      runDetail?.id === selectedRunId
+        ? runDetail
+        : runPage.items.find((run) => run.id === selectedRunId) ?? null,
     [runPage.items, selectedRunId, runDetail],
+  );
+  const eligibleRenderOutputs = useMemo(
+    () => (selectedRun?.outputs ?? []).filter((output) =>
+      output.direction === "output" &&
+      output.mediaType?.trim().toLowerCase() === "image/png" &&
+      /^[0-9a-f]{64}$/i.test(output.sha256 ?? "") &&
+      Number.isSafeInteger(output.sizeBytes) &&
+      (output.sizeBytes ?? 0) > 0 &&
+      (output.sizeBytes ?? 0) <= SCIENCE_STATIC_RENDER_MAX_BYTES),
+    [selectedRun],
   );
   const latestScienceSignal = props.signals.find((signal) => signal.type.startsWith("science.")) ?? null;
   const newWorkEnabled =
@@ -362,6 +425,7 @@ export function ScienceView(props: {
 
   useEffect(() => {
     if (!selectedStudyId) {
+      adminHydratedStudyId.current = null;
       setStudyDetail(null);
       setArtifactPage(EMPTY_PAGE());
       setSelectedArtifactId(null);
@@ -371,6 +435,11 @@ export function ScienceView(props: {
       setRunPage(EMPTY_PAGE());
       return;
     }
+    if (adminHydratedStudyId.current === selectedStudyId) {
+      adminHydratedStudyId.current = null;
+      return;
+    }
+    adminHydratedStudyId.current = null;
     if (!studyPage.items.some((study) => study.id === selectedStudyId)) {
       scienceApi.study(selectedStudyId).then(setStudyDetail).catch(() => setStudyDetail(null));
     } else {
@@ -386,6 +455,7 @@ export function ScienceView(props: {
 
   useEffect(() => {
     if (!selectedArtifactId) {
+      adminHydratedArtifactId.current = null;
       setSelectedArtifactDetail(null);
       setArtifactVersionPage(EMPTY_PAGE());
       setArtifactVersionCursor(null);
@@ -394,6 +464,11 @@ export function ScienceView(props: {
       setArtifactVersionsError(null);
       return;
     }
+    if (adminHydratedArtifactId.current === selectedArtifactId) {
+      adminHydratedArtifactId.current = null;
+      return;
+    }
+    adminHydratedArtifactId.current = null;
     setArtifactVersionCursor(null);
     setArtifactVersionBack([]);
     loadArtifactVersions(selectedArtifactId, null);
@@ -406,7 +481,7 @@ export function ScienceView(props: {
     setComparisonLoading(false);
     if (!selectedRunId) {
       setRunDetail(null);
-      setManifest(null);
+      setManifestResult(null);
       setManifestError(null);
       return;
     }
@@ -419,15 +494,15 @@ export function ScienceView(props: {
     setManifestLoading(true);
     scienceApi.manifest(selectedRunId).then((next) => {
       if (dead) return;
-      setManifest(next);
+      setManifestResult(next);
       setManifestError(null);
     }).catch((error) => {
       if (dead) return;
       if (error instanceof ApiError && error.status === 404 && selectedRun?.state !== "succeeded") {
-        setManifest(null);
+        setManifestResult(null);
         setManifestError(null);
       } else {
-        setManifest(null);
+        setManifestResult(null);
         setManifestError(scienceError(error));
       }
     }).finally(() => {
@@ -487,6 +562,7 @@ export function ScienceView(props: {
           ? loadArtifactVersions(selectedArtifactId, artifactVersionCursor)
           : Promise.resolve(),
         selectedStudyId ? loadRuns(selectedStudyId, runCursor) : Promise.resolve(),
+        selectedRunId ? refreshRun(selectedRunId) : Promise.resolve(null),
       ]).finally(() => setSyncState("live"));
     } else {
       setSyncState("live");
@@ -495,6 +571,7 @@ export function ScienceView(props: {
     props.connected,
     selectedStudyId,
     selectedArtifactId,
+    selectedRunId,
     studyCursor,
     artifactCursor,
     artifactVersionCursor,
@@ -505,11 +582,29 @@ export function ScienceView(props: {
     loadArtifacts,
     loadArtifactVersions,
     loadRuns,
+    refreshRun,
   ]);
 
   useEffect(() => {
     renderSessionRef.current = renderSession;
   }, [renderSession]);
+
+  useEffect(() => {
+    setSelectedRenderOutputId((current) =>
+      eligibleRenderOutputs.some((output) => output.artifactVersionId === current)
+        ? current
+        : eligibleRenderOutputs[0]?.artifactVersionId ?? null);
+    const pending = pendingRenderRequest.current;
+    if (
+      pending &&
+      (pending.runId !== selectedRun?.id ||
+        !eligibleRenderOutputs.some(
+          (output) => output.artifactVersionId === pending.artifactVersionId,
+        ))
+    ) {
+      pendingRenderRequest.current = null;
+    }
+  }, [eligibleRenderOutputs, selectedRun?.id]);
 
   useEffect(() => {
     if (!renderSession || !["starting", "ready"].includes(renderSession.state)) return;
@@ -588,13 +683,15 @@ export function ScienceView(props: {
   };
 
   const selectStudy = (study: ScienceStudy) => {
+    adminHydratedStudyId.current = null;
+    adminHydratedArtifactId.current = null;
     releaseRenderSession();
     setSelectedStudyId(study.id);
     setSelectedArtifactId(null);
     setSelectedArtifactDetail(null);
     setSelectedArtifactVersion(null);
     setSelectedRunId(null);
-    setManifest(null);
+    setManifestResult(null);
     setRenderSession(null);
     setNotice(`Study selected: ${study.name}.`);
   };
@@ -609,6 +706,134 @@ export function ScienceView(props: {
     setNotice(`Run ${run.id.slice(0, 8)} selected.`);
   };
 
+  const navigateAdminAction = async (item: ScienceAdminActionQueueItem) => {
+    const navigation = ++adminNavigationRequest.current;
+    if (item.links.length === 0) {
+      throw new Error("This administrator action has no linked Science context.");
+    }
+    for (const link of item.links) adminLinkEntityId(link);
+
+    const linkedStudyId = adminActionLinkId(item, "study");
+    const linkedRunId = adminActionLinkId(item, "run");
+    const linkedArtifactId = adminActionLinkId(item, "artifact_versions");
+    const linkedArtifactVersionId = adminActionLinkId(item, "artifact_version");
+
+    const [run, linkedVersion] = await Promise.all([
+      linkedRunId ? scienceApi.run(linkedRunId) : Promise.resolve(null),
+      linkedArtifactVersionId
+        ? scienceApi.artifactVersion(linkedArtifactVersionId)
+        : Promise.resolve(null),
+    ]);
+    if (navigation !== adminNavigationRequest.current) return;
+    if (linkedStudyId && run && run.studyId !== linkedStudyId) {
+      throw new Error("Administrator action links disagree about the target study.");
+    }
+    if (
+      linkedArtifactId &&
+      linkedVersion &&
+      linkedVersion.artifactId !== linkedArtifactId
+    ) {
+      throw new Error("Administrator action links disagree about the target artifact.");
+    }
+
+    const studyId = linkedStudyId ?? run?.studyId ?? null;
+    const artifactId = linkedArtifactId ?? linkedVersion?.artifactId ?? null;
+    if (!studyId) {
+      throw new Error("Administrator action does not identify a linked Science study.");
+    }
+
+    const artifactContextPromise = artifactId
+      ? (async () => {
+          let pageCursor: string | null = null;
+          const history: (string | null)[] = [];
+          for (let pageNumber = 0; pageNumber < 25; pageNumber++) {
+            const targetPage = await scienceApi.artifacts(studyId, {
+              cursor: pageCursor,
+              limit: 200,
+            });
+            if (navigation !== adminNavigationRequest.current) return null;
+            const artifact = targetPage.items.find((entry) => entry.id === artifactId);
+            if (artifact) {
+              return { artifact, page: targetPage, cursor: pageCursor, history };
+            }
+            if (!targetPage.nextCursor) break;
+            history.push(pageCursor);
+            pageCursor = targetPage.nextCursor;
+          }
+          throw new Error(
+            "Linked artifact was not found within the bounded Science navigation window.",
+          );
+        })()
+      : Promise.resolve(null);
+    const versionPagePromise = artifactId
+      ? scienceApi.artifactVersions(artifactId, { limit: 20 })
+      : Promise.resolve(EMPTY_PAGE<ScienceArtifactVersion>());
+
+    const [study, artifactContext, linkedVersionPage] = await Promise.all([
+      scienceApi.study(studyId),
+      artifactContextPromise,
+      versionPagePromise,
+    ]);
+    if (navigation !== adminNavigationRequest.current) return;
+
+    const versionPage = linkedVersion &&
+      !linkedVersionPage.items.some((entry) => entry.id === linkedVersion.id)
+      ? {
+          ...linkedVersionPage,
+          items: [linkedVersion, ...linkedVersionPage.items],
+        }
+      : linkedVersionPage;
+
+    studiesRequest.current++;
+    artifactsRequest.current++;
+    artifactVersionsRequest.current++;
+    runsRequest.current++;
+    releaseRenderSession();
+    adminHydratedStudyId.current = study.id;
+    adminHydratedArtifactId.current = artifactContext?.artifact.id ?? null;
+
+    setStudyPage((current) => ({
+      ...current,
+      items: [study, ...current.items.filter((entry) => entry.id !== study.id)],
+    }));
+    setSelectedStudyId(study.id);
+    setStudyDetail(study);
+    setStudyCursor(null);
+    setStudyBack([]);
+
+    setArtifactPage(artifactContext?.page ?? EMPTY_PAGE());
+    setArtifactCursor(artifactContext?.cursor ?? null);
+    setArtifactBack(artifactContext?.history ?? []);
+    setSelectedArtifactId(artifactContext?.artifact.id ?? null);
+    setSelectedArtifactDetail(artifactContext?.artifact ?? null);
+    setArtifactVersionPage(versionPage);
+    setArtifactVersionCursor(null);
+    setArtifactVersionBack([]);
+    setSelectedArtifactVersion(
+      linkedVersion ?? versionPage.items.find((entry) => entry.status === "ready") ?? null,
+    );
+    setArtifactsError(null);
+    setArtifactVersionsError(null);
+
+    setRunPage(run ? { items: [run], nextCursor: null } : EMPTY_PAGE());
+    setRunCursor(null);
+    setRunBack([]);
+    setSelectedRunId(run?.id ?? null);
+    setRunDetail(run);
+    setRunsError(null);
+    setManifestResult(null);
+    setRenderSession(null);
+    if (run?.missionId) props.onTrackMission(run.missionId);
+
+    const targets = [
+      run ? `run ${run.id.slice(0, 8)}` : null,
+      artifactContext ? `artifact ${artifactContext.artifact.logicalName}` : null,
+      linkedVersion ? `version ${linkedVersion.version}` : null,
+    ].filter((value): value is string => Boolean(value));
+    setNotice(
+      `Administrator action context loaded in Science: ${targets.join(" / ") || study.name}.`,
+    );
+  };
   const doAction = async (message: string, action: () => Promise<void>) => {
     setBusy(true);
     try {
@@ -762,6 +987,10 @@ export function ScienceView(props: {
   const reproduce = () => {
     if (!allowNewWork()) return;
     if (!selectedRun) return;
+    if (!manifestResult?.complete) {
+      setNotice("Re-run refused: the server's current manifest assessment is incomplete.");
+      return;
+    }
     doAction("Manifest re-run submitted as a new immutable run.", async () => {
       const run = await scienceApi.reproduce(selectedRun.id, {
         idempotencyKey: randomIdempotencyKey(),
@@ -814,22 +1043,60 @@ export function ScienceView(props: {
   const startRender = () => {
     if (!allowNewWork()) return;
     if (!selectedRun) return;
+    const source = eligibleRenderOutputs.find(
+      (output) => output.artifactVersionId === selectedRenderOutputId,
+    );
+    if (!source) {
+      setNotice("No eligible ready PNG output is linked to this run; static render was refused.");
+      return;
+    }
+    const existing = pendingRenderRequest.current;
+    const request = existing?.runId === selectedRun.id &&
+      existing.artifactVersionId === source.artifactVersionId
+      ? existing
+      : {
+          runId: selectedRun.id,
+          artifactVersionId: source.artifactVersionId,
+          idempotencyKey: randomIdempotencyKey(),
+        };
+    pendingRenderRequest.current = request;
     doAction("Short-lived render session requested.", async () => {
-      const session = await scienceApi.createRenderSession(selectedRun.id, {
-        ...(inspectedArtifact?.latestVersion?.id
-          ? { artifactVersionId: inspectedArtifact.latestVersion.id }
-          : {}),
-      });
-      setRenderSession(session);
+      try {
+        const session = await scienceApi.createRenderSession(request.runId, {
+          artifactVersionId: request.artifactVersionId,
+          mode: "static",
+          idempotencyKey: request.idempotencyKey,
+        });
+        pendingRenderRequest.current = null;
+        setRenderSession(session);
+        setFallbackMode("auto");
+      } catch (error) {
+        // Any transport/5xx failure may follow a committed ready transition.
+        // Preserve the exact key unless the server definitively says this key
+        // belongs to a different intent; selection changes also clear it.
+        if (
+          error instanceof ApiError &&
+          error.status === 409 &&
+          /idempotency key.*different request intent/i.test(error.message)
+        ) {
+          pendingRenderRequest.current = null;
+        }
+        throw error;
+      }
     });
   };
 
   const closeRender = () => {
     if (!renderSession) return;
     const session = renderSession;
-    renderSessionRef.current = null;
-    setRenderSession(null);
-    doAction("Render session closed.", () => scienceApi.closeRenderSession(session.id));
+    doAction("Render session closed.", async () => {
+      await scienceApi.closeRenderSession(session.id);
+      if (renderSessionRef.current?.id === session.id) {
+        renderSessionRef.current = null;
+        setRenderSession(null);
+        setFallbackMode("table");
+      }
+    });
   };
 
 
@@ -883,7 +1150,7 @@ export function ScienceView(props: {
       + `${selectedRun.resourceRequest.wallTimeSeconds}s`
     : "N/A";
   const manifestReadout = selectedRun
-    ? manifest ? manifest.complete ? "COMPLETE" : "INCOMPLETE" : "N/A"
+    ? manifestResult ? manifestResult.complete ? "COMPLETE" : "INCOMPLETE" : "N/A"
     : "N/A";
 
   const moveStudyPage = (direction: -1 | 1) => {
@@ -1023,6 +1290,9 @@ export function ScienceView(props: {
           ADMISSION STATUS / {admissionError}
         </p>
       )}
+      {props.isAdmin && (
+        <AdminActionQueue onNavigate={navigateAdminAction} />
+      )}
 
       <div className="sci-operation-state" role="status" aria-live="polite">
         <span>OP LOG //</span>
@@ -1034,7 +1304,7 @@ export function ScienceView(props: {
         <Panel><Stat label="QUEUE AGE" value={queueAge} /></Panel>
         <Panel><Stat label="WALL TIME" value={wallTime} /></Panel>
         <Panel><Stat label="RESOURCE REQUEST" value={resource} /></Panel>
-        <Panel><Stat label="MANIFEST" value={manifestReadout} tone={manifest?.complete ? "ok" : selectedRun && manifest ? "warn" : "default"} /></Panel>
+        <Panel><Stat label="MANIFEST" value={manifestReadout} tone={manifestResult?.complete ? "ok" : selectedRun && manifestResult ? "warn" : "default"} /></Panel>
       </div>
 
       <div className={`sci-workspace ${railCollapsed ? "rail-collapsed" : ""} ${dossierCollapsed ? "dossier-collapsed" : ""}`}>
@@ -1056,6 +1326,7 @@ export function ScienceView(props: {
             artifactsError={artifactsError}
             selectedArtifactId={selectedArtifactId}
             onSelectArtifact={(artifact) => {
+              adminHydratedArtifactId.current = null;
               releaseRenderSession();
               setSelectedArtifactId(artifact.id);
               setSelectedArtifactDetail(artifact);
@@ -1089,6 +1360,12 @@ export function ScienceView(props: {
             artifact={inspectedArtifact}
             run={selectedRun}
             session={renderSession}
+            eligibleRenderOutputs={eligibleRenderOutputs}
+            selectedRenderOutputId={selectedRenderOutputId}
+            onRenderOutputChange={(artifactVersionId) => {
+              pendingRenderRequest.current = null;
+              setSelectedRenderOutputId(artifactVersionId);
+            }}
             mode={fallbackMode}
             onModeChange={setFallbackMode}
             canBuild={props.canBuild}
@@ -1173,8 +1450,11 @@ export function ScienceView(props: {
             }
             manifestInspector={
               <ManifestInspector
-                manifest={manifest}
-                manifestHash={selectedRun?.manifestHash ?? null}
+                manifest={manifestResult?.manifest ?? null}
+                assessment={manifestResult
+                  ? { complete: manifestResult.complete, gaps: manifestResult.gaps }
+                  : null}
+                manifestHash={manifestResult?.manifestHash ?? null}
                 loading={manifestLoading}
                 error={manifestError}
                 canBuild={props.canBuild}
@@ -1189,6 +1469,8 @@ export function ScienceView(props: {
                 comparison={comparison}
                 comparisonLoading={comparisonLoading}
                 comparisonError={comparisonError}
+                isAdmin={props.isAdmin}
+                runState={selectedRun?.state ?? null}
                 onCompare={compareRun}
                 onReproduce={reproduce}
               />
@@ -1197,8 +1479,14 @@ export function ScienceView(props: {
         )}
       </div>
 
-      <PipelineStrip artifacts={artifactPage.items} run={selectedRun} manifest={manifest} />
-      <footer className="sci-live-rail" aria-label="Science Operations status">
+      <PipelineStrip
+        artifacts={artifactPage.items}
+        run={selectedRun}
+        assessment={manifestResult
+          ? { complete: manifestResult.complete, gaps: manifestResult.gaps }
+          : null}
+      />
+      <footer className="sci-live-rail" role="status" aria-label="Science Operations status">
         <span>SCI //</span>
         <span>{latestScienceSignal ? `${latestScienceSignal.type} · ${latestScienceSignal.label}` : "NO SCIENCE EVENT TRAFFIC · REST STATE LOADED"}</span>
         <span>{props.connected ? "LINK ONLINE" : "LINK OFFLINE"}</span>

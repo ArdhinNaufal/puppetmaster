@@ -1,8 +1,11 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { ScienceAdminActionQueueItem } from "@puppetmaster/shared";
 import type {
+  ScienceAdminActionLink,
   ScienceArtifact,
   ScienceArtifactKind,
   ScienceArtifactVersion,
+  ScienceDomainValidationSubmission,
   ScienceManifest,
   ScienceResourceBounds,
   ScienceRenderSession,
@@ -14,12 +17,14 @@ import type {
 } from "@puppetmaster/shared";
 import {
   acquireScienceRunLease,
+  assessScienceRunManifestForWorkspace,
   appendScienceRunEvent,
   archiveScienceStudy,
   beginScienceUpload,
   claimScienceUploadTransfer,
   claimScienceUploadFinalization,
   claimScienceArtifactVersionRetention,
+  claimScienceRenderSessionLaunch,
   claimScienceRun,
   cleanupScienceArtifactVersionQuarantine,
   cleanupExpiredScienceRenderSessions,
@@ -28,12 +33,13 @@ import {
   createScienceArtifact,
   createScienceArtifactVersion,
   createScienceComputeProfile,
+  createScienceDomainValidation,
   createScienceRenderSession,
   createScienceRun,
   createScienceStudy,
   deleteScienceProviderOutputReservationAfterCommit,
   deleteExpiredScienceArtifactVersionAfterDiscard,
-  deleteTerminalScienceRenderSessionAfterClose,
+  deleteExpiredScienceRenderSessionTombstones,
   deleteTerminalScienceUploadAfterDiscard,
   deferScienceArtifactVersionCleanup,
   deferScienceRenderSessionCleanup,
@@ -44,19 +50,24 @@ import {
   getScienceArtifactForWorkspace,
   getScienceArtifactVersionForWorkspace,
   getScienceComputeProfileForWorkspace,
+  getScienceDomainValidationForRun,
+  getLatestScienceLinkedNumericalEquivalenceRecord,
   getScienceWorkspaceAdmission,
   getLatestScienceRunEvent,
   getScienceRenderSessionForWorkspace,
+  getScienceRenderSessionForRequest,
   getScienceRunByMissionForWorkspace,
   getScienceRunForWorkspace,
   getScienceRunSubmitAttempt,
   getScienceStudyForWorkspace,
   getScienceUploadByTokenHash,
+  listScienceAdminActionQueue,
   listRecoverableScienceRuns,
   listScienceProtectedQuarantineKeys,
   listScienceArtifacts,
   listScienceArtifactVersions,
   listScienceComputeProfiles,
+  listScienceDomainValidations,
   listScienceRenderSessions,
   listScienceRunArtifacts,
   listScienceRunEvents,
@@ -67,6 +78,7 @@ import {
   probeScienceDatabase,
   recordScienceRunSubmitAttempt,
   recordScienceUploadProgress,
+  releaseScienceRenderSessionLaunch,
   replaceScienceRenderSessionProviderHandle,
   releaseScienceUploadFinalization,
   releaseScienceRunLease,
@@ -75,14 +87,15 @@ import {
   renewScienceRunLease,
   requestScienceRunApproval,
   resolveScienceRunApproval,
-  setScienceRenderSessionProviderHandle,
   setScienceRunProviderHandle,
   transitionScienceArtifactVersion,
   transitionScienceRenderSession,
   transitionScienceRun,
+  tombstoneTerminalScienceRenderSessionAfterClose,
   setScienceWorkspaceAdmission,
   updateScienceComputeProfile,
   updateScienceStudy,
+  verifyScienceDomainValidationRecordHash,
   withScienceAuditContext,
   heartbeatScienceRenderSession,
   type Db,
@@ -138,6 +151,171 @@ const RETENTION_OPERATION_TIMEOUT_MS = 5_000;
 const RETENTION_UPLOAD_ATTEMPT_LIMIT = 8;
 const RETENTION_VERSION_ATTEMPT_LIMIT = 8;
 const RETENTION_RENDER_ATTEMPT_LIMIT = 4;
+const STATIC_RENDER_MAX_BYTES = 8 * 1024 * 1024;
+const RENDER_REPLAY_HORIZON_MS = 24 * 60 * 60_000;
+const RENDER_LAUNCH_LEASE_MS = 30_000;
+
+class ScienceExternalUploadStreamTimeoutError extends ScienceConflictError {
+  readonly timeoutKind: "absolute" | "idle";
+
+  constructor(timeoutKind: "absolute" | "idle", timeoutMs: number) {
+    super(
+      `Science external upload stream exceeded its ${timeoutKind} deadline of ` +
+      `${timeoutMs} ms`,
+    );
+    this.name = "ScienceExternalUploadStreamTimeoutError";
+    this.timeoutKind = timeoutKind;
+  }
+}
+
+function externalUploadAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Science external upload stream was aborted");
+}
+
+function awaitExternalUploadOperation<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    // Keep observing a hostile operation that rejects after the deadline.
+    void operation.catch(() => {});
+    return Promise.reject(externalUploadAbortReason(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(externalUploadAbortReason(signal)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+function cancelExternalUploadTransport(
+  body: AsyncIterable<Uint8Array>,
+  error: unknown,
+): void {
+  const destroy = (body as { destroy?: (reason?: Error) => void }).destroy;
+  if (typeof destroy === "function") {
+    try {
+      destroy.call(body, error instanceof Error ? error : new Error(String(error)));
+    } catch {
+      // Best-effort transport cancellation; the durable quarantine transition
+      // remains the authoritative failure boundary.
+    }
+  }
+}
+
+interface ExternalUploadByteStreamOwner {
+  readonly iterator: AsyncIterator<Uint8Array>;
+  readonly completed: boolean;
+  complete(): void;
+  cancel(error: unknown): void;
+}
+
+function takeExternalUploadByteStream(
+  body: AsyncIterable<Uint8Array>,
+): ExternalUploadByteStreamOwner {
+  let iterator: AsyncIterator<Uint8Array>;
+  try {
+    iterator = body[Symbol.asyncIterator]();
+    if (!iterator || typeof iterator.next !== "function") {
+      throw new TypeError("Science external upload body did not provide an async iterator");
+    }
+  } catch (error) {
+    cancelExternalUploadTransport(body, error);
+    throw error;
+  }
+  let completed = false;
+  let cancelled = false;
+  return {
+    iterator,
+    get completed() {
+      return completed;
+    },
+    complete() {
+      completed = true;
+    },
+    cancel(error) {
+      if (completed || cancelled) return;
+      cancelled = true;
+      cancelExternalUploadTransport(body, error);
+      try {
+        const returned = iterator.return?.();
+        if (returned) void Promise.resolve(returned).catch(() => {});
+      } catch {
+        // A hostile iterator cannot prevent the bounded caller from returning.
+      }
+    },
+  };
+}
+
+interface ExternalUploadDeadline {
+  readonly signal: AbortSignal;
+  readonly expired: Promise<never>;
+  readonly timeoutError: ScienceExternalUploadStreamTimeoutError | null;
+  progress(): void;
+  stop(): void;
+}
+
+function startExternalUploadDeadline(
+  absoluteTimeoutMs: number,
+  idleTimeoutMs: number,
+): ExternalUploadDeadline {
+  const controller = new AbortController();
+  let rejectExpired!: (error: ScienceExternalUploadStreamTimeoutError) => void;
+  const expired = new Promise<never>((_resolve, reject) => {
+    rejectExpired = reject;
+  });
+  let timeoutError: ScienceExternalUploadStreamTimeoutError | null = null;
+  let stopped = false;
+  let idleTimer: ReturnType<typeof setTimeout>;
+  const expire = (kind: "absolute" | "idle", timeoutMs: number) => {
+    if (stopped || timeoutError) return;
+    timeoutError = new ScienceExternalUploadStreamTimeoutError(kind, timeoutMs);
+    rejectExpired(timeoutError);
+    controller.abort(timeoutError);
+  };
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => expire("idle", idleTimeoutMs), idleTimeoutMs);
+  };
+  const absoluteTimer = setTimeout(
+    () => expire("absolute", absoluteTimeoutMs),
+    absoluteTimeoutMs,
+  );
+  armIdle();
+  return {
+    signal: controller.signal,
+    expired,
+    get timeoutError() {
+      return timeoutError;
+    },
+    progress: armIdle,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(absoluteTimer);
+      clearTimeout(idleTimer);
+    },
+  };
+}
+
+const SCIENCE_ADMIN_ACTION_LINK = {
+  study: (id: string) => `/api/science/studies/${id}`,
+  run: (id: string) => `/api/science/runs/${id}`,
+  artifact_versions: (id: string) => `/api/science/artifacts/${id}/versions`,
+  artifact_version: (id: string) => `/api/science/artifact-versions/${id}`,
+} satisfies Record<ScienceAdminActionLink["rel"], (id: string) => string>;
 
 function cleanupRetryAt(attempts: number): Date {
   const exponent = Math.max(0, Math.min(10, attempts));
@@ -276,6 +454,22 @@ async function readArtifactBytes(read: ArtifactRead, limit: number): Promise<Buf
 
 function normalizedArtifactFormat(value: string): string {
   return value.trim().toLowerCase().replace(/^\./, "");
+}
+
+const VERIFIED_CODE_SEMANTIC_ROLES = new Set(["code", "notebook", "solver"]);
+
+function isVerifiedCodeArtifact(
+  artifact: Pick<ScienceArtifact, "kind" | "format">,
+  version: Pick<ScienceArtifactVersion, "status" | "metadata">,
+): boolean {
+  // `ipynb` is the only current code-bearing format whose bytes are parsed at
+  // upload time. Other text/opaque declarations remain useful inputs, but are
+  // not sufficient to make a provenance-completeness claim.
+  return version.status === "ready" &&
+    artifact.kind === "notebook" &&
+    normalizedArtifactFormat(artifact.format) === "ipynb" &&
+    version.metadata.detectedFormat === "ipynb" &&
+    version.metadata.formatValidation === "parsed";
 }
 
 function assertSafeArtifactMediaType(mediaType: string, format: string): void {
@@ -509,11 +703,6 @@ function validatedComputeProfileConfig(
   return config;
 }
 
-function verifiedSourceRevision(value: string | null): boolean {
-  return value === null ||
-    /^(?:(?:git|sha256):)?[0-9a-f]{7,64}$/i.test(value);
-}
-
 /**
  * One service boundary for REST, tools, queue ticks, and recovery. Providers
  * never receive database credentials or host paths; callers never receive
@@ -531,6 +720,7 @@ export class ScienceService {
   private readonly workerId: string;
   private readonly gatewaySecret: Buffer;
   private scheduler: ScienceScheduler | null = null;
+  private workflowWaitWaker: ((runId: string) => Promise<void>) | null = null;
 
   private admissionMutationQueue: Promise<void> = Promise.resolve();
 
@@ -557,6 +747,15 @@ export class ScienceService {
       throw new Error("Science scheduler is already attached");
     }
     this.scheduler = scheduler;
+  }
+
+  /** Queue delivery is advisory; `workflow_waits.state=ready` remains the
+   * authoritative after-commit wake source for startup/periodic recovery. */
+  attachWorkflowWaitWaker(waker: (runId: string) => Promise<void>): void {
+    if (this.workflowWaitWaker && this.workflowWaitWaker !== waker) {
+      throw new Error("Science workflow wait waker is already attached");
+    }
+    this.workflowWaitWaker = waker;
   }
 
   private async readArtifactCandidate(
@@ -773,6 +972,14 @@ export class ScienceService {
     }
   }
 
+  /** Metadata review writes consume no provider/storage resource but remain disabled in read-only mode. */
+  private assertMetadataWritable(): void {
+    this.assertReadable();
+    if (!this.config.submissionsEnabled) {
+      throw new ScienceDisabledError("Science Operations is in read-only mode");
+    }
+  }
+
   private assertAcceptedWorkMayConverge(): void {
     this.assertReadable();
   }
@@ -887,18 +1094,22 @@ export class ScienceService {
         this.workspaceId,
         run.id,
       );
-    if (!current) return;
-    await this.publish({
-      type: current.eventType,
-      workspaceId: this.workspaceId,
-      studyId: run.studyId,
-      runId: run.id,
-      missionId: run.missionId,
-      sequence: current.sequence,
-      at: current.createdAt.toISOString(),
-      state: current.state,
-      metadata: boundedRecord(current.payload),
-    });
+    if (current) {
+      await this.publish({
+        type: current.eventType,
+        workspaceId: this.workspaceId,
+        studyId: run.studyId,
+        runId: run.id,
+        missionId: run.missionId,
+        sequence: current.sequence,
+        at: current.createdAt.toISOString(),
+        state: current.state,
+        metadata: boundedRecord(current.payload),
+      });
+    }
+    if (TERMINAL_RUN_STATES.has(run.state)) {
+      await this.workflowWaitWaker?.(run.id).catch(() => {});
+    }
   }
 
   async listStudies(input: {
@@ -911,6 +1122,61 @@ export class ScienceService {
       status: input.status,
       page: input.page,
     });
+  }
+
+  async listAdminActionQueue(input: {
+    page?: { offset?: number; limit?: number };
+  } = {}) {
+    this.assertReadable();
+    const observedAt = new Date();
+    const queue = await listScienceAdminActionQueue(this.db, {
+      workspaceId: this.workspaceId,
+      page: input.page,
+      now: observedAt,
+    });
+    return {
+      ...queue,
+      items: queue.items.map((item) => {
+        const links: ScienceAdminActionLink[] = [];
+        if (item.studyId) {
+          links.push({
+            rel: "study",
+            href: SCIENCE_ADMIN_ACTION_LINK.study(item.studyId),
+          });
+        }
+        if (item.runId) {
+          links.push({
+            rel: "run",
+            href: SCIENCE_ADMIN_ACTION_LINK.run(item.runId),
+          });
+        }
+        if (item.artifactId) {
+          links.push({
+            rel: "artifact_versions",
+            href: SCIENCE_ADMIN_ACTION_LINK.artifact_versions(item.artifactId),
+          });
+        }
+        if (item.artifactVersionId) {
+          links.push({
+            rel: "artifact_version",
+            href: SCIENCE_ADMIN_ACTION_LINK.artifact_version(item.artifactVersionId),
+          });
+        }
+        return ScienceAdminActionQueueItem.parse({
+          id: item.id,
+          kind: item.kind,
+          state: item.state,
+          ageSeconds: Math.max(
+            0,
+            Math.floor((observedAt.getTime() - item.detectedAt.getTime()) / 1_000),
+          ),
+          attempts: item.attempts,
+          nextRetryAt: item.nextRetryAt?.toISOString() ?? null,
+          reason: redactScienceDiagnostic(item.reason, 200),
+          links,
+        });
+      }),
+    };
   }
 
   async createStudy(input: {
@@ -1176,15 +1442,35 @@ export class ScienceService {
   }
 
   private guardUploadByteStream(
-    body: AsyncIterable<Uint8Array>,
+    owner: ExternalUploadByteStreamOwner,
     ensureLease: () => Promise<void>,
+    deadline: ExternalUploadDeadline,
   ): AsyncIterable<Uint8Array> {
     return (async function* () {
-      for await (const chunk of body) {
-        await ensureLease();
-        yield chunk;
+      while (true) {
+        await awaitExternalUploadOperation(
+          Promise.resolve().then(ensureLease),
+          deadline.signal,
+        );
+        const next = await awaitExternalUploadOperation(
+          Promise.resolve().then(() => owner.iterator.next()),
+          deadline.signal,
+        );
+        if (next.done) {
+          owner.complete();
+          break;
+        }
+        deadline.progress();
+        await awaitExternalUploadOperation(
+          Promise.resolve().then(ensureLease),
+          deadline.signal,
+        );
+        yield next.value;
       }
-      await ensureLease();
+      await awaitExternalUploadOperation(
+        Promise.resolve().then(ensureLease),
+        deadline.signal,
+      );
     })();
   }
 
@@ -1193,7 +1479,26 @@ export class ScienceService {
     body: AsyncIterable<Uint8Array>,
     actorId: string,
   ) {
-    this.assertAcceptedWorkMayConverge();
+    const owner = takeExternalUploadByteStream(body);
+    let exitError: unknown;
+    try {
+      this.assertAcceptedWorkMayConverge();
+      return await this.writeAcceptedExternalUpload(uploadToken, owner, actorId);
+    } catch (error) {
+      exitError = error;
+      throw error;
+    } finally {
+      owner.cancel(
+        exitError ?? new Error("Science external upload request body was not consumed"),
+      );
+    }
+  }
+
+  private async writeAcceptedExternalUpload(
+    uploadToken: string,
+    owner: ExternalUploadByteStreamOwner,
+    actorId: string,
+  ) {
     const tokenHash = this.uploadTokenHash(uploadToken);
     const transferLeaseId = randomUUID();
     let claimed;
@@ -1204,6 +1509,9 @@ export class ScienceService {
         tokenHash,
         leaseId: transferLeaseId,
         leaseExpiresAt: new Date(Date.now() + UPLOAD_TRANSFER_LEASE_MS),
+        external: true,
+        maxConcurrentExternalStreamsPerWorkspace:
+          this.config.maxConcurrentExternalUploadStreamsPerWorkspace,
         }));
     } catch (error) {
       if (
@@ -1222,30 +1530,59 @@ export class ScienceService {
     );
     try {
     let receipt;
+    const deadline = startExternalUploadDeadline(
+      this.config.externalUploadAbsoluteTimeoutMs,
+      this.config.externalUploadIdleTimeoutMs,
+    );
+    const storeWrite = Promise.resolve().then(() => this.store.writeQuarantine(
+      upload.quarantineKey,
+      this.guardUploadByteStream(owner, transferHeartbeat.ensure, deadline),
+      {
+        maxBytes: Math.min(this.config.maxUploadBytes, upload.expectedSizeBytes),
+        signal: deadline.signal,
+      },
+    ));
     try {
-      receipt = await this.store.writeQuarantine(
-        upload.quarantineKey,
-        this.guardUploadByteStream(body, transferHeartbeat.ensure),
-        {
-          maxBytes: Math.min(this.config.maxUploadBytes, upload.expectedSizeBytes),
-        },
-      );
+      receipt = await Promise.race([storeWrite, deadline.expired]);
+      deadline.stop();
     } catch (error) {
+      deadline.stop();
+      const transferError = deadline.timeoutError ?? error;
+      const streamTimedOut =
+        transferError instanceof ScienceExternalUploadStreamTimeoutError;
+      if (streamTimedOut) {
+        // Stop extending the durable transfer lease before making the partial
+        // object immediately eligible for retention cleanup.
+        await transferHeartbeat.stop(false);
+      }
+      owner.cancel(transferError);
+      // ArtifactStore implementations own their writer resources and must
+      // settle after the abort signal. Durable quarantine cannot race a late
+      // file open, buffered drain, or object-store write.
+      await storeWrite.catch(() => {});
       await this.mutateAs("science.artifact.upload.quarantine", actorId, (db) =>
         quarantineScienceUpload(db, {
         workspaceId: this.workspaceId,
         tokenHash,
-        error: safeError(error),
-        })).catch(() => {});
+        error: safeError(transferError),
+        cleanupEligible: streamTimedOut,
+        })).catch((quarantineError) => {
+          if (streamTimedOut) {
+            throw new ScienceConflictError(
+              `Science external upload stream timed out and durable quarantine failed: ` +
+              safeError(quarantineError),
+            );
+          }
+        });
       await this.publish({
         type: "science.artifact.quarantined",
         workspaceId: this.workspaceId,
         sequence: 1,
         at: new Date().toISOString(),
         state: "quarantined",
-        metadata: { uploadId: upload.id, reason: safeError(error) },
+        metadata: { uploadId: upload.id, reason: safeError(transferError) },
       });
-      throw error;
+      throw transferError;
     }
     if (
       receipt.size !== upload.expectedSizeBytes ||
@@ -1736,6 +2073,14 @@ export class ScienceService {
       if (!artifact || artifact.studyId !== input.studyId) {
         throw new ScienceConflictError("science run inputs must belong to the selected study");
       }
+      if (
+        VERIFIED_CODE_SEMANTIC_ROLES.has(semanticRole) &&
+        !isVerifiedCodeArtifact(artifact, version)
+      ) {
+        throw new ScienceConflictError(
+          "science code, notebook, or solver roles require a parsed ipynb notebook artifact",
+        );
+      }
       validatedInputs.push({ version, semanticRole });
     }
     const created = await this.mutateAs("science.run.submit", input.actorId, (db) =>
@@ -1810,11 +2155,17 @@ export class ScienceService {
     approvalId: string;
     approved: boolean;
     actorId: string;
+    reason?: string;
+    auditAction?: "science.run.approval" | "science.run.cancel";
   }) {
     if (input.approved) await this.assertWritable();
     else this.assertReadable();
     const run = await this.getRun(input.runId);
-    const result = await this.mutateAs("science.run.approval", input.actorId, (db) =>
+    const action = input.auditAction ?? "science.run.approval";
+    const reason = input.reason?.trim()
+      ? redactScienceDiagnostic(input.reason.trim(), 1_000)
+      : undefined;
+    const result = await this.mutateAs(action, input.actorId, (db) =>
       resolveScienceRunApproval(db, {
       workspaceId: this.workspaceId,
       runId: run.id,
@@ -1822,7 +2173,7 @@ export class ScienceService {
       approvalId: input.approvalId,
       decision: input.approved ? "approved" : "rejected",
       maxActiveRuns: this.config.maxConcurrentRunsPerWorkspace,
-      }));
+      }), reason);
     await this.publishRunEvent(result.run, result.event);
     await this.bus.publish({
       type: "approval.resolved",
@@ -1838,9 +2189,10 @@ export class ScienceService {
     if (input.approved && result.run.state === "queued") {
       await this.scheduler?.enqueue(run.id, null);
     }
-    await this.auditEntry("science.run.approval", input.actorId, run.id, {
+    await this.auditEntry(action, input.actorId, run.id, {
       approvalId: input.approvalId,
       approved: input.approved,
+      ...(reason ? { reason } : {}),
     }, run.missionId);
     return result;
   }
@@ -1963,14 +2315,17 @@ export class ScienceService {
       this.recentRunEvents(runId, boundedEventLimit),
       this.allRunArtifacts(runId),
     ]);
-    const artifacts = await Promise.all(links.map(async (link) => ({
-      ...link,
-      version: await getScienceArtifactVersionForWorkspace(
+    const artifacts = await Promise.all(links.map(async (link) => {
+      const version = await getScienceArtifactVersionForWorkspace(
         this.db,
         this.workspaceId,
         link.artifactVersionId,
-      ),
-    })));
+      );
+      const artifact = version
+        ? await getScienceArtifactForWorkspace(this.db, this.workspaceId, version.artifactId)
+        : null;
+      return { ...link, version, artifact };
+    }));
     return {
       run,
       events: {
@@ -1982,7 +2337,12 @@ export class ScienceService {
     };
   }
 
-  async cancelRun(input: { runId: string; expectedGeneration?: number; actorId: string }) {
+  async cancelRun(input: {
+    runId: string;
+    expectedGeneration?: number;
+    actorId: string;
+    reason?: string;
+  }) {
     // Read-only rollback stops new submissions but must retain authority to
     // terminate already-running external compute.
     this.assertReadable();
@@ -1996,6 +2356,9 @@ export class ScienceService {
     if (TERMINAL_RUN_STATES.has(run.state)) {
       return { run, accepted: false };
     }
+    const reason = input.reason?.trim()
+      ? redactScienceDiagnostic(input.reason.trim(), 1_000)
+      : undefined;
     if (run.state === "awaiting_approval") {
       const approval = await findApprovalForNode(this.db, run.missionId, "science.run");
       if (!approval) throw new Error("awaiting science run has no approval");
@@ -2004,6 +2367,8 @@ export class ScienceService {
         approvalId: approval.id,
         approved: false,
         actorId: input.actorId,
+        reason,
+        auditAction: "science.run.cancel",
       });
       return { run: resolved.run, accepted: true };
     }
@@ -2014,11 +2379,15 @@ export class ScienceService {
       runId: run.id,
       expectedGeneration: run.executionGeneration,
       to: target,
-      eventPayload: { requestedBy: input.actorId },
-      }));
+      eventPayload: {
+        requestedBy: input.actorId,
+        ...(reason ? { reason } : {}),
+      },
+      }), reason);
     await this.publishRunEvent(run);
     await this.auditEntry("science.run.cancel", input.actorId, run.id, {
       executionGeneration: run.executionGeneration,
+      ...(reason ? { reason } : {}),
     }, run.missionId);
     if (run.state === "cancelling") await this.scheduler?.enqueue(run.id, null);
     return { run, accepted: true };
@@ -2176,6 +2545,7 @@ export class ScienceService {
         tokenHash: reservationTokenHash,
         leaseId: reservationLeaseId,
         leaseExpiresAt: new Date(Date.now() + UPLOAD_TRANSFER_LEASE_MS),
+        external: false,
       });
     } catch (error) {
       // Aggregate admission happens before the provider stream is opened.
@@ -2443,18 +2813,35 @@ export class ScienceService {
         link.artifactVersionId,
       );
       if (!version) throw new Error("science manifest link is missing its artifact version");
+      const artifact = await getScienceArtifactForWorkspace(
+        this.db,
+        this.workspaceId,
+        version.artifactId,
+      );
+      if (!artifact) throw new Error("science manifest link is missing its artifact");
       return {
         direction: link.direction,
         artifactVersionId: version.id,
         sha256: version.sha256,
         sizeBytes: version.sizeBytes,
         semanticRole: link.semanticRole,
+        artifactKind: artifact.kind,
+        artifactFormat: artifact.format,
+        artifactVersionStatus: version.status,
+        artifactVersionMetadata: version.metadata,
       };
     }));
     const sorted = (direction: "input" | "output") =>
       refs
         .filter((entry) => entry.direction === direction)
-        .map(({ direction: _direction, ...entry }) => entry)
+        .map(({
+          direction: _direction,
+          artifactKind: _artifactKind,
+          artifactFormat: _artifactFormat,
+          artifactVersionStatus: _artifactVersionStatus,
+          artifactVersionMetadata: _artifactVersionMetadata,
+          ...entry
+        }) => entry)
         .sort((left, right) =>
           left.semanticRole.localeCompare(right.semanticRole) ||
           left.artifactVersionId.localeCompare(right.artifactVersionId));
@@ -2468,12 +2855,17 @@ export class ScienceService {
     const inputs = sorted("input");
     const outputs = sorted("output");
     const codeArtifactVersionId =
-      inputs.find((entry) => ["code", "notebook", "solver"].includes(entry.semanticRole))
+      refs.find((entry) =>
+        entry.direction === "input" &&
+        VERIFIED_CODE_SEMANTIC_ROLES.has(entry.semanticRole) &&
+        isVerifiedCodeArtifact(
+          { kind: entry.artifactKind, format: entry.artifactFormat },
+          {
+            status: entry.artifactVersionStatus,
+            metadata: entry.artifactVersionMetadata,
+          },
+        ))
         ?.artifactVersionId ?? null;
-    const sourceRevision =
-      typeof run.parameters.sourceRevision === "string"
-        ? run.parameters.sourceRevision.slice(0, 500)
-        : null;
     const preliminary = {
       schemaVersion: 1 as const,
       studyId: run.studyId,
@@ -2482,7 +2874,11 @@ export class ScienceService {
       inputs,
       outputs,
       codeArtifactVersionId,
-      sourceRevision,
+      // Run parameters are user-controlled. Until an independent repository
+      // resolver records immutable evidence, a declared source revision must
+      // remain informational inside `parameters` and cannot be promoted to
+      // verified top-level provenance.
+      sourceRevision: null,
       compute: {
         ...run.profileSnapshot,
         requestedResources: run.resourceRequest,
@@ -2528,12 +2924,6 @@ export class ScienceService {
     };
     const assessed = assessManifest(preliminary);
     const gaps = [...assessed.gaps];
-    if (!codeArtifactVersionId && !sourceRevision) {
-      gaps.push("manifest.codeArtifactVersionId|sourceRevision");
-    }
-    if (sourceRevision && !verifiedSourceRevision(sourceRevision)) {
-      gaps.push("manifest.sourceRevision.unverified");
-    }
     if (Object.keys(dependencyLock).length === 0) {
       gaps.push("manifest.compute.dependencyLock");
     }
@@ -2554,6 +2944,7 @@ export class ScienceService {
     let current = run;
     let leaseFailure: unknown = null;
     let providerTerminalObserved = false;
+    let durableSubmitAttemptExists = false;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatTail = Promise.resolve();
     const leaseExpiresAt = () => new Date(Date.now() + WORKER_LEASE_MS);
@@ -2706,6 +3097,7 @@ export class ScienceService {
         runId: current.id,
         expectedGeneration: current.executionGeneration,
       });
+      durableSubmitAttemptExists = submitAttempt !== null;
       let storedHandle: StoredComputeHandle | null = null;
       if (current.providerHandle) {
         storedHandle = decodeComputeHandle(current.providerHandle);
@@ -2915,6 +3307,7 @@ export class ScienceService {
           throw error;
         }
         submitAttempt = marker.attempt;
+        durableSubmitAttemptExists = true;
         if (marker.event) await this.publishRunEvent(current, marker.event);
         const submitted = await provider.submit(submission, {
           expectedInstanceId: instanceId,
@@ -3193,7 +3586,7 @@ export class ScienceService {
                 }, current.missionId).catch(() => {});
                 return { nextPollMs: null };
               }
-            } else if (current.providerHandle) {
+            } else if (current.providerHandle || durableSubmitAttemptExists) {
               current = await transitionScienceRun(this.db, {
                 workspaceId: this.workspaceId,
                 runId: current.id,
@@ -3202,8 +3595,13 @@ export class ScienceService {
                 to: "cancelling",
                 eventPayload: {
                   reason: "provider control plane failed repeatedly",
+                  attempt: errorCount + 1,
                   providerErrorCount: errorCount + 1,
+                  orphaned: true,
                   adminActionRequired: true,
+                  providerHandlePersisted: current.providerHandle !== null,
+                  durableSubmitAttemptPersisted: durableSubmitAttemptExists,
+                  diagnostic: redactScienceDiagnostic(error, 1_000),
                 },
               }).catch(() => current);
               if (current.state === "cancelling") {
@@ -3216,6 +3614,7 @@ export class ScienceService {
               error: message,
               providerErrorCount: errorCount + 1,
               providerHandlePersisted: current.providerHandle !== null,
+              durableSubmitAttemptPersisted: durableSubmitAttemptExists,
               adminActionRequired: true,
             }, current.missionId).catch(() => {});
           }
@@ -3272,16 +3671,94 @@ export class ScienceService {
     return this.tickWithLease(run);
   }
 
+  private async assessPersistedManifest(
+    runId: string,
+  ) {
+    return (await assessScienceRunManifestForWorkspace(
+      this.db,
+      this.workspaceId,
+      runId,
+    )) ?? { complete: false, gaps: ["manifest.relational-integrity"] };
+  }
+
   async getManifest(runId: string) {
     const run = await this.getRun(runId);
+    const assessed = await this.assessPersistedManifest(run.id);
     return {
       runId: run.id,
       state: run.state,
       manifest: run.manifest,
       manifestHash: run.manifestHash,
-      complete: run.manifest?.complete ?? false,
-      gaps: run.manifest?.gaps ?? ["manifest-not-yet-available"],
+      // Stored manifest bytes and hash remain immutable. These top-level fields
+      // are the current trust assessment, so pre-hardening manifests cannot
+      // retain a stale completeness claim.
+      complete: assessed.complete,
+      gaps: assessed.gaps,
     };
+  }
+
+  async recordDomainValidation(
+    input: ScienceDomainValidationSubmission & {
+      runId: string;
+      reviewerId: string;
+      reviewerRole: "admin" | "owner";
+    },
+  ) {
+    this.assertMetadataWritable();
+    const runId = input.runId.toLowerCase();
+    const baselineRunId = input.baselineRunId?.toLowerCase();
+    const reviewerId = input.reviewerId.toLowerCase();
+    const record = await this.mutateAs(
+      "science.domain-validation.create",
+      reviewerId,
+      (db) => createScienceDomainValidation(db, {
+        ...input,
+        runId,
+        baselineRunId,
+        reviewerId,
+        workspaceId: this.workspaceId,
+      }),
+    );
+    await this.auditEntry(
+      "science.domain-validation.create",
+      reviewerId,
+      record.id,
+      {
+        runId: record.runId,
+        revision: record.revision,
+        baselineRunId: record.baselineRunId,
+        kind: record.kind,
+        metric: record.metric,
+        decision: record.decision,
+        recordHash: record.recordHash,
+      },
+    );
+    return record;
+  }
+
+  async listDomainValidations(runId: string, page?: { offset?: number; limit?: number }) {
+    this.assertReadable();
+    runId = runId.toLowerCase();
+    await this.getRun(runId);
+    return listScienceDomainValidations(this.db, {
+      workspaceId: this.workspaceId,
+      runId,
+      page,
+    });
+  }
+
+  async getDomainValidation(runId: string, validationId: string) {
+    this.assertReadable();
+    runId = runId.toLowerCase();
+    validationId = validationId.toLowerCase();
+    await this.getRun(runId);
+    const record = await getScienceDomainValidationForRun(this.db, {
+      workspaceId: this.workspaceId,
+      runId,
+      validationId,
+    });
+    if (!record) throw new ScienceNotFoundError("science domain validation not found");
+    return record;
   }
 
   async reproduceRun(input: {
@@ -3291,9 +3768,10 @@ export class ScienceService {
   }) {
     await this.assertWritable();
     const source = await this.getRun(input.runId);
-    if (!source.manifest || source.state !== "succeeded" || !source.manifest.complete) {
+    const manifestAssessment = await this.assessPersistedManifest(source.id);
+    if (!source.manifest || source.state !== "succeeded" || !manifestAssessment.complete) {
       throw new ScienceConflictError(
-        "only a succeeded science run with a complete manifest can be reproduced",
+        "only a succeeded science run with a currently verified complete manifest can be reproduced",
       );
     }
     const profile = await getScienceComputeProfileForWorkspace(
@@ -3346,6 +3824,8 @@ export class ScienceService {
   }
 
   async compareRuns(leftRunId: string, rightRunId: string) {
+    leftRunId = leftRunId.toLowerCase();
+    rightRunId = rightRunId.toLowerCase();
     const [left, right] = await Promise.all([
       this.getRun(leftRunId),
       this.getRun(rightRunId),
@@ -3353,26 +3833,66 @@ export class ScienceService {
     if (!left.manifest || !right.manifest) {
       throw new ScienceConflictError("both science runs need manifests before comparison");
     }
+    const newestLinkedRecord = await getLatestScienceLinkedNumericalEquivalenceRecord(this.db, {
+      workspaceId: this.workspaceId,
+      baselineRunId: leftRunId,
+      candidateRunId: rightRunId,
+    });
+    const leftHash = createHash("sha256").update(canonicalJson(left.manifest)).digest("hex");
+    const rightHash = createHash("sha256").update(canonicalJson(right.manifest)).digest("hex");
+    let linked: typeof newestLinkedRecord = null;
+    if (newestLinkedRecord) {
+      try {
+        if (
+          verifyScienceDomainValidationRecordHash(newestLinkedRecord) &&
+          left.manifestHash !== null &&
+          right.manifestHash !== null &&
+          leftHash === left.manifestHash &&
+          rightHash === right.manifestHash &&
+          newestLinkedRecord.baselineManifestHash === left.manifestHash &&
+          newestLinkedRecord.runManifestHash === right.manifestHash &&
+          canonicalJson(newestLinkedRecord.baselineOutputChecksums) ===
+            canonicalJson(left.manifest.outputs) &&
+          canonicalJson(newestLinkedRecord.runOutputChecksums) ===
+            canonicalJson(right.manifest.outputs)
+        ) {
+          linked = newestLinkedRecord;
+        }
+      } catch {
+        // The newest exact-pair record is authoritative. Any malformed hash or
+        // lineage binding makes numerical review unavailable; older decisions
+        // must never be used as a fallback.
+      }
+    }
+    const numericalValidation = linked
+      ? {
+          passed: linked.decision,
+          metric: linked.metric,
+          tolerance: linked.tolerance,
+          observed: linked.observedValue,
+          units: linked.units,
+          methodProtocolId: linked.methodProtocolId,
+          limitationsReason: linked.limitationsReason,
+          recordId: linked.id,
+          revision: linked.revision,
+          reviewerId: linked.reviewerId,
+          createdAt: linked.createdAt.toISOString(),
+          recordHash: linked.recordHash,
+        }
+      : null;
     return {
       leftRunId,
       rightRunId,
-      comparison: compareManifests(left.manifest, right.manifest),
+      comparison: compareManifests(left.manifest, right.manifest, numericalValidation),
     };
   }
 
-  private async renderSource(run: ScienceRun, versionId?: string): Promise<{
+  private async renderSource(run: ScienceRun, versionId: string): Promise<{
     version: ScienceArtifactVersion;
     artifact: ScienceArtifact;
   }> {
     const outputs = await this.allRunArtifacts(run.id, "output");
-    let selectedId = versionId;
-    if (!selectedId) {
-      selectedId = outputs.find((entry) =>
-        /geometry|mesh|vtk|step|result/i.test(entry.semanticRole))?.artifactVersionId ??
-        outputs[0]?.artifactVersionId;
-    }
-    if (!selectedId) throw new ScienceConflictError("science run has no renderable output");
-    if (!outputs.some((entry) => entry.artifactVersionId === selectedId)) {
+    if (!outputs.some((entry) => entry.artifactVersionId === versionId)) {
       throw new ScienceConflictError(
         "render source must be an output linked to the selected science run",
       );
@@ -3380,7 +3900,7 @@ export class ScienceService {
     const version = await getScienceArtifactVersionForWorkspace(
       this.db,
       this.workspaceId,
-      selectedId,
+      versionId,
     );
     if (!version || version.status !== "ready") {
       throw new ScienceConflictError("render source must be a ready artifact version");
@@ -3393,12 +3913,25 @@ export class ScienceService {
     if (!artifact || artifact.studyId !== run.studyId) {
       throw new ScienceConflictError("render source must belong to the run study");
     }
+    if (
+      artifact.format.toLowerCase() !== "png" ||
+      version.mediaType.toLowerCase() !== "image/png" ||
+      version.sizeBytes < 1 ||
+      version.sizeBytes > STATIC_RENDER_MAX_BYTES
+    ) {
+      throw new ScienceConflictError(
+        `static render accepts only ready inline PNG outputs up to ${STATIC_RENDER_MAX_BYTES} bytes`,
+      );
+    }
     return { version, artifact };
   }
 
-  private chooseRenderProvider(mode?: "client" | "remote" | "static"): RenderSessionProvider {
-    const kinds = this.renderProviders.list().map((entry) => entry.kind);
-    if (mode === "remote" && kinds.includes("trame")) return this.renderProviders.get("trame");
+  private chooseRenderProvider(mode: "client" | "remote" | "static"): RenderSessionProvider {
+    if (mode !== "static") {
+      throw new ScienceConflictError(
+        `${mode} render mode is not released; no implicit static downgrade is permitted`,
+      );
+    }
     return this.renderProviders.get("static");
   }
 
@@ -3438,36 +3971,145 @@ export class ScienceService {
 
   async createRender(input: {
     runId: string;
-    artifactVersionId?: string;
-    mode?: "client" | "remote" | "static";
+    artifactVersionId: string;
+    mode: "client" | "remote" | "static";
+    idempotencyKey: string;
     actorId: string;
   }) {
-    await this.assertWritable();
+    this.assertReadable();
+    const idempotencyKey = typeof input.idempotencyKey === "string"
+      ? input.idempotencyKey.trim()
+      : "";
+    if (!idempotencyKey || idempotencyKey.length > 200) {
+      throw new ScienceConflictError("render idempotency key must be between 1 and 200 characters");
+    }
     const run = await this.getRun(input.runId);
-    const { version, artifact } = await this.renderSource(run, input.artifactVersionId);
     const provider = this.chooseRenderProvider(input.mode);
+    const requestKeyHash = sha256(idempotencyKey);
+    const fingerprint = (source: {
+      artifactVersionId: string;
+      sha256: string;
+      mediaType: string;
+      sizeBytes: number;
+      logicalName: string;
+    }) => sha256(canonicalJson({
+        contract: "science-render-intent.v1",
+        workspaceId: this.workspaceId,
+        ownerId: input.actorId,
+        runId: run.id,
+        artifactVersionId: source.artifactVersionId,
+        mode: input.mode,
+        providerKind: provider.kind,
+        sourceSha256: source.sha256,
+        sourceMediaType: source.mediaType.toLowerCase(),
+        sourceSizeBytes: source.sizeBytes,
+        sourceLogicalName: source.logicalName,
+      }));
+    const response = (session: ScienceRenderSession, created: boolean) => ({
+      session,
+      created,
+      mode: session.mode,
+      provider: session.providerKind,
+      source: {
+        artifactVersionId: session.artifactVersionId!,
+        sha256: session.sourceSha256,
+        mediaType: session.sourceMediaType,
+        sizeBytes: session.sourceSizeBytes,
+        logicalName: session.sourceLogicalName,
+      },
+      url: session.state === "ready"
+        ? `/api/science/render-sessions/${session.id}/gateway`
+        : null,
+      expiresAt: session.expiresAt.toISOString(),
+    });
+    const replay = await getScienceRenderSessionForRequest(this.db, {
+      workspaceId: this.workspaceId,
+      ownerId: input.actorId,
+      requestKeyHash,
+    });
+    let version: ScienceArtifactVersion;
+    let artifact: ScienceArtifact;
+    let intentFingerprint: string;
+    if (replay) {
+      const replayFingerprint = fingerprint({
+        artifactVersionId: replay.artifactVersionId ?? "",
+        sha256: replay.sourceSha256,
+        mediaType: replay.sourceMediaType,
+        sizeBytes: replay.sourceSizeBytes,
+        logicalName: replay.sourceLogicalName,
+      });
+      if (
+        replay.intentFingerprint !== replayFingerprint ||
+        replay.runId !== run.id ||
+        replay.artifactVersionId !== input.artifactVersionId ||
+        replay.mode !== input.mode ||
+        replay.providerKind !== provider.kind
+      ) {
+        throw new ScienceConflictError(
+          "Render idempotency key was already used for a different request intent",
+        );
+      }
+      if (replay.state !== "starting") return response(replay, false);
+      try {
+        await this.assertWritable();
+      } catch (error) {
+        if (error instanceof ScienceDisabledError) return response(replay, false);
+        throw error;
+      }
+      ({ version, artifact } = await this.renderSource(run, input.artifactVersionId));
+      intentFingerprint = fingerprint({
+        artifactVersionId: version.id,
+        sha256: version.sha256,
+        mediaType: version.mediaType,
+        sizeBytes: version.sizeBytes,
+        logicalName: artifact.logicalName,
+      });
+      if (intentFingerprint !== replay.intentFingerprint) {
+        throw new ScienceConflictError(
+          "Render idempotency key was already used for a different request intent",
+        );
+      }
+    } else {
+      await this.assertWritable();
+      ({ version, artifact } = await this.renderSource(run, input.artifactVersionId));
+      intentFingerprint = fingerprint({
+        artifactVersionId: version.id,
+        sha256: version.sha256,
+        mediaType: version.mediaType,
+        sizeBytes: version.sizeBytes,
+        logicalName: artifact.logicalName,
+      });
+    }
     const providerInstanceId = await this.admitRenderProvider(provider);
-    const audience = `science-render:${randomUUID()}`;
+    const audience = `science-render:${sha256(
+      `${this.workspaceId}:${input.actorId}:${requestKeyHash}`,
+    )}`;
     const gatewayToken = this.renderGatewayToken(audience);
-    const expiresAt = new Date(Date.now() + this.config.renderTtlSeconds * 1_000);
+    const now = Date.now();
+    const expiresAt = new Date(now + this.config.renderTtlSeconds * 1_000);
+    const replayExpiresAt = new Date(
+      now + Math.max(RENDER_REPLAY_HORIZON_MS, this.config.renderTtlSeconds * 1_000),
+    );
     const created = await this.mutateAs("science.render.open", input.actorId, (db) =>
       createScienceRenderSession(db, {
       workspaceId: this.workspaceId,
       runId: run.id,
       artifactVersionId: version.id,
+      requestKeyHash,
+      intentFingerprint,
+      providerKind: provider.kind,
+      mode: input.mode,
+      sourceSha256: version.sha256,
+      sourceMediaType: version.mediaType.toLowerCase(),
+      sourceSizeBytes: version.sizeBytes,
+      sourceLogicalName: artifact.logicalName,
       tokenHash: sha256(gatewayToken),
       audience,
       ownerId: input.actorId,
       expiresAt,
+      replayExpiresAt,
       maxConcurrentSessions: this.config.maxConcurrentRenderSessionsPerWorkspace,
       }));
-    const reference = await this.store.reference(version.storageKey, {
-      versionId: version.id,
-      sha256: version.sha256,
-      size: version.sizeBytes,
-      audience,
-      ttlSeconds: this.config.renderTtlSeconds,
-    });
     const source: RenderSource = {
       runId: run.id,
       artifactVersionId: version.id,
@@ -3475,64 +4117,75 @@ export class ScienceService {
       mediaType: version.mediaType,
       size: version.sizeBytes,
       sha256: version.sha256,
-      reference,
     };
-    await this.publish({
-      type: "science.render.starting",
-      workspaceId: this.workspaceId,
-      studyId: run.studyId,
-      runId: run.id,
-      missionId: run.missionId,
-      artifactVersionId: version.id,
-      renderSessionId: created.session.id,
-      sequence: 1,
-      at: created.session.createdAt.toISOString(),
-      state: "starting",
-      metadata: { mode: input.mode ?? "static", provider: provider.kind },
-    });
     const launchAttemptHandle = encodeRenderAttempt({
       providerKind: provider.kind,
       instanceId: providerInstanceId,
       sessionId: created.session.id,
     });
-    await this.mutateAs("science.render.open", input.actorId, (db) =>
-      setScienceRenderSessionProviderHandle(db, {
-      workspaceId: this.workspaceId,
-      sessionId: created.session.id,
-      ownerId: input.actorId,
-      providerHandle: launchAttemptHandle,
-      }));
     let launchedHandle: string | null = null;
-    let persistedHandle: string | null = null;
+    let launchLeaseId: string | null = null;
     let actualHandlePersisted = false;
     try {
+      if (created.session.state !== "starting") return response(created.session, created.created);
+      if (created.session.providerHandle) {
+        const stored = decodeRenderHandle(created.session.providerHandle);
+        if (!stored.attempt) {
+          if (stored.providerKind !== provider.kind) {
+            throw new ScienceConflictError("persisted render provider does not match request intent");
+          }
+          await this.admitRenderProvider(provider, stored.instanceId);
+          const status = await provider.status(
+            stored.handle,
+            { expectedInstanceId: stored.instanceId },
+          );
+          const session = status.state === "ready"
+            ? await this.mutateAs("science.render.open", input.actorId, (db) =>
+                transitionScienceRenderSession(db, {
+                  workspaceId: this.workspaceId,
+                  sessionId: created.session.id,
+                  ownerId: input.actorId,
+                  to: "ready",
+                }))
+            : created.session;
+          return response(session, created.created);
+        }
+      }
+      if (created.created) {
+        await this.publish({
+          type: "science.render.starting",
+          workspaceId: this.workspaceId,
+          studyId: run.studyId,
+          runId: run.id,
+          missionId: run.missionId,
+          artifactVersionId: version.id,
+          renderSessionId: created.session.id,
+          sequence: 1,
+          at: created.session.createdAt.toISOString(),
+          state: "starting",
+          metadata: { mode: input.mode, provider: provider.kind },
+        });
+      }
+      launchLeaseId = randomUUID();
+      const claim = await this.mutateAs("science.render.open", input.actorId, (db) =>
+        claimScienceRenderSessionLaunch(db, {
+          workspaceId: this.workspaceId,
+          sessionId: created.session.id,
+          ownerId: input.actorId,
+          providerHandle: launchAttemptHandle,
+          leaseId: launchLeaseId!,
+          leaseExpiresAt: new Date(Date.now() + RENDER_LAUNCH_LEASE_MS),
+        }));
+      if (!claim.claimed) return response(claim.session, created.created);
       const launch = await provider.start({
         sessionId: created.session.id,
         workspaceId: this.workspaceId,
         ownerId: input.actorId,
-        expiresAt: expiresAt.toISOString(),
+        expiresAt: created.session.expiresAt.toISOString(),
         gatewayToken,
         source,
       }, { expectedInstanceId: providerInstanceId });
       launchedHandle = launch.providerHandle;
-      // Persist the returned handle against the already-admitted instance
-      // before trusting any other response field. A later validation or close
-      // failure therefore leaves retryable evidence instead of a hidden live
-      // renderer.
-      persistedHandle = encodeRenderHandle({
-        providerKind: provider.kind,
-        instanceId: providerInstanceId,
-        handle: launch.providerHandle,
-      });
-      const sessionWithHandle = await this.mutateAs("science.render.open", input.actorId, (db) =>
-        replaceScienceRenderSessionProviderHandle(db, {
-        workspaceId: this.workspaceId,
-        sessionId: created.session.id,
-        ownerId: input.actorId,
-        expectedProviderHandle: launchAttemptHandle,
-        providerHandle: persistedHandle!,
-        }));
-      actualHandlePersisted = true;
       if (!/^[a-z0-9._-]{1,100}$/i.test(launch.instanceId)) {
         throw new Error(
           "render provider start did not return a bounded immutable instance ID",
@@ -3543,6 +4196,27 @@ export class ScienceService {
           "render provider identity changed between health admission and session launch",
         );
       }
+      if (launch.mode !== "static") {
+        throw new Error("static render provider returned a non-static launch mode");
+      }
+      if (launch.state !== "ready" && launch.state !== "starting") {
+        throw new Error("render provider failed to start");
+      }
+      const persistedHandle = encodeRenderHandle({
+        providerKind: provider.kind,
+        instanceId: providerInstanceId,
+        handle: launch.providerHandle,
+      });
+      const sessionWithHandle = await this.mutateAs("science.render.open", input.actorId, (db) =>
+        replaceScienceRenderSessionProviderHandle(db, {
+          workspaceId: this.workspaceId,
+          sessionId: created.session.id,
+          ownerId: input.actorId,
+          expectedProviderHandle: launchAttemptHandle,
+          launchLeaseId: launchLeaseId!,
+          providerHandle: persistedHandle,
+        }));
+      actualHandlePersisted = true;
       let session;
       if (launch.state === "ready") {
         session = await this.mutateAs("science.render.open", input.actorId, (db) =>
@@ -3552,11 +4226,7 @@ export class ScienceService {
           ownerId: input.actorId,
           to: "ready",
           }));
-      } else if (launch.state === "starting") {
-        session = sessionWithHandle;
-      } else {
-        throw new Error("render provider failed to start");
-      }
+      } else session = sessionWithHandle;
       const type: ScienceEventType =
         session.state === "ready" ? "science.render.ready" : "science.render.starting";
       await this.publish({
@@ -3578,57 +4248,38 @@ export class ScienceService {
         provider: provider.kind,
         mode: launch.mode,
       }, run.missionId);
-      return {
-        session,
-        mode: launch.mode,
-        url: `/api/science/render-sessions/${session.id}/gateway`,
-        expiresAt: session.expiresAt.toISOString(),
-      };
+      return response(session, created.created);
     } catch (error) {
-      let closeConfirmed = false;
-      if (launchedHandle) {
+      if (launchedHandle && launchLeaseId && !actualHandlePersisted) {
         try {
           await provider.close(
             launchedHandle,
             { expectedInstanceId: providerInstanceId },
           );
-          closeConfirmed = true;
-        } catch {
-          // Preserve the actual handle below when possible. The admitted
-          // instance, never an untrusted response field, remains the fence.
-        }
-      }
-      if (launchedHandle && persistedHandle && !actualHandlePersisted && !closeConfirmed) {
-        try {
           await this.mutateAs("science.render.open", input.actorId, (db) =>
-            replaceScienceRenderSessionProviderHandle(db, {
+            releaseScienceRenderSessionLaunch(db, {
+              workspaceId: this.workspaceId,
+              sessionId: created.session.id,
+              ownerId: input.actorId,
+              providerHandle: launchAttemptHandle,
+              leaseId: launchLeaseId!,
+            }));
+        } catch {
+          // Keep the durable launch marker/lease so no retry can start a
+          // second provider until the bounded claim expires.
+        }
+      } else if (launchLeaseId) {
+        await this.mutateAs("science.render.open", input.actorId, (db) =>
+          releaseScienceRenderSessionLaunch(db, {
             workspaceId: this.workspaceId,
             sessionId: created.session.id,
             ownerId: input.actorId,
-            expectedProviderHandle: launchAttemptHandle,
-            providerHandle: persistedHandle!,
-            }));
-          actualHandlePersisted = true;
-        } catch {
-          // The launch-attempt marker remains a conservative, durable hold.
-        }
-      }
-      const failed = await this.mutateAs("science.render.open", input.actorId, (db) =>
-        transitionScienceRenderSession(db, {
-        workspaceId: this.workspaceId,
-        sessionId: created.session.id,
-        ownerId: input.actorId,
-        to: "failed",
-        })).catch(() => {});
-      if (closeConfirmed && failed) {
-        await this.mutateAs("science.render.open", input.actorId, (db) =>
-          deleteTerminalScienceRenderSessionAfterClose(db, {
-          workspaceId: this.workspaceId,
-          sessionId: created.session.id,
+            providerHandle: launchAttemptHandle,
+            leaseId: launchLeaseId!,
           })).catch(() => {});
       }
       await this.publish({
-        type: "science.render.failed",
+        type: "science.render.starting",
         workspaceId: this.workspaceId,
         studyId: run.studyId,
         runId: run.id,
@@ -3637,9 +4288,9 @@ export class ScienceService {
         renderSessionId: created.session.id,
         sequence: 2,
         at: new Date().toISOString(),
-        state: "failed",
+        state: "starting",
         metadata: { error: safeError(error) },
-      });
+      }).catch(() => {});
       throw error;
     }
   }
@@ -3739,21 +4390,22 @@ export class ScienceService {
     }
     const provider = this.renderProviders.get(stored.providerKind);
     await this.admitRenderProvider(provider, stored.instanceId);
-    // Persisted admission comes before the remote mutation. An expired,
-    // revoked, failed, or still-starting local lease must never extend a
-    // provider-side session.
+    // Renew the provider first. If the owner-locked local heartbeat then loses
+    // a close/expiry race, the same-origin gateway remains locally denied; the
+    // inverse order could leave a failed provider renewal with a live gateway.
+    await provider.renew(
+      stored.handle,
+      expiresAt.toISOString(),
+      { expectedInstanceId: stored.instanceId },
+    );
     const session = await this.mutateAs("science.render.renew", input.actorId, (db) =>
       heartbeatScienceRenderSession(db, {
       workspaceId: this.workspaceId,
       sessionId: current.id,
       ownerId: input.actorId,
       extendExpiresAt: expiresAt,
+      extendReplayExpiresAt: new Date(Date.now() + RENDER_REPLAY_HORIZON_MS),
       }));
-    await provider.renew(
-      stored.handle,
-      expiresAt.toISOString(),
-      { expectedInstanceId: stored.instanceId },
-    );
     await this.publish({
       type: "science.render.heartbeat",
       workspaceId: this.workspaceId,
@@ -3794,13 +4446,14 @@ export class ScienceService {
             ownerId: input.actorId,
             to: "revoked",
             }));
-    await this.mutateAs("science.render.close", input.actorId, (db) =>
-      deleteTerminalScienceRenderSessionAfterClose(db, {
-      workspaceId: this.workspaceId,
-      sessionId: session.id,
+    const tombstone = await this.mutateAs("science.render.close", input.actorId, (db) =>
+      tombstoneTerminalScienceRenderSessionAfterClose(db, {
+        workspaceId: this.workspaceId,
+        sessionId: session.id,
+        replayExpiresAt: new Date(Date.now() + RENDER_REPLAY_HORIZON_MS),
       }));
     await this.auditEntry("science.render.close", input.actorId, session.id);
-    return session;
+    return tombstone ?? session;
   }
 
   async cleanupRetention(): Promise<{
@@ -3892,22 +4545,28 @@ export class ScienceService {
             if (session.providerHandle) {
               const stored = decodeRenderHandle(session.providerHandle);
               if (stored.attempt) {
-                throw new Error("ambiguous render launch marker requires administrator action");
+                if (stored.providerKind !== "static") {
+                  throw new Error("ambiguous render launch marker requires administrator action");
+                }
+                // A static launch marker has no external resource. Once the
+                // session lease is terminal it can be safely tombstoned.
+              } else {
+                const provider = this.renderProviders.get(stored.providerKind);
+                await withOperationDeadline((async () => {
+                  await this.admitRenderProvider(provider, stored.instanceId);
+                  await provider.close(
+                    stored.handle,
+                    { expectedInstanceId: stored.instanceId },
+                  );
+                })(), "science render close");
               }
-              const provider = this.renderProviders.get(stored.providerKind);
-              await withOperationDeadline((async () => {
-                await this.admitRenderProvider(provider, stored.instanceId);
-                await provider.close(
-                  stored.handle,
-                  { expectedInstanceId: stored.instanceId },
-                );
-              })(), "science render close");
             }
-            const deleted = await deleteTerminalScienceRenderSessionAfterClose(this.db, {
+            const tombstone = await tombstoneTerminalScienceRenderSessionAfterClose(this.db, {
               workspaceId: this.workspaceId,
               sessionId: session.id,
+              replayExpiresAt: new Date(Date.now() + RENDER_REPLAY_HORIZON_MS),
             });
-            if (deleted) deletedRenders++;
+            if (tombstone) deletedRenders++;
           } catch {
             await deferScienceRenderSessionCleanup(this.db, {
               workspaceId: this.workspaceId,
@@ -3919,6 +4578,10 @@ export class ScienceService {
         }
       })(),
     ]);
+    deletedRenders += await deleteExpiredScienceRenderSessionTombstones(this.db, {
+      workspaceId: this.workspaceId,
+      limit: 500,
+    });
     // Sweep only old, unreferenced quarantine files. Protecting keys from all
     // workspaces prevents this workspace's maintenance pass from racing a
     // live transfer or lease-renewed finalizer elsewhere.
@@ -4055,6 +4718,11 @@ export class ScienceService {
       limits: {
         maxUploadBytes: this.config.maxUploadBytes,
         maxWorkspaceStorageBytes: this.config.maxWorkspaceStorageBytes,
+        externalUploadAbsoluteTimeoutMs:
+          this.config.externalUploadAbsoluteTimeoutMs,
+        externalUploadIdleTimeoutMs: this.config.externalUploadIdleTimeoutMs,
+        maxConcurrentExternalUploadStreamsPerWorkspace:
+          this.config.maxConcurrentExternalUploadStreamsPerWorkspace,
         maxConcurrentRunsPerWorkspace: this.config.maxConcurrentRunsPerWorkspace,
         maxConcurrentRenderSessionsPerWorkspace:
           this.config.maxConcurrentRenderSessionsPerWorkspace,

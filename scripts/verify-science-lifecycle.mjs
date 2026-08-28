@@ -21,6 +21,7 @@ import {
   createScienceArtifact,
   createScienceArtifactVersion,
   createScienceComputeProfile,
+  createScienceDomainValidation,
   createScienceRenderSession,
   createScienceRun,
   createScienceStudy,
@@ -28,8 +29,12 @@ import {
   deleteScienceProviderOutputReservationAfterCommit,
   deleteExpiredScienceArtifactVersionAfterDiscard,
   deleteExpiredScienceUploadAfterDiscard,
+  tombstoneTerminalScienceRenderSessionAfterClose,
   deferScienceArtifactVersionCleanup,
+  deferScienceRenderSessionCleanup,
+  deferScienceUploadCleanup,
   finalizeScienceUpload,
+  getScienceDomainValidationForRun,
   getScienceWorkspaceAdmission,
   getLatestScienceRunEvent,
   getScienceArtifactByLogicalName,
@@ -42,6 +47,8 @@ import {
   getScienceUploadByTokenHash,
   heartbeatScienceRenderSession,
   linkScienceRunArtifact,
+  listScienceAdminActionQueue,
+  listScienceDomainValidations,
   listRecoverableScienceRuns,
   listScienceRunArtifacts,
   listScienceRunEvents,
@@ -57,12 +64,14 @@ import {
   requestScienceRunApproval,
   resolveScienceRunApproval,
   setScienceWorkspaceAdmission,
+  scienceDomainValidationRunLockOrder,
   setScienceRunProviderHandle,
   setScienceRenderSessionProviderHandle,
   transitionScienceArtifactVersion,
   transitionScienceRenderSession,
   transitionScienceRun,
   upsertMembership,
+  verifyScienceDomainValidationRecordHash,
   workspaces,
 } from "../packages/db/dist/index.js";
 
@@ -196,6 +205,48 @@ async function verifyMigrationRollbackIsAtomic() {
   }
 }
 
+async function verifyRewrittenV12DriftIsRejected() {
+  const handle = await createDb({ ephemeral: true });
+  const originalMigrations = [...SCHEMA_MIGRATIONS];
+  try {
+    SCHEMA_MIGRATIONS.splice(
+      0,
+      SCHEMA_MIGRATIONS.length,
+      ...originalMigrations.filter((migration) => migration.version <= 11),
+    );
+    await migrate(handle);
+    await handle.db.execute(sql.raw(`
+      CREATE TABLE science_domain_validations (
+        id uuid PRIMARY KEY,
+        workspace_id uuid,
+        run_id uuid,
+        record_hash text
+      )
+    `));
+    await handle.db.execute(sql.raw(`
+      INSERT INTO schema_migrations(version, name)
+      VALUES (12, 'science-append-only-domain-validation')
+    `));
+    SCHEMA_MIGRATIONS.splice(0, SCHEMA_MIGRATIONS.length, ...originalMigrations);
+    await assert.rejects(
+      () => migrate(handle),
+      /science migration 13 schema drift: migration 12 lacks rewritten revision\/created_at\/record_hash columns/i,
+      "an older unreleased v12 ledger must fail fast rather than silently install an untrustworthy head",
+    );
+    const ledgerResult = await handle.db.execute(sql.raw(
+      "SELECT count(*) AS copies FROM schema_migrations WHERE version = 13",
+    ));
+    assert.equal(Number((ledgerResult.rows ?? ledgerResult)[0].copies), 0);
+    const headResult = await handle.db.execute(sql.raw(
+      "SELECT to_regclass('public.science_domain_validation_heads')::text AS relation",
+    ));
+    assert.equal((headResult.rows ?? headResult)[0].relation, null);
+  } finally {
+    SCHEMA_MIGRATIONS.splice(0, SCHEMA_MIGRATIONS.length, ...originalMigrations);
+    await handle.close();
+  }
+}
+
 async function verifyLifecycle(databaseUrl) {
   const handle = await createDb(
     databaseUrl ? { databaseUrl } : { ephemeral: true },
@@ -207,7 +258,7 @@ async function verifyLifecycle(databaseUrl) {
     await migrate(handle);
     assert.deepEqual(
       SCHEMA_MIGRATIONS.map((migration) => migration.version),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     );
     const ledgerResult = await handle.db.execute(
       sql.raw(
@@ -980,6 +1031,86 @@ async function verifyLifecycle(databaseUrl) {
     });
     assert.equal(firstUpload.created, true);
     assert.equal(duplicateUpload.created, false);
+
+    const externalCapTokens = ["12".repeat(32), "34".repeat(32)];
+    const externalCapUploads = await Promise.all(
+      externalCapTokens.map((tokenHash, index) => beginScienceUpload(handle.db, {
+        workspaceId: workspaceA.id,
+        artifactId: inputArtifact.id,
+        tokenHash,
+        expectedSizeBytes: 0,
+        expectedSha256: SHA_INPUT,
+        quarantineKey: `quarantine/${study.id}/external-cap-${index}`,
+        expiresAt: uploadExpiry,
+        maxWorkspaceStorageBytes: WORKSPACE_STORAGE_LIMIT,
+      })),
+    );
+    const externalCapLeaseIds = [
+      "20000000-0000-4000-8000-000000000010",
+      "20000000-0000-4000-8000-000000000011",
+    ];
+    const externalCapStart = new Date();
+    const externalCapClaims = await Promise.allSettled(
+      externalCapTokens.map((tokenHash, index) => claimScienceUploadTransfer(handle.db, {
+        workspaceId: workspaceA.id,
+        tokenHash,
+        leaseId: externalCapLeaseIds[index],
+        leaseExpiresAt: new Date(externalCapStart.getTime() + 100),
+        external: true,
+        maxConcurrentExternalStreamsPerWorkspace: 1,
+        now: externalCapStart,
+      })),
+    );
+    assert.equal(
+      externalCapClaims.filter((result) => result.status === "fulfilled").length,
+      1,
+      "workspace-row serialization must admit exactly one external stream",
+    );
+    const externalWinner = externalCapClaims.findIndex(
+      (result) => result.status === "fulfilled",
+    );
+    const externalLoser = 1 - externalWinner;
+    await renewScienceUploadTransfer(handle.db, {
+      workspaceId: workspaceA.id,
+      tokenHash: externalCapTokens[externalWinner],
+      leaseId: externalCapLeaseIds[externalWinner],
+      now: new Date(externalCapStart.getTime() + 50),
+      leaseExpiresAt: new Date(externalCapStart.getTime() + 250),
+    });
+    await expectConflict(
+      () => claimScienceUploadTransfer(handle.db, {
+        workspaceId: workspaceA.id,
+        tokenHash: externalCapTokens[externalLoser],
+        leaseId: externalCapLeaseIds[externalLoser],
+        leaseExpiresAt: new Date(externalCapStart.getTime() + 300),
+        external: true,
+        maxConcurrentExternalStreamsPerWorkspace: 1,
+        now: new Date(externalCapStart.getTime() + 150),
+      }),
+      /external upload stream concurrency limit of 1/,
+    );
+    await claimScienceUploadTransfer(handle.db, {
+      workspaceId: workspaceA.id,
+      tokenHash: externalCapTokens[externalLoser],
+      leaseId: externalCapLeaseIds[externalLoser],
+      leaseExpiresAt: new Date(externalCapStart.getTime() + 500),
+      external: true,
+      maxConcurrentExternalStreamsPerWorkspace: 1,
+      now: new Date(externalCapStart.getTime() + 251),
+    });
+    for (let index = 0; index < externalCapTokens.length; index++) {
+      await quarantineScienceUpload(handle.db, {
+        workspaceId: workspaceA.id,
+        tokenHash: externalCapTokens[index],
+        error: "external concurrency fence verification cleanup",
+        cleanupEligible: true,
+      });
+      assert.equal(await deleteExpiredScienceUploadAfterDiscard(handle.db, {
+        workspaceId: workspaceA.id,
+        uploadId: externalCapUploads[index].upload.id,
+      }), true);
+    }
+
     const transferLeaseIds = [
       "20000000-0000-4000-8000-000000000002",
       "20000000-0000-4000-8000-000000000003",
@@ -1482,18 +1613,370 @@ async function verifyLifecycle(databaseUrl) {
       complete: true,
       gaps: [],
     };
+    await expectConflict(
+      () => transitionScienceRun(handle.db, {
+        workspaceId: workspaceA.id,
+        runId: createdRun.run.id,
+        expectedGeneration: 1,
+        leaseOwner: "worker-a",
+        to: "succeeded",
+        manifest,
+      }),
+      /source revision is unverified.*immutable code input/i,
+    );
+    const structurallyUnderreportedManifest = {
+      ...manifest,
+      sourceRevision: null,
+      compute: {
+        ...manifest.compute,
+        dependencyLock: {},
+      },
+      complete: false,
+      // The caller names the code gap but tries to hide the missing lock.
+      gaps: ["manifest.codeArtifactVersionId"],
+    };
+    await expectConflict(
+      () => transitionScienceRun(handle.db, {
+        workspaceId: workspaceA.id,
+        runId: createdRun.run.id,
+        expectedGeneration: 1,
+        leaseOwner: "worker-a",
+        to: "succeeded",
+        manifest: structurallyUnderreportedManifest,
+      }),
+      /complete and gaps must exactly match the current structural assessment/i,
+    );
+    const incompleteManifest = {
+      ...manifest,
+      sourceRevision: null,
+      complete: false,
+      gaps: ["manifest.codeArtifactVersionId"],
+    };
     const succeeded = await transitionScienceRun(handle.db, {
       workspaceId: workspaceA.id,
       runId: createdRun.run.id,
       expectedGeneration: 1,
       leaseOwner: "worker-a",
       to: "succeeded",
-      manifest,
+      manifest: incompleteManifest,
     });
     assert.equal(succeeded.state, "succeeded");
     assert.match(succeeded.manifestHash, /^[0-9a-f]{64}$/);
     assert.equal(succeeded.leaseOwner, null);
     assert.equal(succeeded.leaseExpiresAt, null);
+    assert.deepEqual(
+      scienceDomainValidationRunLockOrder(
+        succeeded.id.toUpperCase(),
+        workspaceB.id,
+      ),
+      scienceDomainValidationRunLockOrder(
+        succeeded.id,
+        workspaceB.id.toUpperCase(),
+      ),
+      "mixed-case representations of one pair must never reverse the run-lock order",
+    );
+    await assert.rejects(
+      () => createScienceDomainValidation(handle.db, {
+        workspaceId: workspaceA.id,
+        runId: succeeded.id,
+        reviewerId: user.id,
+        reviewerRole: "admin",
+        kind: "domain-validation",
+        metric: "synthetic-output-count",
+        tolerance: 0,
+        observedValue: succeeded.manifest.outputs.length,
+        units: "count",
+        methodProtocolId: "synthetic-lifecycle-protocol/v1",
+        decision: true,
+        limitationsReason: "Synthetic lifecycle fixture; not release or domain evidence.",
+      }),
+      /reviewer must be a current admin or owner/i,
+      "a repository caller cannot spoof a different reviewer role",
+    );
+    await assert.rejects(
+      () => createScienceDomainValidation(handle.db, {
+        workspaceId: workspaceA.id,
+        runId: succeeded.id,
+        reviewerId: user.id,
+        reviewerRole: "owner",
+        kind: "domain-validation",
+        metric: "synthetic-output-count",
+        tolerance: 0,
+        observedValue: succeeded.manifest.outputs.length,
+        units: "count",
+        methodProtocolId: "synthetic-lifecycle-protocol/v1",
+        decision: true,
+        limitationsReason: "Synthetic lifecycle fixture; not release or domain evidence.",
+        createdAt: new Date("2000-01-01T00:00:00.000Z"),
+      }),
+      /revision and createdAt are database-assigned/i,
+      "a repository caller cannot control validation precedence or display time",
+    );
+    const rejectedValidationAudits = await handle.db.execute(sql.raw(
+      "SELECT count(*) AS copies FROM audit_log WHERE target LIKE 'science_domain_validations:%'",
+    ));
+    assert.equal(Number((rejectedValidationAudits.rows ?? rejectedValidationAudits)[0].copies), 0);
+    const domainValidation = await createScienceDomainValidation(handle.db, {
+      workspaceId: workspaceA.id.toUpperCase(),
+      runId: succeeded.id.toUpperCase(),
+      reviewerId: user.id.toUpperCase(),
+      reviewerRole: "owner",
+      kind: "domain-validation",
+      metric: "synthetic-output-count",
+      tolerance: 0,
+      observedValue: succeeded.manifest.outputs.length,
+      units: "count",
+      methodProtocolId: "synthetic-lifecycle-protocol/v1",
+      decision: true,
+      limitationsReason: "Synthetic lifecycle fixture; not release or domain evidence.",
+    });
+    assert.equal(domainValidation.runManifestHash, succeeded.manifestHash);
+    assert.equal(domainValidation.workspaceId, workspaceA.id);
+    assert.equal(domainValidation.runId, succeeded.id);
+    assert.equal(domainValidation.reviewerId, user.id);
+    assert.equal(domainValidation.revision, 1);
+    assert.deepEqual(domainValidation.runOutputChecksums, succeeded.manifest.outputs);
+    assert.equal(domainValidation.reviewerId, user.id);
+    assert.equal(domainValidation.reviewerRole, "owner");
+    assert.equal(verifyScienceDomainValidationRecordHash(domainValidation), true);
+    assert.equal(
+      verifyScienceDomainValidationRecordHash({
+        ...domainValidation,
+        decision: !domainValidation.decision,
+      }),
+      false,
+      "the stable record hash must detect a changed review decision",
+    );
+    assert.equal(
+      verifyScienceDomainValidationRecordHash({
+        ...domainValidation,
+        revision: domainValidation.revision + 1,
+      }),
+      false,
+      "the stable record hash must bind the candidate-run revision",
+    );
+    const validationAudits = await handle.db.execute(sql`
+      SELECT actor_kind, actor_id, action, target
+        FROM audit_log
+       WHERE target = ${`science_domain_validations:${domainValidation.id}`}
+    `);
+    assert.deepEqual(validationAudits.rows ?? validationAudits, [{
+      actor_kind: "system",
+      actor_id: "science-db",
+      action: "science.db.insert",
+      target: `science_domain_validations:${domainValidation.id}`,
+    }], "direct repository writes retain the explicit database-system fallback audit");
+    const validationHeadResult = await handle.db.execute(sql`
+      SELECT id, workspace_id, run_id, kind, scope_baseline_run_id,
+             validation_id, revision, record_hash, head_hash
+        FROM science_domain_validation_heads
+       WHERE workspace_id = ${workspaceA.id}
+         AND run_id = ${succeeded.id}
+         AND kind = 'domain-validation'
+         AND scope_baseline_run_id = ${succeeded.id}
+    `);
+    const [validationHead] = validationHeadResult.rows ?? validationHeadResult;
+    assert.equal(validationHead.validation_id, domainValidation.id);
+    assert.equal(Number(validationHead.revision), 1);
+    assert.equal(validationHead.record_hash, domainValidation.recordHash);
+    assert.match(validationHead.head_hash, /^[0-9a-f]{64}$/);
+    const validationHeadAudits = await handle.db.execute(sql`
+      SELECT actor_kind, actor_id, action, target, detail
+        FROM audit_log
+       WHERE target = ${`science_domain_validation_heads:${validationHead.id}`}
+    `);
+    assert.deepEqual(validationHeadAudits.rows ?? validationHeadAudits, [{
+      actor_kind: "system",
+      actor_id: "science-db",
+      action: "science.db.insert",
+      target: `science_domain_validation_heads:${validationHead.id}`,
+      detail: {
+        operation: "insert",
+        table: "science_domain_validation_heads",
+        validationId: domainValidation.id,
+        revision: 1,
+        recordHash: domainValidation.recordHash,
+        headHash: validationHead.head_hash,
+      },
+    }], "the mutable scope head must retain its own atomic integrity trail");
+    const validationPage = await listScienceDomainValidations(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: succeeded.id,
+      page: { offset: 0, limit: 10 },
+    });
+    assert.deepEqual(validationPage.items.map((entry) => entry.id), [domainValidation.id]);
+    assert.deepEqual(
+      Object.keys(validationPage.items[0]).sort(),
+      [
+        "baselineManifestHash",
+        "baselineRunId",
+        "createdAt",
+        "decision",
+        "id",
+        "kind",
+        "limitationsReason",
+        "methodProtocolId",
+        "metric",
+        "observedValue",
+        "recordHash",
+        "reviewerId",
+        "reviewerRole",
+        "revision",
+        "runId",
+        "runManifestHash",
+        "tolerance",
+        "units",
+      ].sort(),
+      "validation pages must be strict bounded summaries without checksum arrays",
+    );
+    assert.deepEqual(
+      await getScienceDomainValidationForRun(handle.db, {
+        workspaceId: workspaceA.id,
+        runId: succeeded.id,
+        validationId: domainValidation.id,
+      }),
+      domainValidation,
+      "one-record detail retains the immutable checksum bindings",
+    );
+    const concurrentValidations = await Promise.all([false, true].map((decision, index) =>
+      createScienceDomainValidation(handle.db, {
+        workspaceId: workspaceA.id,
+        runId: succeeded.id,
+        reviewerId: user.id,
+        reviewerRole: "owner",
+        kind: "domain-validation",
+        metric: `synthetic-concurrent-${index}`,
+        tolerance: 0,
+        observedValue: index,
+        units: "count",
+        methodProtocolId: "synthetic-lifecycle-protocol/v1",
+        decision,
+        limitationsReason: "Synthetic lifecycle fixture; not release or domain evidence.",
+      })
+    ));
+    assert.deepEqual(
+      concurrentValidations.map((entry) => entry.revision).sort((left, right) => left - right),
+      [2, 3],
+      "the candidate-run lock must serialize concurrent positive revisions",
+    );
+    const revisedValidationPage = await listScienceDomainValidations(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: succeeded.id,
+      page: { offset: 0, limit: 10 },
+    });
+    assert.deepEqual(
+      revisedValidationPage.items.map((entry) => entry.revision),
+      [3, 2, 1],
+      "summary order must use revision rather than display time",
+    );
+    const latestDomainValidation = concurrentValidations.reduce((latest, entry) =>
+      entry.revision > latest.revision ? entry : latest
+    );
+    const advancedHeadResult = await handle.db.execute(sql`
+      SELECT id, validation_id, revision, record_hash, head_hash
+        FROM science_domain_validation_heads
+       WHERE workspace_id = ${workspaceA.id}
+         AND run_id = ${succeeded.id}
+         AND kind = 'domain-validation'
+         AND scope_baseline_run_id = ${succeeded.id}
+    `);
+    const [advancedHead] = advancedHeadResult.rows ?? advancedHeadResult;
+    assert.equal(advancedHead.id, validationHead.id, "head identity must stay stable as it advances");
+    assert.equal(advancedHead.validation_id, latestDomainValidation.id);
+    assert.equal(Number(advancedHead.revision), 3);
+    assert.equal(advancedHead.record_hash, latestDomainValidation.recordHash);
+    assert.notEqual(advancedHead.head_hash, validationHead.head_hash);
+    const advancedHeadAudits = await handle.db.execute(sql`
+      SELECT action
+        FROM audit_log
+       WHERE target = ${`science_domain_validation_heads:${advancedHead.id}`}
+       ORDER BY created_at
+    `);
+    assert.deepEqual(
+      (advancedHeadAudits.rows ?? advancedHeadAudits).map((entry) => entry.action),
+      ["science.db.insert", "science.db.update", "science.db.update"],
+      "each monotonic scope-head advance must be actor-attributed atomically",
+    );
+
+    await handle.db.execute(sql.raw("DROP TABLE science_domain_validation_heads"));
+    await handle.db.execute(sql.raw(
+      "DELETE FROM schema_migrations WHERE version = 13",
+    ));
+    await migrate(handle);
+    const rebuiltHeadResult = await handle.db.execute(sql`
+      SELECT id, validation_id, revision, record_hash, head_hash
+        FROM science_domain_validation_heads
+       WHERE workspace_id = ${workspaceA.id}
+         AND run_id = ${succeeded.id}
+         AND kind = 'domain-validation'
+         AND scope_baseline_run_id = ${succeeded.id}
+    `);
+    const [rebuiltHead] = rebuiltHeadResult.rows ?? rebuiltHeadResult;
+    assert.equal(rebuiltHead.id, advancedHead.id, "v12 backfill must derive deterministic scope identity");
+    assert.equal(rebuiltHead.validation_id, latestDomainValidation.id);
+    assert.equal(Number(rebuiltHead.revision), 3);
+    assert.equal(rebuiltHead.record_hash, latestDomainValidation.recordHash);
+    assert.match(rebuiltHead.head_hash, /^[0-9a-f]{64}$/);
+    const v13LedgerResult = await handle.db.execute(sql.raw(
+      "SELECT name, count(*) AS copies FROM schema_migrations WHERE version = 13 GROUP BY name",
+    ));
+    const [v13Ledger] = v13LedgerResult.rows ?? v13LedgerResult;
+    assert.deepEqual({ name: v13Ledger.name, copies: Number(v13Ledger.copies) }, {
+      name: "science-domain-validation-scope-heads",
+      copies: 1,
+    }, "a populated rewritten-v12 schema must upgrade and backfill deterministically");
+    await expectConflict(
+      () => createScienceDomainValidation(handle.db, {
+        workspaceId: workspaceB.id,
+        runId: succeeded.id,
+        reviewerId: user.id,
+        reviewerRole: "owner",
+        kind: "domain-validation",
+        metric: "synthetic-output-count",
+        tolerance: 0,
+        observedValue: succeeded.manifest.outputs.length,
+        units: "count",
+        methodProtocolId: "synthetic-lifecycle-protocol/v1",
+        decision: true,
+        limitationsReason: "Synthetic lifecycle fixture; not release or domain evidence.",
+      }),
+      /does not exist in workspace/i,
+    );
+    assert.deepEqual(await listScienceDomainValidations(handle.db, {
+      workspaceId: workspaceB.id,
+      runId: succeeded.id,
+      page: { offset: 0, limit: 10 },
+    }), { items: [], nextOffset: null });
+    assert.equal(await getScienceDomainValidationForRun(handle.db, {
+      workspaceId: workspaceB.id,
+      runId: succeeded.id,
+      validationId: domainValidation.id,
+    }), null, "validation detail must not cross workspace scope");
+    await assert.rejects(
+      () => handle.db.execute(sql`
+        UPDATE science_domain_validations
+           SET decision = false
+         WHERE id = ${domainValidation.id}
+      `),
+      /append-only/i,
+    );
+    const immutableValidationAudits = await handle.db.execute(sql`
+      SELECT count(*) AS copies
+        FROM audit_log
+       WHERE target = ${`science_domain_validations:${domainValidation.id}`}
+    `);
+    assert.equal(
+      Number((immutableValidationAudits.rows ?? immutableValidationAudits)[0].copies),
+      1,
+      "rejected append-only mutations must roll back their generic audit rows",
+    );
+    await assert.rejects(
+      () => handle.db.execute(sql`
+        DELETE FROM science_domain_validations
+         WHERE id = ${domainValidation.id}
+      `),
+      /append-only/i,
+    );
     await expectConflict(
       () =>
         linkScienceRunArtifact(handle.db, {
@@ -1533,10 +2016,22 @@ async function verifyLifecycle(databaseUrl) {
     assert.equal(await countActiveScienceRuns(handle.db, workspaceA.id), 0);
 
     const renderBase = Date.now();
+    const renderReplayFields = (requestKeyHash) => ({
+      requestKeyHash,
+      intentFingerprint: requestKeyHash,
+      providerKind: "static",
+      mode: "static",
+      sourceSha256: outputVersion.sha256,
+      sourceMediaType: outputVersion.mediaType,
+      sourceSizeBytes: outputVersion.sizeBytes,
+      sourceLogicalName: outputArtifact.logicalName,
+      replayExpiresAt: new Date(renderBase + 24 * 60 * 60_000),
+    });
     const render = await createScienceRenderSession(handle.db, {
       workspaceId: workspaceA.id,
       runId: createdRun.run.id,
       artifactVersionId: outputVersion.id,
+      ...renderReplayFields(TOKEN_RENDER),
       tokenHash: TOKEN_RENDER,
       audience: "science-render-verification",
       ownerId: user.id,
@@ -1572,6 +2067,7 @@ async function verifyLifecycle(databaseUrl) {
       () => createScienceRenderSession(handle.db, {
         workspaceId: workspaceA.id,
         artifactVersionId: outputVersion.id,
+        ...renderReplayFields("7".repeat(64)),
         tokenHash: "7".repeat(64),
         audience: "science-render-over-quota-verification",
         ownerId: user.id,
@@ -1594,6 +2090,7 @@ async function verifyLifecycle(databaseUrl) {
     const liveRender = await createScienceRenderSession(handle.db, {
       workspaceId: workspaceA.id,
       artifactVersionId: outputVersion.id,
+      ...renderReplayFields(TOKEN_RENDER_LIVE),
       tokenHash: TOKEN_RENDER_LIVE,
       audience: "science-render-live-verification",
       ownerId: user.id,
@@ -1603,6 +2100,7 @@ async function verifyLifecycle(databaseUrl) {
     const terminalRender = await createScienceRenderSession(handle.db, {
       workspaceId: workspaceA.id,
       artifactVersionId: outputVersion.id,
+      ...renderReplayFields(TOKEN_RENDER_TERMINAL),
       tokenHash: TOKEN_RENDER_TERMINAL,
       audience: "science-render-terminal-verification",
       ownerId: user.id,
@@ -1905,6 +2403,160 @@ async function verifyLifecycle(databaseUrl) {
         abandonedUploadVersionCleanup.some((candidate) => candidate.id === version.id)),
       "artifact cleanup must resume after every matching upload lease has expired",
     );
+
+    const queueRetryAt = new Date(Date.now() + 120_000);
+    assert.equal(await deferScienceUploadCleanup(handle.db, {
+      workspaceId: workspaceA.id,
+      uploadId: quarantinedUpload.upload.id,
+      retryAt: queueRetryAt,
+    }), true);
+    assert.equal(await deferScienceArtifactVersionCleanup(handle.db, {
+      workspaceId: workspaceA.id,
+      versionId: uploadProtectedVersions[0].id,
+      retryAt: queueRetryAt,
+    }), true);
+    assert.equal(await deferScienceRenderSessionCleanup(handle.db, {
+      workspaceId: workspaceA.id,
+      sessionId: terminalRender.session.id,
+      retryAt: queueRetryAt,
+    }), true);
+
+    const actionRun = await createScienceRun(handle.db, {
+      workspaceId: workspaceA.id,
+      studyId: study.id,
+      computeProfileId: profile.id,
+      resourceRequest: RESOURCE_REQUEST,
+      idempotencyKey: "admin-action-queue-run",
+      inputs: [{ artifactVersionId: inputVersion.id, semanticRole: "mesh" }],
+      createdBy: user.id,
+    });
+    const actionApproval = await requestScienceRunApproval(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: actionRun.run.id,
+      expectedGeneration: 0,
+      prompt: "Approve admin action queue fixture",
+    });
+    await resolveScienceRunApproval(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: actionRun.run.id,
+      expectedGeneration: 0,
+      approvalId: actionApproval.approval.id,
+      decision: "approved",
+      maxActiveRuns: 1,
+    });
+    const actionClaim = await claimScienceRun(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: actionRun.run.id,
+      expectedGeneration: 0,
+    });
+    const actionLeaseOwner = "admin-action-queue-worker";
+    await acquireScienceRunLease(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: actionRun.run.id,
+      expectedGeneration: actionClaim.executionGeneration,
+      leaseOwner: actionLeaseOwner,
+      leaseExpiresAt: new Date(Date.now() + 120_000),
+    });
+    await transitionScienceRun(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: actionRun.run.id,
+      expectedGeneration: actionClaim.executionGeneration,
+      leaseOwner: actionLeaseOwner,
+      to: "cancelling",
+      eventPayload: {
+        attempt: 5,
+        orphaned: true,
+        adminActionRequired: true,
+      },
+    });
+
+    const foreignQueueStudy = await createScienceStudy(handle.db, {
+      workspaceId: workspaceB.id,
+      name: "Foreign admin action queue study",
+      createdBy: user.id,
+    });
+    const foreignQueueArtifact = await createScienceArtifact(handle.db, {
+      workspaceId: workspaceB.id,
+      studyId: foreignQueueStudy.id,
+      logicalName: "foreign-queue.bin",
+      kind: "dataset",
+      format: "binary",
+      createdBy: user.id,
+    });
+    const foreignQueueUpload = await beginScienceUpload(handle.db, {
+      workspaceId: workspaceB.id,
+      artifactId: foreignQueueArtifact.id,
+      tokenHash: "5".repeat(64),
+      expectedSizeBytes: 0,
+      expectedSha256: SHA_CHILD,
+      quarantineKey: "quarantine/foreign-admin-action-queue",
+      expiresAt: new Date(Date.now() + 120_000),
+      maxWorkspaceStorageBytes: WORKSPACE_STORAGE_LIMIT,
+    });
+    await quarantineScienceUpload(handle.db, {
+      workspaceId: workspaceB.id,
+      tokenHash: foreignQueueUpload.upload.tokenHash,
+      error: "foreign queue fixture",
+    });
+
+    const actionQueue = await listScienceAdminActionQueue(handle.db, {
+      workspaceId: workspaceA.id,
+      page: { offset: 0, limit: 200 },
+      now: new Date(),
+    });
+    const actionQueueById = new Map(actionQueue.items.map((item) => [item.id, item]));
+    assert.equal(actionQueueById.get(actionRun.run.id)?.kind, "run");
+    assert.equal(actionQueueById.get(actionRun.run.id)?.attempts, 5);
+    assert.equal(
+      actionQueueById.get(quarantinedUpload.upload.id)?.kind,
+      "upload_reservation",
+    );
+    assert.equal(
+      actionQueueById.get(uploadProtectedVersions[0].id)?.kind,
+      "artifact_version",
+    );
+    assert.equal(
+      actionQueueById.get(terminalRender.session.id)?.kind,
+      "render_session",
+    );
+    assert.equal(
+      actionQueueById.has(foreignQueueUpload.upload.id),
+      false,
+      "action queue must not cross workspace ownership",
+    );
+    const firstActionPage = await listScienceAdminActionQueue(handle.db, {
+      workspaceId: workspaceA.id,
+      page: { offset: 0, limit: 2 },
+      now: new Date(),
+    });
+    assert.equal(firstActionPage.items.length, 2);
+    assert.equal(firstActionPage.nextOffset, 2);
+    const secondActionPage = await listScienceAdminActionQueue(handle.db, {
+      workspaceId: workspaceA.id,
+      page: { offset: firstActionPage.nextOffset, limit: 2 },
+      now: new Date(),
+    });
+    assert.deepEqual(
+      [...firstActionPage.items, ...secondActionPage.items].map((item) => item.id),
+      actionQueue.items.map((item) => item.id),
+      "global queue pagination must be stable across heterogeneous resource kinds",
+    );
+
+    await transitionScienceRun(handle.db, {
+      workspaceId: workspaceA.id,
+      runId: actionRun.run.id,
+      expectedGeneration: actionClaim.executionGeneration,
+      leaseOwner: actionLeaseOwner,
+      to: "cancelled",
+    });
+    assert.equal(await deleteExpiredScienceUploadAfterDiscard(handle.db, {
+      workspaceId: workspaceA.id,
+      uploadId: quarantinedUpload.upload.id,
+    }), true);
+    assert.ok(await tombstoneTerminalScienceRenderSessionAfterClose(handle.db, {
+      workspaceId: workspaceA.id,
+      sessionId: terminalRender.session.id,
+    }));
     for (const version of uploadProtectedVersions) {
       assert.equal(
         await deleteExpiredScienceArtifactVersionAfterDiscard(handle.db, {
@@ -1912,6 +2564,24 @@ async function verifyLifecycle(databaseUrl) {
           versionId: version.id,
         }),
         true,
+      );
+    }
+    const resolvedActionQueue = await listScienceAdminActionQueue(handle.db, {
+      workspaceId: workspaceA.id,
+      page: { offset: 0, limit: 200 },
+      now: new Date(),
+    });
+    const resolvedActionIds = new Set(resolvedActionQueue.items.map((item) => item.id));
+    for (const resolvedId of [
+      actionRun.run.id,
+      quarantinedUpload.upload.id,
+      uploadProtectedVersions[0].id,
+      terminalRender.session.id,
+    ]) {
+      assert.equal(
+        resolvedActionIds.has(resolvedId),
+        false,
+        "resolved or historical action markers must not remain active",
       );
     }
 
@@ -1947,5 +2617,6 @@ async function verifyLifecycle(databaseUrl) {
 
 await verifyLegacyUpgrade();
 await verifyMigrationRollbackIsAtomic();
+await verifyRewrittenV12DriftIsRejected();
 const driver = await verifyLifecycle(process.env.SCIENCE_TEST_DATABASE_URL);
 console.log(`science lifecycle (${driver}): ok`);

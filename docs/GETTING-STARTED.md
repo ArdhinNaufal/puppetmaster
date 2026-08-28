@@ -8,7 +8,7 @@ It has three layers, so you can read as deep as you need:
 
 - **Part 1 — Install & run.** Get it running on your own machine in about 15 minutes.
 - **Part 2 — The big picture.** The handful of ideas everything else is built from.
-- **Part 3 — Everything it can do.** A guided tour of all eleven screens and every feature,
+- **Part 3 — Everything it can do.** A guided tour of the main screens and major features,
   one section at a time, with screenshots.
 - **Part 4 — Reference.** Two hands-on test drives, the demo dataset, making your data
   permanent, connecting real AI, the full settings list, troubleshooting, and a glossary.
@@ -144,25 +144,27 @@ and each agent has an *autonomy tier* that caps what it can do without asking.
 
 # Part 3 — Everything it can do
 
-## The eleven screens
+## The main screens
 
-Across the top of the app is a bar of eleven screens ("views"). Press its number (1–9, then
-the last two) or click it. **Ctrl+K** (Mac: **Cmd+K**) opens a command bar that can reach
-any of them by keyboard.
+Across the top of the app is a bar of views. Availability depends on your
+workspace role. Click a view or use **Ctrl+K** (Mac: **Cmd+K**) to find a
+permitted destination by keyboard.
 
 | # | Screen | What it's for |
 |---|--------|---------------|
 | 1 | **NEXUS** | The live operations dashboard — one figure showing your whole system in motion |
 | 2 | **COMMAND** | Chat with agents |
 | 3 | **CANVAS** | Build and run workflows visually |
-| 4 | **WORKSHOP** | Build software under verifiable quality gates |
-| 5 | **TEMPLATES** | Ready-made agents and workflows to clone |
-| 6 | **KNOWLEDGE** | Upload documents your agents can search and cite |
-| 7 | **MISSIONS** | The history and live status of every run |
-| 8 | **AGENTS** | The roster; inspect and tune each agent |
-| 9 | **TOOLS** | The tool catalog and MCP server management |
-| 10 | **EVALS** | Quality tests, cost tracking, budgets, and the model router |
-| 11 | **ADMIN** | Members, roles, branding, and the audit log |
+| 4 | **SCIENCE OPERATIONS** | Version scientific inputs, approve runs, inspect exact static results, and retain provenance |
+| 5 | **WORKSHOP** | Build software under verifiable quality gates |
+| 6 | **CLAUDE** | Plan and execute approved coding work in an isolated workbench |
+| 7 | **TEMPLATES** | Ready-made agents and workflows to clone |
+| 8 | **KNOWLEDGE** | Upload documents your agents can search and cite |
+| 9 | **MISSIONS** | The history and live status of every run |
+| 10 | **AGENTS** | The roster; inspect and tune each agent |
+| 11 | **TOOLS** | The tool catalog and MCP server management |
+| 12 | **EVALS** | Quality tests, cost tracking, budgets, and the model router |
+| 13 | **ADMIN** | Members, roles, branding, and the audit log |
 
 The screenshots below come from the built-in **demo dataset** (a fictional "Acme
 Operations" company) so you can see each screen full of realistic data. Part 4 shows how to
@@ -225,6 +227,30 @@ Other things on this screen:
 - **SAVE / ▶ RUN** — every save creates a new **version**; RUN starts a mission with the
   JSON input in the box next to it. The right-hand **OPERATION** panel then shows the run
   tracing through your graph live.
+
+## SCIENCE OPERATIONS — controlled scientific work
+
+SCIENCE OPERATIONS is a gated control plane for studies, immutable artifact
+versions, approved runs, manifests, comparisons, human review, and bounded
+result inspection. It accepts only `non_regulated` data in the current slice.
+
+The locally released tutorial path can:
+
+1. create a study and upload immutable inputs;
+2. submit and approve work through the deterministic fixture provider;
+3. wait durably for the exact Science run, even across server recovery;
+4. require a human to approve one exact checksummed PNG output;
+5. display that source through a replay-safe same-origin static session; and
+6. read the complete provenance manifest and append an immutable admin/owner
+   review.
+
+The fixture PNG is data-derived but labelled `fixturePreview=true` and
+`productionCompute=false`. The uploaded notebook is not executed. Jupyter
+Enterprise Gateway execution, live rootless OCI execution, trame remote
+rendering, and OCCT tessellation are not released. The original Science MVP and
+production release remain **NOT MET**. Follow the
+[Science Operations user guide](./science/user-guide.md) for the nontechnical
+walkthrough and beginner API examples.
 
 ## 4. WORKSHOP — build software under quality gates
 
@@ -626,9 +652,10 @@ them in a self-contained box.
    ```
 
 Now everything survives restarts, **and** scheduled (cron) triggers work. There is also an
-all-in-one `docker compose -f docker/docker-compose.yml up --build` for the API, Postgres, and
-Redis. That API container does not include the web app or access to a Docker daemon, so it cannot
-host CLAUDE workbenches; run the server on the host as shown above when using the CLAUDE page.
+all-in-one `docker compose -f docker/docker-compose.yml up --build` for the same-origin web
+gateway, API, Postgres, and Redis. Open `http://127.0.0.1:4000/`; the API is not published on a
+second host port. The API container still has no Docker-daemon access, so it cannot host CLAUDE
+workbenches; run the server on the host as shown above when using the CLAUDE page.
 
 ## Connect real AI
 

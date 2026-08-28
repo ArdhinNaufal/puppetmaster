@@ -671,7 +671,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     ),
   };
 
-  const missionLive = mission !== null && ["queued", "running", "awaiting_approval"].includes(mission.status);
+  const missionLive = mission !== null && ["queued", "running", "waiting", "awaiting_approval"].includes(mission.status);
   // NEXUS is the whole theater: the shell's side/operation panels give way to
   // the stage — their content lives on as docked task panes (docs/NEXUS.md §3).
   const stageSolo = view === "nexus" || view === "science";

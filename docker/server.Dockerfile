@@ -12,4 +12,5 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /app .
 EXPOSE 4000
+USER node
 CMD ["node", "apps/server/dist/bootstrap.js"]

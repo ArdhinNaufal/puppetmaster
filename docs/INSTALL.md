@@ -1,6 +1,6 @@
 # Installing Puppetmaster locally
 
-Two paths: **Docker Compose** (fastest, runs the API + its dependencies in containers) or
+Two paths: **Docker Compose** (fastest, runs the web app, API, and dependencies in containers) or
 **manual dev setup** (runs Postgres/Redis in Docker but the server and web app on your
 machine with hot reload — this is how the project is actually developed).
 
@@ -11,33 +11,64 @@ machine with hot reload — this is how the project is actually developed).
 - **Docker** and **Docker Compose** (for Postgres + Redis and required for CLAUDE/Workshop
   workbenches; not required for an embedded-PGlite quick look with no shell execution)
 
-## Option A — Docker Compose (API only)
+## Option A — Docker Compose (same-origin web + API)
 
-This brings up Postgres (with pgvector), Redis, and the built server container.
+This builds the web app and brings up its unprivileged static gateway, the API,
+Postgres (with pgvector), and Redis. Choose and retain a non-placeholder database
+password before the first start. Read it without echo so the value is not
+stored in shell history; for shared or production deployments, inject it from a
+secret manager instead.
 
 ```bash
 git clone <this-repo-url> puppetmaster
 cd puppetmaster
+read -r -s -p "Postgres password: " POSTGRES_PASSWORD
+printf '\n'
+export POSTGRES_PASSWORD
+docker compose -f docker/docker-compose.yml config --quiet
 docker compose -f docker/docker-compose.yml up --build
+
+# After the stack has stopped:
+unset POSTGRES_PASSWORD
 ```
 
-- API: http://localhost:4000/api/health
-- Postgres: `localhost:5432` (user/db `puppetmaster`, password `puppetmaster` unless you set
-  `POSTGRES_PASSWORD` in your shell before running `up`)
+Use `docker compose config --quiet` for validation. Unqualified
+`docker compose config` renders resolved environment values and can disclose
+secrets in terminal scrollback, logs, or CI artifacts.
+
+- Web app: http://localhost:4000/
+- Same-origin API probe: http://localhost:4000/api/health
+- Postgres: `localhost:5432` (user/db `puppetmaster`; password is the required
+  `POSTGRES_PASSWORD` value)
 - Redis: `localhost:6379`
 
-The web app is **not** built into this compose stack yet — run it separately per Option B's
-web step, pointed at this API (it proxies `/api` to `localhost:4000` by default, so no config
-is needed if you leave the API on its default port).
+Port `4000` terminates at the web gateway. The API container has no host-published
+port; `/api`, `/api/events` WebSocket upgrades, artifact streams, and Science
+render-gateway paths are proxied over the isolated Compose network. To change the
+loopback listener, set `PUPPETMASTER_WEB_BIND_ADDRESS` and
+`PUPPETMASTER_WEB_PORT` before rendering the Compose configuration. Keep the
+default loopback bind when a host TLS reverse proxy fronts Puppetmaster.
 
-This Compose server is also **not a CLAUDE workbench host**. It has neither a Docker client nor
-access to the host Docker daemon, and the service currently passes only its database/Redis
-settings. Run the server on the host via Option B when using the CLAUDE page. Giving an API
-container access to the host Docker socket would be a separate privileged deployment decision,
-not an implicit setup step.
+The web runtime is non-root, read-only, capability-free, and resource-bounded.
+It serves hashed Vite assets with immutable caching, never caches `index.html`,
+and supplies the SPA fallback and browser security policy. It has no Docker
+socket or application credentials.
 
-To stop: `docker compose -f docker/docker-compose.yml down` (add `-v` to also drop the
-Postgres volume).
+The repository's retained local lane built and ran this nginx gateway as
+UID/GID 101 with a read-only root, dropped capabilities, bounded tmpfs/resources,
+and `no-new-privileges`; loopback HTTP and installed-Chrome same-origin
+WebSocket probes passed. This is delivery-boundary evidence, not target TLS,
+load, HA, CVE, or production availability certification.
+
+This Compose server is also **not a CLAUDE workbench host**. It has neither a
+Docker client nor access to the host Docker daemon. Run the server on the host
+via Option B when using the CLAUDE page. Giving an API container access to the
+host Docker socket would be a separate privileged deployment decision, not an
+implicit setup step.
+
+To stop: `docker compose -f docker/docker-compose.yml down` (add `-v` only when
+you intentionally want to delete the named database, queue, and application
+data volumes).
 
 ## Option B — Manual dev setup (recommended for development)
 
@@ -55,7 +86,14 @@ pnpm install
 Use just the two dependency services from the compose file (skip building the server image):
 
 ```bash
+read -r -s -p "Postgres password: " POSTGRES_PASSWORD
+printf '\n'
+export POSTGRES_PASSWORD
+docker compose -f docker/docker-compose.yml config --quiet
 docker compose -f docker/docker-compose.yml up postgres redis
+
+# After the services have stopped:
+unset POSTGRES_PASSWORD
 ```
 
 Or point at any Postgres 14+ / Redis 6+ you already have running — pgvector isn't required
@@ -67,7 +105,10 @@ that step if it's unavailable.
 Put local settings in the repository-root `.env`, export them in the shell, or prefix the run
 command. The `dev` and `start` package commands load the root `.env` before the runtime starts;
 explicit process variables retain precedence. The Compose service does not forward arbitrary
-root `.env` values into its container.
+root `.env` values into its container. The repository ignores `.env`, but do not
+use a repository-local file for production secrets, paste secrets into shell
+history, or attach rendered environment/Compose output to tickets. Prefer the
+deployment secret manager and clear temporary test variables after use.
 
 | Variable       | Default                | Notes                                                   |
 |----------------|-------------------------|----------------------------------------------------------|
@@ -321,6 +362,41 @@ Sessions are HttpOnly-cookie based and live 30 days. Additional users are create
 8. **Signed webhooks:** on a workflow with a webhook trigger, the Canvas shows a **⚿ WEBHOOK**
    box with the URL and HMAC secret; calls to `/api/hooks/:id` must send
    `X-Puppetmaster-Signature: sha256=HMAC_SHA256(secret, body)` or they're rejected 401.
+
+### Science Operations local static workflow
+
+Science Operations is disabled by default. Before enabling it, read the
+[Science installation/configuration guide](./science/installation-and-configuration.md)
+and [Science user guide](./science/user-guide.md). The released local acceptance
+path is deliberately narrow:
+
+1. use only `non_regulated` tutorial data;
+2. enable Science and have an admin/owner record a reasoned workspace admission;
+3. create a deterministic `local_container` profile, study, and ready input;
+4. submit and approve a run;
+5. confirm the generated PNG says `fixturePreview=true` and
+   `productionCompute=false`;
+6. append any synthetic tutorial review through the reviewer FUI while clearly
+   labelling it non-release; and
+7. run **Science: reproducible notebook run** to exercise the durable terminal
+   wait, exact checksummed PNG approval, replay-safe static render, and complete
+   manifest read.
+
+This path does not execute the uploaded notebook. Jupyter Enterprise Gateway is
+an unregistered prerequisite only, the OCI executor is a deterministic
+candidate without live rootless/corpus proof, and trame/OCCT remain NO-GO. The
+original Science MVP and production release are **NOT MET**.
+
+For maintainers, the current deterministic Science aggregate marker is:
+
+```text
+SCIENCE GOLDEN PASS^3: 18 isolated deterministic suites; 34 evidence classes verified on every pass
+```
+
+Fresh build/typecheck and the installed-browser Science gate (4/4) pass.
+Dedicated loopback PostgreSQL 16/16, Redis/AOF restart, and MinIO/S3 adapter
+lanes also pass, but do not replace target TLS/load/HA/SLO/CVE/DR or a named
+domain review.
 
 ### Try the demo dataset
 

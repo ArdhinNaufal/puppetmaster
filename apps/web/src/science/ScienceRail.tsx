@@ -108,7 +108,7 @@ function VirtualChoiceList<T>(props: VirtualChoiceProps<T>) {
 
 function Pager(props: PageControls & { label: string }) {
   return (
-    <div className="sci-pager" aria-label={`${props.label} pagination`}>
+    <div className="sci-pager" role="group" aria-label={`${props.label} pagination`}>
       <Chip tiny disabled={!props.hasPrevious} onClick={props.onPrevious}>‹ PREV</Chip>
       <span>{props.label}</span>
       <Chip tiny disabled={!props.hasNext} onClick={props.onNext}>NEXT ›</Chip>
@@ -269,7 +269,7 @@ export function ScienceRail(props: {
             </label>
             {file && file.size > SCIENCE_CLIENT_HASH_MAX_BYTES && (
               <p className="sci-error" role="alert">
-                This artifact exceeds the bounded browser checksum path. Use the server/S3 ingest path.
+                This artifact exceeds the bounded browser checksum path. Ask an operator to use the documented streaming REST upload contract.
               </p>
             )}
             <HoldButton

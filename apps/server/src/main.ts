@@ -15,6 +15,7 @@ import {
   appendAudit,
   budgetsForAgent,
   checkAndPinToolHash,
+  cancelWorkflowMissionWait,
   createApproval,
   createBudget,
   createMcpServer,
@@ -78,6 +79,8 @@ import {
   listMemories,
   listMissions,
   listPoliciesForAgent,
+  listQueuedGenericMissionsForRecovery,
+  listReadyWorkflowWaits,
   listProjectTraceLinks,
   listTemplates,
   listWorkflows,
@@ -87,6 +90,7 @@ import {
   monthUsageBreakdown,
   recordUsage,
   requestMissionCancel,
+  recoverExpiredWorkflowWaitClaims,
   resetMissionForRetry,
   resolveApproval,
   saveWorkflowVersion,
@@ -110,6 +114,7 @@ import {
   ClaudeCodeRuntime,
   connectMcpServer,
   createAgentInvoker,
+  createWorkspaceMissionDispatcher,
   createEmbedder,
   draftWorkflowGraph,
   explainFailure,
@@ -131,6 +136,7 @@ import {
   registerKbTools,
   registerProjectTools,
   registerScienceTools,
+  assertScienceProductionDeploymentEnv,
   resolveRequiredSections,
   resolveScienceRuntimeConfig,
   sectionCoverage,
@@ -143,6 +149,7 @@ import {
   createArtifactStoreFromEnv,
   createComputeProvidersFromEnv,
   createRenderProvidersFromEnv,
+  createSingleFlightTtlCache,
   InlineScienceScheduler,
   QueueScienceScheduler,
   ScienceDisabledError,
@@ -216,6 +223,7 @@ app.addContentTypeParser("application/json", { parseAs: "string" }, (req, body, 
 });
 
 // --- Kernel wiring -----------------------------------------------------------
+assertScienceProductionDeploymentEnv(process.env);
 const handle: DbHandle = await createDb();
 await migrate(handle);
 const { db } = handle;
@@ -470,7 +478,9 @@ if (
   );
 }
 const scienceSecret =
-  configuredScienceSecret || "puppetmaster-science-development-key-v1";
+  scienceConfig.enabled
+    ? configuredScienceSecret || "puppetmaster-science-development-key-v1"
+    : "puppetmaster-science-development-key-v1";
 const scienceStore = createArtifactStoreFromEnv(process.env, scienceSecret);
 const scienceComputeProviders = createComputeProvidersFromEnv(process.env);
 const scienceRenderProviders = createRenderProvidersFromEnv(process.env);
@@ -541,7 +551,7 @@ if (seededTemplates > 0) app.log.info({ seededTemplates }, "seeded builtin templ
 
 // --- The bridge (ARCHITECTURE.md §3.3) ----------------------------------------
 // Workflow → agent: agent nodes dispatch a task and await the child mission.
-const agentInvoker = createAgentInvoker({ db, runtime: agentRuntime });
+const agentInvoker = createAgentInvoker({ db, workspaceId, runtime: agentRuntime });
 executor.setAgentInvoker(agentInvoker);
 // Agent → workflow: workflows join the shared tool catalog (workflow.list/run/
 // create_draft). Stage 8: agentInvoker also enables agent.ask delegation.
@@ -680,31 +690,72 @@ for (const row of await listMcpServers(db, workspaceId)) {
 }
 
 /** Route a mission to the right executor based on its kind. */
-const dispatch: MissionDispatcher = async (missionId) => {
-  const mission = await getMission(db, missionId);
-  if (!mission) throw new Error(`mission ${missionId} not found`);
-  if (mission.kind === "science") {
-    if (scienceConfig.submissionsEnabled) {
-      const run = await scienceService.getRunByMission(mission.id);
-      if (run && !["succeeded", "failed", "cancelled"].includes(run.state)) {
-        await scienceScheduler.enqueue(run.id, null);
+const dispatch: MissionDispatcher = createWorkspaceMissionDispatcher(
+  db,
+  workspaceId,
+  async (mission) => {
+    const missionId = mission.id;
+    if (mission.kind === "science") {
+      if (scienceConfig.submissionsEnabled) {
+        const run = await scienceService.getRunByMission(mission.id);
+        if (run && !["succeeded", "failed", "cancelled"].includes(run.state)) {
+          await scienceScheduler.enqueue(run.id, null);
+        }
       }
+      // The science scheduler owns provider polling and terminalization. A
+      // generic mission recovery job must hand off and then finish, not execute
+      // a science mission as a workflow graph.
+      return mission.status;
     }
-    // The science scheduler owns provider polling and terminalization. A
-    // generic mission recovery job must hand off and then finish, not execute
-    // a science mission as a workflow graph.
-    return mission.status;
-  }
-  return mission.kind === "agent"
-    ? agentRuntime.runMission(missionId)
-    : mission.kind === "claude"
-      ? claudeRuntime.runMission(missionId)
-      : executor.runMission(missionId);
-};
+    return mission.kind === "agent"
+      ? agentRuntime.runMission(missionId)
+      : mission.kind === "claude"
+        ? claudeRuntime.runMission(missionId)
+        : executor.runMission(missionId);
+  },
+);
 
 const runner: WorkflowRunner = REDIS_URL
-  ? new QueueRunner(REDIS_URL, { run: dispatch, db })
+  ? new QueueRunner(REDIS_URL, { run: dispatch, db, workspaceId })
   : new InlineRunner(dispatch);
+
+const QUEUED_MISSION_RECOVERY_LIMIT = 500;
+async function recoverQueuedWorkspaceMissions(): Promise<number> {
+  const queued = await listQueuedGenericMissionsForRecovery(db, {
+    workspaceId,
+    limit: QUEUED_MISSION_RECOVERY_LIMIT + 1,
+  });
+  if (queued.length > QUEUED_MISSION_RECOVERY_LIMIT) {
+    throw new Error(
+      `more than ${QUEUED_MISSION_RECOVERY_LIMIT} queued workflow/agent/Claude missions require recovery`,
+    );
+  }
+  for (const mission of queued) {
+    await runner.enqueue(mission.id, `startup-queued-${mission.id}`);
+  }
+  return queued.length;
+}
+
+async function wakeReadyWorkflowWaits(runId?: string): Promise<{
+  recoveredClaims: number;
+  enqueued: number;
+}> {
+  const recovered = runId
+    ? []
+    : await recoverExpiredWorkflowWaitClaims(db, { workspaceId, limit: 500 });
+  const ready = await listReadyWorkflowWaits(db, { workspaceId, runId, limit: 500 });
+  for (const wait of ready) {
+    await runner.enqueue(
+      wait.missionId,
+      `workflow-wait-${wait.id}-${wait.generation}`,
+    );
+  }
+  return { recoveredClaims: recovered.length, enqueued: ready.length };
+}
+
+scienceService.attachWorkflowWaitWaker(async (runId) => {
+  await wakeReadyWorkflowWaits(runId);
+});
 
 app.log.info(
   {
@@ -723,33 +774,53 @@ app.log.info(
   "puppetmaster kernel ready",
 );
 const scienceRecovery = await scienceService.reconcile();
+const workflowWaitRecovery = await wakeReadyWorkflowWaits();
+const queuedMissionRecovery = await recoverQueuedWorkspaceMissions();
 if (
   scienceRecovery.enqueued > 0 ||
   scienceRecovery.expiredUploads > 0 ||
   scienceRecovery.expiredArtifactVersions > 0 ||
-  scienceRecovery.expiredRenderSessions > 0
+  scienceRecovery.expiredRenderSessions > 0 ||
+  workflowWaitRecovery.recoveredClaims > 0 ||
+  workflowWaitRecovery.enqueued > 0 ||
+  queuedMissionRecovery > 0
 ) {
-  app.log.info(scienceRecovery, "reconciled Science Operations durable state");
+  app.log.info(
+    {
+      ...scienceRecovery,
+      workflowWaits: workflowWaitRecovery,
+      queuedMissionRecovery,
+    },
+    "reconciled Science Operations durable state",
+  );
 }
 const scienceReconcilePeriodMs = Math.max(
   5_000,
   Math.min(60_000, Math.floor(scienceConfig.uploadTtlSeconds * 500)),
 );
 let scienceReconcilePromise: Promise<void> | null = null;
-const scienceReconcileTimer = scienceConfig.enabled
-  ? setInterval(() => {
+const scienceReconcileTimer = setInterval(() => {
       if (scienceReconcilePromise) return;
-      scienceReconcilePromise = scienceService
-        .reconcile()
-        .then((result) => {
+      scienceReconcilePromise = (scienceConfig.enabled
+        ? scienceService.reconcile()
+        : Promise.resolve(null))
+        .then(async (result) => {
+          const workflowWaits = await wakeReadyWorkflowWaits();
           if (
-            result.enqueued > 0 ||
-            result.expiredUploads > 0 ||
-            result.expiredArtifactVersions > 0 ||
-            result.expiredRenderSessions > 0 ||
-            result.orphanQuarantineObjects > 0
+            (result && (
+              result.enqueued > 0 ||
+              result.expiredUploads > 0 ||
+              result.expiredArtifactVersions > 0 ||
+              result.expiredRenderSessions > 0 ||
+              result.orphanQuarantineObjects > 0
+            )) ||
+            workflowWaits.recoveredClaims > 0 ||
+            workflowWaits.enqueued > 0
           ) {
-            app.log.info(result, "completed periodic Science durable-state reconciliation");
+            app.log.info(
+              { ...(result ?? {}), workflowWaits },
+              "completed periodic Science durable-state reconciliation",
+            );
           }
         })
         .catch((error) => {
@@ -758,8 +829,7 @@ const scienceReconcileTimer = scienceConfig.enabled
         .finally(() => {
           scienceReconcilePromise = null;
         });
-    }, scienceReconcilePeriodMs)
-  : null;
+    }, scienceReconcilePeriodMs);
 scienceReconcileTimer?.unref?.();
 await scienceScheduler.start();
 await runner.start();
@@ -847,19 +917,10 @@ app.get("/api/health", async () => ({
   version: "0.0.1",
 }));
 
-let readinessCache:
-  | { expiresAt: number; value: Awaited<ReturnType<typeof scienceService.health>> }
-  | null = null;
-async function currentReadiness() {
-  const now = Date.now();
-  if (!readinessCache || readinessCache.expiresAt <= now) {
-    readinessCache = {
-      expiresAt: now + 5_000,
-      value: await scienceService.health(),
-    };
-  }
-  return readinessCache.value;
-}
+const currentReadiness = createSingleFlightTtlCache(
+  () => scienceService.health(),
+  { ttlMs: 5_000 },
+);
 app.get("/api/readiness", async (_request, reply) => {
   const readiness = await currentReadiness();
   return reply.code(readiness.ok ? 200 : 503).send({
@@ -958,7 +1019,9 @@ app.post("/api/templates", async (req, reply) => {
 
   if (body.kind === "workflow") {
     const wf = await getWorkflowWithGraph(db, body.sourceId);
-    if (!wf?.version) return reply.code(404).send({ error: "workflow not found" });
+    if (!wf?.version || wf.workflow.workspaceId !== workspaceId) {
+      return reply.code(404).send({ error: "workflow not found" });
+    }
     const created = await createTemplate(db, {
       workspaceId,
       kind: "workflow",
@@ -971,7 +1034,9 @@ app.post("/api/templates", async (req, reply) => {
   }
   if (body.kind === "agent") {
     const agent = await getAgent(db, body.sourceId);
-    if (!agent) return reply.code(404).send({ error: "agent not found" });
+    if (!agent || agent.workspaceId !== workspaceId) {
+      return reply.code(404).send({ error: "agent not found" });
+    }
     const created = await createTemplate(db, {
       workspaceId,
       kind: "agent",
@@ -1378,6 +1443,16 @@ app.get("/api/suggestions", async () => {
 // --- Workflows ---------------------------------------------------------------
 app.get("/api/workflows", async () => listWorkflows(db, workspaceId));
 
+async function getWorkspaceWorkflow(id: string) {
+  const workflow = await getWorkflow(db, id);
+  return workflow?.workspaceId === workspaceId ? workflow : null;
+}
+
+async function getWorkspaceWorkflowWithGraph(id: string) {
+  const workflow = await getWorkflowWithGraph(db, id);
+  return workflow?.workflow.workspaceId === workspaceId ? workflow : null;
+}
+
 app.post("/api/workflows", async (req, reply) => {
   const body = req.body as { name?: string; graph?: unknown };
   const graph = WorkflowGraph.safeParse(body.graph ?? { nodes: [], edges: [] });
@@ -1392,7 +1467,7 @@ app.post("/api/workflows", async (req, reply) => {
 
 app.get("/api/workflows/:id", async (req, reply) => {
   const { id } = req.params as { id: string };
-  const wf = await getWorkflowWithGraph(db, id);
+  const wf = await getWorkspaceWorkflowWithGraph(id);
   if (!wf) return reply.code(404).send({ error: "workflow not found" });
   return wf;
 });
@@ -1402,6 +1477,9 @@ app.put("/api/workflows/:id", async (req, reply) => {
   const body = req.body as { graph?: unknown };
   const graph = WorkflowGraph.safeParse(body.graph);
   if (!graph.success) return reply.code(400).send({ error: "invalid graph", detail: graph.error.issues });
+  if (!await getWorkspaceWorkflow(id)) {
+    return reply.code(404).send({ error: "workflow not found" });
+  }
   try {
     const version = await saveWorkflowVersion(db, id, graph.data);
     await scheduleCrons(id, graph.data);
@@ -1419,7 +1497,7 @@ app.put("/api/workflows/:id", async (req, reply) => {
 /** Reveal the webhook URL + signing secret (builder+). */
 app.get("/api/workflows/:id/webhook", async (req, reply) => {
   const { id } = req.params as { id: string };
-  const wf = await getWorkflow(db, id);
+  const wf = await getWorkspaceWorkflow(id);
   if (!wf) return reply.code(404).send({ error: "workflow not found" });
   return {
     url: `/api/hooks/${id}`,
@@ -1433,7 +1511,7 @@ app.get("/api/workflows/:id/webhook", async (req, reply) => {
 /** Rotate (or set) the webhook signing secret (builder+). */
 app.post("/api/workflows/:id/webhook/rotate", async (req, reply) => {
   const { id } = req.params as { id: string };
-  const wf = await getWorkflow(db, id);
+  const wf = await getWorkspaceWorkflow(id);
   if (!wf) return reply.code(404).send({ error: "workflow not found" });
   const secret = newWebhookSecret();
   await setWebhookSecret(db, id, secret);
@@ -1468,8 +1546,12 @@ app.post("/api/workflows/lint", async (req) => {
 app.post("/api/workflows/:id/run", async (req, reply) => {
   const { id } = req.params as { id: string };
   const body = (req.body ?? {}) as { input?: unknown };
+  if (!await getWorkspaceWorkflow(id)) {
+    return reply.code(404).send({ error: "workflow not found" });
+  }
   try {
     const mission = await startWorkflow(db, {
+      workspaceId,
       workflowId: id,
       trigger: { mode: "manual", actorId: req.authUser!.id },
       payload: body.input ?? {},
@@ -1485,7 +1567,8 @@ app.post("/api/workflows/:id/run", async (req, reply) => {
 app.post("/api/hooks/:workflowId", async (req, reply) => {
   const { workflowId } = req.params as { workflowId: string };
   // Enforce the HMAC signature when the workflow has a signing secret.
-  const wf = await getWorkflow(db, workflowId);
+  const wf = await getWorkspaceWorkflow(workflowId);
+  if (!wf) return reply.code(404).send({ error: "workflow not found" });
   if (wf?.webhookSecret) {
     const sig = req.headers[WEBHOOK_SIGNATURE_HEADER] as string | undefined;
     const raw = (req as { rawBody?: string }).rawBody ?? "";
@@ -1495,6 +1578,7 @@ app.post("/api/hooks/:workflowId", async (req, reply) => {
   }
   try {
     const mission = await startWorkflow(db, {
+      workspaceId,
       workflowId,
       trigger: { mode: "webhook" },
       payload: req.body ?? {},
@@ -1570,6 +1654,7 @@ app.post("/api/agents/:id/chat", async (req, reply) => {
   if (!body.message?.trim()) return reply.code(400).send({ error: "message is required" });
   try {
     const mission = await startAgentTick(db, {
+      workspaceId,
       agentId: id,
       trigger: { mode: "chat", actorId: req.authUser!.id },
       payload: { message: body.message },
@@ -2032,8 +2117,34 @@ app.post("/api/missions/:id/cancel", async (req, reply) => {
   if (["succeeded", "failed", "cancelled"].includes(mission.status)) {
     return reply.code(409).send({ error: `mission is already ${mission.status}` });
   }
+  const cancelledWait = mission.kind === "workflow"
+    ? await cancelWorkflowMissionWait(db, { missionId: id })
+    : null;
+  if (cancelledWait) {
+    const at = new Date().toISOString();
+    await bus.publish({ type: "mission.finished", missionId: id, status: "cancelled", at });
+    await appendAudit(db, {
+      workspaceId,
+      actorKind: "user",
+      actorId: req.authUser?.id ?? null,
+      actorLabel: req.authUser?.email ?? "unknown",
+      missionId: id,
+      action: "mission.cancel",
+      detail: {
+        immediateRequested: true,
+        processAborted: false,
+        cancelled: true,
+        durableWaitId: cancelledWait.id,
+        childScienceRunCancelled: false,
+      },
+    });
+    return reply.code(202).send({ ok: true, cancelled: true, cancelling: false });
+  }
   await requestMissionCancel(db, id);
-  const immediateRequested = mission.status === "queued" || mission.status === "awaiting_approval";
+  const immediateRequested =
+    mission.status === "queued" ||
+    mission.status === "waiting" ||
+    mission.status === "awaiting_approval";
   const processAborted = mission.kind === "claude" ? await claudeRuntime.cancel(id) : false;
   if (immediateRequested && !processAborted) {
     if (mission.kind === "claude") {

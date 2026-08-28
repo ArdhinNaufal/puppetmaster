@@ -26,6 +26,24 @@ assert.notEqual(
 );
 assert.throws(() => scienceSchedulerJobId("", null), /run ID/);
 assert.throws(() => scienceSchedulerJobId(RUN_ID, -1), /generation/);
+assert.throws(
+  () =>
+    new QueueScienceScheduler(
+      "redis://127.0.0.1:6379",
+      async () => ({ nextPollMs: null }),
+      { queueName: "not:isolated" },
+    ),
+  /queue name/,
+);
+assert.throws(
+  () =>
+    new QueueScienceScheduler(
+      "redis://127.0.0.1:6379",
+      async () => ({ nextPollMs: null }),
+      { queuePrefix: "not:isolated" },
+    ),
+  /queue prefix/,
+);
 
 let attempts = 0;
 const errors = [];

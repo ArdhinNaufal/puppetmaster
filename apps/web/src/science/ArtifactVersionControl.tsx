@@ -94,7 +94,7 @@ export function ArtifactVersionControl(props: {
             <span className="sci-state-note">NO IMMUTABLE VERSIONS</span>
           )}
         </div>
-        <div className="sci-pager" aria-label="Artifact version pagination">
+        <div className="sci-pager" role="group" aria-label="Artifact version pagination">
           <Chip tiny disabled={!props.hasPreviousPage} onClick={props.onPreviousPage}>
             ‹ PREV
           </Chip>
@@ -173,8 +173,8 @@ export function ArtifactVersionControl(props: {
             </label>
             {file && file.size > SCIENCE_CLIENT_HASH_MAX_BYTES && (
               <p className="sci-error" role="alert">
-                This version exceeds the bounded browser checksum path. Use the
-                server/S3 ingest path.
+                This version exceeds the bounded browser checksum path. Ask an operator to use the
+                documented streaming REST upload contract.
               </p>
             )}
             <HoldButton

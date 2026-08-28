@@ -9,8 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { sql } from "../packages/db/node_modules/drizzle-orm/index.js";
+import { canonicalScienceJson } from "../packages/shared/dist/index.js";
 import {
   acquireScienceRunLease,
+  claimScienceUploadTransfer,
+  cleanupExpiredScienceUploads,
   createScienceRun,
   createDb,
   createUser,
@@ -20,6 +23,7 @@ import {
   listScienceRenderSessions,
   migrate,
   probeScienceDatabase,
+  quarantineScienceUpload,
   releaseScienceRunLease,
   setScienceWorkspaceAdmission,
   transitionScienceRenderSession,
@@ -33,6 +37,8 @@ import {
   FilesystemArtifactStore,
   InMemoryEventBus,
   InlineScienceScheduler,
+  RedisEventBus,
+  redisEventBusConnectionOptions,
   RenderProviderRegistry,
   S3CompatibleArtifactStore,
   ScienceService,
@@ -62,6 +68,9 @@ const CONFIG = {
   maxUploadBytes: 8 * 1024 * 1024,
   maxWorkspaceStorageBytes: 64 * 1024 * 1024,
   uploadTtlSeconds: 60,
+  externalUploadAbsoluteTimeoutMs: 60_000,
+  externalUploadIdleTimeoutMs: 10_000,
+  maxConcurrentExternalUploadStreamsPerWorkspace: 4,
   renderTtlSeconds: 60,
   maxConcurrentRunsPerWorkspace: 16,
   maxConcurrentRenderSessionsPerWorkspace: 16,
@@ -101,6 +110,26 @@ function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+async function uploadTransferFence(db, workspaceId, tokenHash) {
+  const result = await db.execute(sql`
+    select transfer_lease_id, transfer_lease_expires_at, external_transfer, updated_at
+      from science_uploads
+     where workspace_id = ${workspaceId}
+       and token_hash = ${tokenHash}
+  `);
+  return (result.rows ?? result)[0] ?? null;
+}
+
+function storeWithWriteOverride(base, writeQuarantine) {
+  return new Proxy(base, {
+    get(target, property) {
+      if (property === "writeQuarantine") return writeQuarantine;
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 async function bytesOf(stream) {
   const chunks = [];
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
@@ -121,6 +150,31 @@ function createRenderRegistry() {
   const registry = new RenderProviderRegistry();
   registry.register(new StaticRenderSessionProvider());
   return registry;
+}
+
+class CountingStaticRenderProvider extends StaticRenderSessionProvider {
+  startCalls = 0;
+  healthCalls = 0;
+  failStarts = 0;
+
+  constructor({ failStarts = 0 } = {}) {
+    super();
+    this.failStarts = failStarts;
+  }
+
+  async start(input, fence) {
+    this.startCalls++;
+    await Promise.resolve();
+    if (this.startCalls <= this.failStarts) {
+      throw new Error("deterministic static launch failure fixture");
+    }
+    return super.start(input, fence);
+  }
+
+  async health() {
+    this.healthCalls++;
+    return super.health();
+  }
 }
 
 function trackQuarantine(base) {
@@ -159,16 +213,17 @@ function createService({
   audit,
   auditEntries,
   publishedEvents,
+  bus,
 }) {
-  const bus = new InMemoryEventBus();
-  bus.subscribe((event) => publishedEvents?.push(event));
+  const eventBus = bus ?? new InMemoryEventBus();
+  if (publishedEvents) eventBus.subscribe((event) => publishedEvents.push(event));
   return new ScienceService({
     db,
     workspaceId,
     store,
     computeProviders,
     renderProviders: renderProviders ?? createRenderRegistry(),
-    bus,
+    bus: eventBus,
     config,
     workerId,
     gatewaySecret: GATEWAY_SECRET,
@@ -709,6 +764,39 @@ class LostSubmitResponseProvider extends DeterministicComputeProvider {
   }
 }
 
+class RepeatedLostSubmitResponseProvider extends DeterministicComputeProvider {
+  constructor(instanceId) {
+    super({ kind: "local_container", provisioningMs: 60_000, runningMs: 60_000 });
+    this.instanceId = instanceId;
+    this.submitCalls = 0;
+    this.cancelCalls = 0;
+    this.responsesUnavailable = true;
+    this.acceptedHandle = null;
+    this.cancelledHandle = null;
+  }
+
+  async submit(input, fence) {
+    this.submitCalls++;
+    const result = await super.submit(input, fence);
+    this.acceptedHandle ??= result.handle;
+    assert.equal(result.handle, this.acceptedHandle, "idempotent retry must recover the exact execution");
+    if (this.responsesUnavailable) {
+      throw new Error("fixture repeatedly lost the accepted submit response");
+    }
+    return result;
+  }
+
+  async cancel(handle, generation, fence) {
+    this.cancelCalls++;
+    this.cancelledHandle = handle;
+    return super.cancel(handle, generation, fence);
+  }
+
+  restoreResponses() {
+    this.responsesUnavailable = false;
+  }
+}
+
 class LongHandleRenderProvider {
   constructor(handleLength, {
     instanceId = "render-a",
@@ -1086,6 +1174,650 @@ try {
     assert.deepEqual(await bytesOf(opened.body), Buffer.alloc(0));
   });
 
+  await acceptance(
+    "external deadline aborts and settles a store that never pulls request bytes",
+    async () => {
+      let storeSettled = false;
+      let storePulls = 0;
+      const neverPullStore = storeWithWriteOverride(
+        store,
+        async (_quarantineKey, _body, opts) => {
+          assert.ok(opts.signal, "external writes must supply an abort signal");
+          try {
+            await new Promise((_resolve, reject) => {
+              const abort = () => reject(opts.signal.reason);
+              if (opts.signal.aborted) abort();
+              else opts.signal.addEventListener("abort", abort, { once: true });
+            });
+            assert.fail("never-pull store unexpectedly completed");
+          } finally {
+            storeSettled = true;
+          }
+        },
+      );
+      const service = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store: neverPullStore,
+        computeProviders: createComputeRegistry(),
+        config: {
+          ...CONFIG,
+          externalUploadAbsoluteTimeoutMs: 500,
+          externalUploadIdleTimeoutMs: 60,
+          maxConcurrentExternalUploadStreamsPerWorkspace: 2,
+        },
+        workerId: "acceptance-external-upload-never-pull-store",
+      });
+      const artifact = await service.createArtifact({
+        studyId: study.id,
+        logicalName: "external-upload-never-pull-store.bin",
+        kind: "dataset",
+        format: "binary",
+        actorId: owner.id,
+      });
+      const byte = Buffer.from("x");
+      const upload = await service.beginUpload({
+        artifactId: artifact.id,
+        expectedSizeBytes: byte.length,
+        expectedSha256: digest(byte),
+        actorId: owner.id,
+      });
+      let iteratorFactoryCalls = 0;
+      let iteratorReturnCalls = 0;
+      let transportDestroyCalls = 0;
+      const requestBody = {
+        destroy() {
+          transportDestroyCalls++;
+        },
+        [Symbol.asyncIterator]() {
+          iteratorFactoryCalls++;
+          return {
+            next() {
+              storePulls++;
+              return Promise.resolve({ value: byte, done: false });
+            },
+            return() {
+              iteratorReturnCalls++;
+              return Promise.resolve({ done: true });
+            },
+          };
+        },
+      };
+      const startedAt = Date.now();
+      await assert.rejects(
+        service.writeUpload(upload.uploadToken, requestBody, owner.id),
+        /idle deadline of 60 ms/i,
+      );
+      assert.ok(Date.now() - startedAt < 1_000);
+      assert.equal(storeSettled, true, "durable quarantine raced the store writer");
+      assert.equal(storePulls, 0, "never-pull fixture unexpectedly consumed bytes");
+      assert.equal(iteratorFactoryCalls, 1);
+      assert.equal(iteratorReturnCalls, 1);
+      assert.equal(transportDestroyCalls, 1);
+      const persisted = await getScienceUploadByTokenHash(
+        dbHandle.db,
+        workspaceA.id,
+        digest(upload.uploadToken),
+      );
+      assert.equal(persisted?.state, "quarantined");
+      assert.ok(persisted && persisted.expiresAt.getTime() <= Date.now());
+    },
+  );
+
+  await acceptance(
+    "external idle deadline aborts a store stalled after its first chunk",
+    async () => {
+      let storeSettled = false;
+      let firstChunk = null;
+      const stalledStore = storeWithWriteOverride(
+        store,
+        async (_quarantineKey, body, opts) => {
+          assert.ok(opts.signal);
+          const iterator = body[Symbol.asyncIterator]();
+          try {
+            const first = await iterator.next();
+            assert.equal(first.done, false);
+            firstChunk = Buffer.from(first.value);
+            await new Promise((_resolve, reject) => {
+              const abort = () => reject(opts.signal.reason);
+              if (opts.signal.aborted) abort();
+              else opts.signal.addEventListener("abort", abort, { once: true });
+            });
+            assert.fail("post-first-chunk store unexpectedly resumed");
+          } finally {
+            await iterator.return?.();
+            storeSettled = true;
+          }
+        },
+      );
+      const service = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store: stalledStore,
+        computeProviders: createComputeRegistry(),
+        config: {
+          ...CONFIG,
+          externalUploadAbsoluteTimeoutMs: 500,
+          externalUploadIdleTimeoutMs: 70,
+          maxConcurrentExternalUploadStreamsPerWorkspace: 2,
+        },
+        workerId: "acceptance-external-upload-store-drain-stall",
+      });
+      const artifact = await service.createArtifact({
+        studyId: study.id,
+        logicalName: "external-upload-store-drain-stall.bin",
+        kind: "dataset",
+        format: "binary",
+        actorId: owner.id,
+      });
+      const bytes = Buffer.from("drain-stall");
+      const upload = await service.beginUpload({
+        artifactId: artifact.id,
+        expectedSizeBytes: bytes.length,
+        expectedSha256: digest(bytes),
+        actorId: owner.id,
+      });
+      let nextCalls = 0;
+      let returnCalls = 0;
+      const body = {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next() {
+          nextCalls++;
+          if (nextCalls === 1) {
+            return Promise.resolve({ value: bytes, done: false });
+          }
+          return new Promise(() => {});
+        },
+        return() {
+          returnCalls++;
+          return Promise.resolve({ done: true });
+        },
+      };
+      const startedAt = Date.now();
+      await assert.rejects(
+        service.writeUpload(upload.uploadToken, body, owner.id),
+        /idle deadline of 70 ms/i,
+      );
+      assert.ok(Date.now() - startedAt < 1_000);
+      assert.deepEqual(firstChunk, bytes);
+      assert.equal(storeSettled, true);
+      assert.equal(nextCalls, 1, "store stall must not trigger speculative body pulls");
+      assert.equal(returnCalls, 1, "owned request iterator must be cancelled once");
+      assert.equal(
+        (await getScienceUploadByTokenHash(
+          dbHandle.db,
+          workspaceA.id,
+          digest(upload.uploadToken),
+        ))?.state,
+        "quarantined",
+      );
+    },
+  );
+
+  await acceptance(
+    "external upload absolute deadline stops heartbeat and frees the durable workspace cap",
+    async () => {
+      const deadlineConfig = {
+        ...CONFIG,
+        externalUploadAbsoluteTimeoutMs: 150,
+        externalUploadIdleTimeoutMs: 150,
+        maxConcurrentExternalUploadStreamsPerWorkspace: 1,
+      };
+      const firstService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store,
+        computeProviders: createComputeRegistry(),
+        config: deadlineConfig,
+        workerId: "acceptance-external-upload-deadline-a",
+      });
+      const secondService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store,
+        computeProviders: createComputeRegistry(),
+        config: deadlineConfig,
+        workerId: "acceptance-external-upload-deadline-b",
+      });
+      const [stalledArtifact, queuedArtifact] = await Promise.all([
+        firstService.createArtifact({
+          studyId: study.id,
+          logicalName: "external-upload-never-yields.bin",
+          kind: "dataset",
+          format: "binary",
+          actorId: owner.id,
+        }),
+        secondService.createArtifact({
+          studyId: study.id,
+          logicalName: "external-upload-cap-retry.bin",
+          kind: "dataset",
+          format: "binary",
+          actorId: owner.id,
+        }),
+      ]);
+      const stalledBytes = Buffer.from("never arrives", "utf8");
+      const queuedBytes = Buffer.from("cap retry succeeds", "utf8");
+      const [stalledUpload, queuedUpload] = await Promise.all([
+        firstService.beginUpload({
+          artifactId: stalledArtifact.id,
+          expectedSizeBytes: stalledBytes.length,
+          expectedSha256: digest(stalledBytes),
+          actorId: owner.id,
+        }),
+        secondService.beginUpload({
+          artifactId: queuedArtifact.id,
+          expectedSizeBytes: queuedBytes.length,
+          expectedSha256: digest(queuedBytes),
+          actorId: owner.id,
+        }),
+      ]);
+      const entered = deferred();
+      let iteratorReturnCalls = 0;
+      let rejectLateNext;
+      const neverYieldingBody = {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next() {
+          entered.resolve();
+          return new Promise((_resolve, reject) => {
+            rejectLateNext = reject;
+          });
+        },
+        return() {
+          iteratorReturnCalls++;
+          rejectLateNext?.(new Error("late-next-rejection-must-be-observed"));
+          return Promise.resolve({ done: true });
+        },
+      };
+      let queuedIteratorReturns = 0;
+      let queuedIteratorNexts = 0;
+      const refusedBody = {
+        destroy() {},
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next() {
+          queuedIteratorNexts++;
+          return Promise.resolve({ value: queuedBytes, done: false });
+        },
+        return() {
+          queuedIteratorReturns++;
+          return Promise.resolve({ done: true });
+        },
+      };
+      const lateUnhandled = [];
+      const onUnhandled = (reason) => {
+        if (/late-next-rejection-must-be-observed/i.test(String(reason))) {
+          lateUnhandled.push(reason);
+        }
+      };
+      process.on("unhandledRejection", onUnhandled);
+      const startedAt = Date.now();
+      const timedOut = assert.rejects(
+        firstService.writeUpload(
+          stalledUpload.uploadToken,
+          neverYieldingBody,
+          owner.id,
+        ),
+        /absolute deadline of 150 ms/i,
+      );
+      await entered.promise;
+      await assert.rejects(
+        secondService.writeUpload(
+          queuedUpload.uploadToken,
+          refusedBody,
+          owner.id,
+        ),
+        /external upload stream concurrency limit of 1/i,
+      );
+      assert.equal(
+        (await getScienceUploadByTokenHash(
+          dbHandle.db,
+          workspaceA.id,
+          digest(queuedUpload.uploadToken),
+        ))?.state,
+        "pending",
+        "cap refusal must occur before the durable transfer claim",
+      );
+      await timedOut;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      process.removeListener("unhandledRejection", onUnhandled);
+      assert.ok(
+        Date.now() - startedAt < 1_000,
+        "a never-yielding iterator exceeded the bounded test horizon",
+      );
+      assert.equal(iteratorReturnCalls, 1, "timed-out iterator must be cancelled exactly once");
+      assert.deepEqual(lateUnhandled, [], "late iterator.next rejection escaped ownership");
+      assert.equal(queuedIteratorNexts, 0, "cap refusal must not pull request bytes");
+      assert.equal(queuedIteratorReturns, 1, "cap refusal must cancel the request iterator");
+      const stalledState = await getScienceUploadByTokenHash(
+        dbHandle.db,
+        workspaceA.id,
+        digest(stalledUpload.uploadToken),
+      );
+      assert.equal(stalledState?.state, "quarantined");
+      const stalledFence = await uploadTransferFence(
+        dbHandle.db,
+        workspaceA.id,
+        digest(stalledUpload.uploadToken),
+      );
+      assert.equal(stalledFence?.transfer_lease_id, null);
+      assert.equal(stalledFence?.transfer_lease_expires_at, null);
+      assert.equal(stalledFence?.external_transfer, false);
+      assert.ok(
+        stalledState && stalledState.expiresAt.getTime() <= Date.now(),
+        "timed-out partial bytes must be immediately cleanup-eligible",
+      );
+      const cleanupCandidates = await cleanupExpiredScienceUploads(dbHandle.db, {
+        workspaceId: workspaceA.id,
+        now: new Date(Date.now() + 1_000),
+      });
+      assert.ok(
+        cleanupCandidates.some((upload) => upload.id === stalledUpload.upload.id),
+        "timed-out upload did not enter the durable cleanup queue",
+      );
+
+      const writtenAfterRelease = await secondService.writeUpload(
+        queuedUpload.uploadToken,
+        Readable.from([queuedBytes]),
+        owner.id,
+      );
+      assert.equal(writtenAfterRelease?.state, "uploading");
+      const completedAfterRelease = await secondService.completeUpload({
+        uploadToken: queuedUpload.uploadToken,
+        mediaType: "application/octet-stream",
+        actorId: owner.id,
+      });
+      assert.equal(completedAfterRelease.upload.state, "completed");
+      assert.equal(completedAfterRelease.version.sha256, digest(queuedBytes));
+    },
+  );
+
+  await acceptance(
+    "external upload idle deadline cancels slow drip and preserves size failures",
+    async () => {
+      const idleService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store,
+        computeProviders: createComputeRegistry(),
+        config: {
+          ...CONFIG,
+          externalUploadAbsoluteTimeoutMs: 1_000,
+          externalUploadIdleTimeoutMs: 80,
+          maxConcurrentExternalUploadStreamsPerWorkspace: 2,
+        },
+        workerId: "acceptance-external-upload-idle",
+      });
+      const slowArtifact = await idleService.createArtifact({
+        studyId: study.id,
+        logicalName: "external-upload-slow-drip.bin",
+        kind: "dataset",
+        format: "binary",
+        actorId: owner.id,
+      });
+      const slowBytes = Buffer.from("ab", "utf8");
+      const slowUpload = await idleService.beginUpload({
+        artifactId: slowArtifact.id,
+        expectedSizeBytes: slowBytes.length,
+        expectedSha256: digest(slowBytes),
+        actorId: owner.id,
+      });
+      let nextIndex = 0;
+      let slowTimer = null;
+      let resolveSlowNext = null;
+      let slowIteratorCancelled = false;
+      const slowDripBody = {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next() {
+          nextIndex++;
+          if (nextIndex === 1) {
+            return Promise.resolve({ value: Buffer.from("a"), done: false });
+          }
+          return new Promise((resolve) => {
+            resolveSlowNext = resolve;
+            slowTimer = setTimeout(
+              () => resolve({ value: Buffer.from("b"), done: false }),
+              2_000,
+            );
+          });
+        },
+        return() {
+          slowIteratorCancelled = true;
+          if (slowTimer) clearTimeout(slowTimer);
+          resolveSlowNext?.({ done: true });
+          return Promise.resolve({ done: true });
+        },
+      };
+      const slowStartedAt = Date.now();
+      await assert.rejects(
+        idleService.writeUpload(
+          slowUpload.uploadToken,
+          slowDripBody,
+          owner.id,
+        ),
+        /idle deadline of 80 ms/i,
+      );
+      assert.ok(
+        Date.now() - slowStartedAt < 1_000,
+        "slow-drip iterator exceeded the bounded test horizon",
+      );
+      assert.equal(slowIteratorCancelled, true);
+      const slowState = await getScienceUploadByTokenHash(
+        dbHandle.db,
+        workspaceA.id,
+        digest(slowUpload.uploadToken),
+      );
+      assert.equal(slowState?.state, "quarantined");
+      const slowFence = await uploadTransferFence(
+        dbHandle.db,
+        workspaceA.id,
+        digest(slowUpload.uploadToken),
+      );
+      assert.equal(slowFence?.transfer_lease_id, null);
+      assert.equal(slowFence?.transfer_lease_expires_at, null);
+      assert.equal(slowFence?.external_transfer, false);
+      assert.ok(
+        (await cleanupExpiredScienceUploads(dbHandle.db, {
+          workspaceId: workspaceA.id,
+          now: new Date(Date.now() + 1_000),
+        })).some((upload) => upload.id === slowUpload.upload.id),
+      );
+
+      const sizeArtifact = await mainService.createArtifact({
+        studyId: study.id,
+        logicalName: "external-upload-size-overrun.bin",
+        kind: "dataset",
+        format: "binary",
+        actorId: owner.id,
+      });
+      const declaredByte = Buffer.from("a");
+      const sizeUpload = await mainService.beginUpload({
+        artifactId: sizeArtifact.id,
+        expectedSizeBytes: declaredByte.length,
+        expectedSha256: digest(declaredByte),
+        actorId: owner.id,
+      });
+      await assert.rejects(
+        mainService.writeUpload(
+          sizeUpload.uploadToken,
+          Readable.from([Buffer.from("ab")]),
+          owner.id,
+        ),
+        /upload exceeds the 1-byte limit/i,
+      );
+      const sizeState = await getScienceUploadByTokenHash(
+        dbHandle.db,
+        workspaceA.id,
+        digest(sizeUpload.uploadToken),
+      );
+      assert.equal(sizeState?.state, "quarantined");
+      assert.ok(
+        sizeState && sizeState.expiresAt.getTime() > Date.now(),
+        "ordinary size failures must retain the existing quarantine TTL",
+      );
+    },
+  );
+
+  await acceptance(
+    "external upload owns and cancels rejected, foreign, claimed, and replay bodies",
+    async () => {
+      const unconsumedBody = (factoryError = null) => {
+        const stats = { factories: 0, nexts: 0, returns: 0, destroys: 0 };
+        const iterator = {
+          next() {
+            stats.nexts++;
+            return Promise.resolve({ done: true });
+          },
+          return() {
+            stats.returns++;
+            return Promise.resolve({ done: true });
+          },
+        };
+        return {
+          stats,
+          body: {
+            destroy() {
+              stats.destroys++;
+            },
+            [Symbol.asyncIterator]() {
+              stats.factories++;
+              if (factoryError) throw factoryError;
+              return iterator;
+            },
+          },
+        };
+      };
+      const assertCancelledWithoutPull = (fixture, label) => {
+        assert.deepEqual(
+          fixture.stats,
+          { factories: 1, nexts: 0, returns: 1, destroys: 1 },
+          label,
+        );
+      };
+
+      const unknown = unconsumedBody();
+      await assert.rejects(
+        mainService.writeUpload("unknown-upload-token", unknown.body, owner.id),
+        /upload not found/i,
+      );
+      assertCancelledWithoutPull(unknown, "unknown token body was not cancelled");
+
+      const replayArtifact = await mainService.createArtifact({
+        studyId: study.id,
+        logicalName: "external-upload-completed-replay.bin",
+        kind: "dataset",
+        format: "binary",
+        actorId: owner.id,
+      });
+      const replayBytes = Buffer.from("completed replay", "utf8");
+      const replayUpload = await mainService.beginUpload({
+        artifactId: replayArtifact.id,
+        expectedSizeBytes: replayBytes.length,
+        expectedSha256: digest(replayBytes),
+        actorId: owner.id,
+      });
+      await mainService.writeUpload(
+        replayUpload.uploadToken,
+        Readable.from([replayBytes]),
+        owner.id,
+      );
+      await mainService.completeUpload({
+        uploadToken: replayUpload.uploadToken,
+        mediaType: "application/octet-stream",
+        actorId: owner.id,
+      });
+
+      const replay = unconsumedBody();
+      assert.equal(
+        (await mainService.writeUpload(
+          replayUpload.uploadToken,
+          replay.body,
+          owner.id,
+        )).state,
+        "completed",
+      );
+      assertCancelledWithoutPull(replay, "completed replay body was not cancelled");
+
+      const foreignService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceB.id,
+        store,
+        computeProviders: createComputeRegistry(),
+        workerId: "acceptance-external-upload-foreign-token",
+      });
+      const foreign = unconsumedBody();
+      await assert.rejects(
+        foreignService.writeUpload(replayUpload.uploadToken, foreign.body, owner.id),
+        /upload not found/i,
+      );
+      assertCancelledWithoutPull(foreign, "foreign token body was not cancelled");
+
+      const claimedArtifact = await mainService.createArtifact({
+        studyId: study.id,
+        logicalName: "external-upload-already-claimed.bin",
+        kind: "dataset",
+        format: "binary",
+        actorId: owner.id,
+      });
+      const claimedBytes = Buffer.from("already claimed", "utf8");
+      const claimedUpload = await mainService.beginUpload({
+        artifactId: claimedArtifact.id,
+        expectedSizeBytes: claimedBytes.length,
+        expectedSha256: digest(claimedBytes),
+        actorId: owner.id,
+      });
+      await claimScienceUploadTransfer(dbHandle.db, {
+        workspaceId: workspaceA.id,
+        tokenHash: digest(claimedUpload.uploadToken),
+        leaseId: "20000000-0000-4000-8000-000000000020",
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+        external: false,
+      });
+      const alreadyClaimed = unconsumedBody();
+      await assert.rejects(
+        mainService.writeUpload(
+          claimedUpload.uploadToken,
+          alreadyClaimed.body,
+          owner.id,
+        ),
+        /byte transfer was already claimed/i,
+      );
+      assertCancelledWithoutPull(
+        alreadyClaimed,
+        "already-claimed token body was not cancelled",
+      );
+      await quarantineScienceUpload(dbHandle.db, {
+        workspaceId: workspaceA.id,
+        tokenHash: digest(claimedUpload.uploadToken),
+        error: "already-claimed body ownership fixture cleanup",
+        cleanupEligible: true,
+      });
+
+      const factoryFailure = new Error("iterator-factory-refusal-fixture");
+      const invalidFactory = unconsumedBody(factoryFailure);
+      await assert.rejects(
+        mainService.writeUpload(
+          replayUpload.uploadToken,
+          invalidFactory.body,
+          owner.id,
+        ),
+        /iterator-factory-refusal-fixture/,
+      );
+      assert.deepEqual(invalidFactory.stats, {
+        factories: 1,
+        nexts: 0,
+        returns: 0,
+        destroys: 1,
+      });
+    },
+  );
+
   await acceptance("checksum-confirmed retention tombstones unreferenced ready bytes", async () => {
     const retained = await uploadArtifact(mainService, {
       studyId: study.id,
@@ -1347,6 +2079,89 @@ try {
       network: "none",
     },
     actorId: owner.id,
+  });
+
+  await acceptance("stalled Redis advisory publish is bounded across API and terminal run paths", async () => {
+    const publishTimeoutMs = 10;
+    const writerOptions = redisEventBusConnectionOptions("writer", publishTimeoutMs);
+    assert.equal(writerOptions.maxRetriesPerRequest, 1);
+    assert.equal(writerOptions.enableOfflineQueue, false);
+    assert.equal(writerOptions.connectTimeout, publishTimeoutMs);
+    assert.equal(writerOptions.commandTimeout, publishTimeoutMs);
+    assert.equal(redisEventBusConnectionOptions("reader").maxRetriesPerRequest, null);
+    let publishCalls = 0;
+    const writer = {
+      xadd() {
+        publishCalls++;
+        return new Promise(() => {});
+      },
+      disconnect() {},
+    };
+    const reader = {
+      xread() {
+        return new Promise(() => {});
+      },
+      disconnect() {},
+    };
+    const bus = new RedisEventBus("redis://never-resolving.fixture", {
+      publishTimeoutMs,
+      clientFactory: (_url, role) => role === "writer" ? writer : reader,
+    });
+    const completesWithin = async (operation, timeoutMs, label) => {
+      let timer;
+      try {
+        return await Promise.race([
+          operation,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`${label} exceeded ${timeoutMs} ms`)),
+              timeoutMs,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    try {
+      const directStartedAt = Date.now();
+      await completesWithin(bus.publish({
+        type: "mission.started",
+        missionId: "redis-advisory-never-resolves",
+        at: new Date().toISOString(),
+      }), 500, "direct advisory publish");
+      assert.ok(Date.now() - directStartedAt >= publishTimeoutMs);
+
+      const service = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store,
+        computeProviders: createComputeRegistry(),
+        workerId: "acceptance-redis-advisory-deadline",
+        bus,
+      });
+      const apiStudy = await completesWithin(service.createStudy({
+        name: "Redis advisory deadline API fixture",
+        actorId: owner.id,
+      }), 1_000, "committed API path");
+      assert.equal((await service.getStudy(apiStudy.id)).id, apiStudy.id);
+
+      const submitted = await completesWithin(service.submitRun(runIntent({
+        studyId: study.id,
+        profileId: profile.id,
+        inputVersionId: notebook.version.id,
+        actorId: owner.id,
+        key: "acceptance-redis-advisory-deadline",
+      })), 1_000, "run submission API path");
+      await completesWithin(approve(service, submitted, owner.id), 1_000, "approval API path");
+      await completesWithin(service.tick(submitted.run.id, 0), 3_000, "terminal run tick");
+      const terminal = await service.getRun(submitted.run.id);
+      assert.equal(terminal.state, "succeeded");
+      assert.equal(terminal.manifest?.complete, true);
+      assert.ok(publishCalls >= 8, "fixture must stall every advisory publish site");
+    } finally {
+      await bus.close();
+    }
   });
 
   await acceptance("provider telemetry is capped at 1000 persisted run events", async () => {
@@ -1663,6 +2478,57 @@ try {
     );
   });
 
+  await acceptance("repeated lost submit responses enter the admin queue and recover exact execution", async () => {
+    const provider = new RepeatedLostSubmitResponseProvider("repeated-lost-submit-instance");
+    const service = createService({
+      db: dbHandle.db,
+      workspaceId: workspaceA.id,
+      store,
+      computeProviders: registryWith(provider),
+      workerId: "acceptance-repeated-lost-submit",
+    });
+    const submitted = await service.submitRun(runIntent({
+      studyId: study.id,
+      profileId: profile.id,
+      inputVersionId: notebook.version.id,
+      actorId: owner.id,
+      key: "acceptance-repeated-lost-submit",
+    }));
+    await approve(service, submitted, owner.id);
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await service.tick(submitted.run.id, attempt === 0 ? 0 : 1);
+    }
+    const ambiguous = await service.getRun(submitted.run.id);
+    assert.equal(ambiguous.state, "cancelling");
+    assert.equal(ambiguous.finishedAt, null);
+    assert.equal(ambiguous.providerHandle, null);
+    assert.equal(provider.submitCalls, 5);
+    const dossier = await service.getRunDossier(submitted.run.id, 100);
+    const orphanEvent = dossier.events.items.find((event) =>
+      event.payload.orphaned === true && event.payload.adminActionRequired === true);
+    assert.ok(orphanEvent);
+    assert.equal(orphanEvent.payload.attempt, 5);
+    assert.equal(orphanEvent.payload.durableSubmitAttemptPersisted, true);
+    assert.ok(String(orphanEvent.payload.diagnostic).length <= 1_000);
+
+    const queued = await service.listAdminActionQueue({ page: { offset: 0, limit: 200 } });
+    const queueItem = queued.items.find((item) => item.kind === "run" && item.id === submitted.run.id);
+    assert.ok(queueItem);
+    assert.equal(queueItem.state, "cancelling");
+    assert.equal(queueItem.attempts, 5);
+
+    provider.restoreResponses();
+    await service.tick(submitted.run.id, 1);
+    const cancelled = await service.getRun(submitted.run.id);
+    assert.equal(cancelled.state, "cancelled");
+    assert.equal(provider.submitCalls, 6);
+    assert.equal(provider.cancelCalls, 1);
+    assert.equal(provider.cancelledHandle, provider.acceptedHandle);
+    const cleared = await service.listAdminActionQueue({ page: { offset: 0, limit: 200 } });
+    assert.equal(cleared.items.some((item) => item.kind === "run" && item.id === submitted.run.id), false);
+  });
+
   await acceptance("ambiguous submit is admin-fenced across provider instance drift", async () => {
     const original = new LostSubmitResponseProvider("ambiguous-instance-original");
     const originalService = createService({
@@ -1783,13 +2649,18 @@ try {
       resourceRequest: RESOURCE_REQUEST,
     });
     assert.equal(quote.available, true);
-    const submitted = await mainService.submitRun(runIntent({
+    const intent = runIntent({
       studyId: study.id,
       profileId: profile.id,
       inputVersionId: notebook.version.id,
       actorId: owner.id,
       key: "acceptance-source-run",
-    }));
+    });
+    intent.parameters = {
+      ...intent.parameters,
+      sourceRevision: "deadbee",
+    };
+    const submitted = await mainService.submitRun(intent);
     assert.equal(submitted.run.state, "awaiting_approval");
     await approve(mainService, submitted, owner.id);
     sourceRun = await waitForRun(mainService, submitted.run.id, ["succeeded"]);
@@ -1798,10 +2669,18 @@ try {
     assert.equal(sourceRun.manifest?.complete, true);
     assert.deepEqual(sourceRun.manifest?.gaps, []);
     assert.equal(sourceRun.manifest?.codeArtifactVersionId, notebook.version.id);
+    assert.equal(sourceRun.manifest?.sourceRevision, null);
+    assert.equal(sourceRun.manifest?.parameters.sourceRevision, "deadbee");
 
     sourceDossier = await mainService.getRunDossier(sourceRun.id, 50);
     assert.equal(sourceDossier.inputs.length, 1);
-    assert.equal(sourceDossier.outputs.length, 2);
+    assert.equal(sourceDossier.outputs.length, 3);
+    const fixturePreview = sourceDossier.outputs.find(
+      (output) => output.version?.mediaType === "image/png",
+    );
+    assert.ok(fixturePreview, "deterministic runs must expose the labelled fixture PNG preview");
+    assert.equal(fixturePreview.version.metadata.fixturePreview, true);
+    assert.equal(fixturePreview.version.metadata.productionCompute, false);
     for (const output of sourceDossier.outputs) {
       assert.equal(output.version?.status, "ready");
       const object = await store.open(output.version.storageKey);
@@ -1812,6 +2691,198 @@ try {
     assert.equal(schedulerErrors.length, 0);
     assert.ok(publishedEvents.some((event) => event.type === "science.run.succeeded"));
   });
+
+  let dataOnly;
+  await acceptance("manifest completeness requires a linked immutable code input", async () => {
+    dataOnly = await uploadArtifact(mainService, {
+      studyId: study.id,
+      actorId: owner.id,
+      logicalName: "source-revision-counterexample.csv",
+      kind: "dataset",
+      format: "csv",
+      mediaType: "text/csv",
+      bytes: Buffer.from("time,value\n0,1\n", "utf8"),
+    });
+    const mislabeled = runIntent({
+      studyId: study.id,
+      profileId: profile.id,
+      inputVersionId: dataOnly.version.id,
+      actorId: owner.id,
+      key: "acceptance-mislabeled-code-role",
+    });
+    await assert.rejects(
+      mainService.submitRun(mislabeled),
+      /code, notebook, or solver roles require a parsed ipynb notebook artifact/i,
+      "a caller-controlled semantic role must not promote dataset bytes into code provenance",
+    );
+    const intent = runIntent({
+      studyId: study.id,
+      profileId: profile.id,
+      inputVersionId: dataOnly.version.id,
+      actorId: owner.id,
+      key: "acceptance-unverified-source-revision",
+    });
+    intent.inputs = [{
+      artifactVersionId: dataOnly.version.id,
+      semanticRole: "dataset",
+    }];
+    intent.parameters = {
+      ...intent.parameters,
+      sourceRevision: "deadbee",
+    };
+    const submitted = await mainService.submitRun(intent);
+    await approve(mainService, submitted, owner.id);
+    const finished = await waitForRun(mainService, submitted.run.id, ["succeeded"]);
+    assert.equal(finished.manifest?.complete, false);
+    assert.equal(finished.manifest?.codeArtifactVersionId, null);
+    assert.equal(finished.manifest?.sourceRevision, null);
+    assert.equal(finished.manifest?.parameters.sourceRevision, "deadbee");
+    assert.ok(finished.manifest?.gaps.includes("manifest.codeArtifactVersionId"));
+    assert.ok(finished.manifest?.gaps.includes("manifest.sourceRevision.unverified"));
+    assert.match(finished.manifestHash, /^[0-9a-f]{64}$/);
+    const currentAssessment = await mainService.getManifest(finished.id);
+    assert.equal(currentAssessment.complete, false);
+    assert.ok(currentAssessment.gaps.includes("manifest.codeArtifactVersionId"));
+  });
+
+  if (sourceRun?.manifest && dataOnly) {
+    const storedManifest = structuredClone(sourceRun.manifest);
+    const storedManifestHash = sourceRun.manifestHash;
+    const persistManifestFixture = async (manifest) => {
+      const manifestHash = createHash("sha256")
+        .update(canonicalScienceJson(manifest))
+        .digest("hex");
+      await dbHandle.db.execute(sql`
+        UPDATE science_runs
+           SET manifest = ${JSON.stringify(manifest)}::jsonb,
+               manifest_hash = ${manifestHash}
+         WHERE id = ${sourceRun.id}
+      `);
+      return manifestHash;
+    };
+    const restoreStoredManifest = () => dbHandle.db.execute(sql`
+      UPDATE science_runs
+         SET manifest = ${JSON.stringify(storedManifest)}::jsonb,
+             manifest_hash = ${storedManifestHash}
+       WHERE id = ${sourceRun.id}
+    `);
+
+    await acceptance("current manifest assessment preserves declared non-structural gaps", async () => {
+      const declaredGapManifest = {
+        ...structuredClone(storedManifest),
+        complete: false,
+        gaps: ["manifest.history.truncated"],
+      };
+      await persistManifestFixture(declaredGapManifest);
+      try {
+        const assessed = await mainService.getManifest(sourceRun.id);
+        assert.equal(assessed.manifest.complete, false);
+        assert.equal(assessed.complete, false);
+        assert.deepEqual(assessed.gaps, ["manifest.history.truncated"]);
+        await assert.rejects(
+          mainService.reproduceRun({
+            runId: sourceRun.id,
+            actorId: owner.id,
+            idempotencyKey: "acceptance-declared-manifest-gap-refused",
+          }),
+          /currently verified complete manifest/i,
+        );
+      } finally {
+        await restoreStoredManifest();
+      }
+    });
+
+    await acceptance("current manifest assessment rejects self-hashed forged relational lineage", async () => {
+      const forgedLineageManifest = {
+        ...structuredClone(storedManifest),
+        inputs: [{
+          artifactVersionId: dataOnly.version.id,
+          sha256: dataOnly.version.sha256,
+          sizeBytes: dataOnly.version.sizeBytes,
+          semanticRole: "notebook",
+        }],
+        codeArtifactVersionId: dataOnly.version.id,
+        complete: true,
+        gaps: [],
+      };
+      await persistManifestFixture(forgedLineageManifest);
+      try {
+        const assessed = await mainService.getManifest(sourceRun.id);
+        assert.equal(assessed.manifest.complete, true);
+        assert.equal(assessed.complete, false);
+        assert.ok(assessed.gaps.includes("manifest.relational-integrity"));
+        await assert.rejects(
+          mainService.reproduceRun({
+            runId: sourceRun.id,
+            actorId: owner.id,
+            idempotencyKey: "acceptance-forged-lineage-refused",
+          }),
+          /currently verified complete manifest/i,
+        );
+      } finally {
+        await restoreStoredManifest();
+      }
+    });
+
+    await acceptance("parsed notebook evidence is required at submit, read, and reproduce boundaries", async () => {
+      const originalMetadata = structuredClone(notebook.version.metadata);
+      const unparsedMetadata = {
+        ...originalMetadata,
+        detectedFormat: "ipynb",
+        formatValidation: "opaque",
+      };
+      await dbHandle.db.execute(sql`
+        UPDATE science_artifact_versions
+           SET metadata = ${JSON.stringify(unparsedMetadata)}::jsonb
+         WHERE id = ${notebook.version.id}
+      `);
+      try {
+        await assert.rejects(
+          mainService.submitRun(runIntent({
+            studyId: study.id,
+            profileId: profile.id,
+            inputVersionId: notebook.version.id,
+            actorId: owner.id,
+            key: "acceptance-unparsed-notebook-service-refused",
+          })),
+          /parsed ipynb notebook artifact/i,
+        );
+        await assert.rejects(
+          createScienceRun(dbHandle.db, {
+            workspaceId: workspaceA.id,
+            studyId: study.id,
+            computeProfileId: profile.id,
+            resourceRequest: RESOURCE_REQUEST,
+            idempotencyKey: "acceptance-unparsed-notebook-repo-refused",
+            inputs: [{
+              artifactVersionId: notebook.version.id,
+              semanticRole: "notebook",
+            }],
+            parameters: { fixture: true },
+            createdBy: owner.id,
+          }),
+          /parsed ipynb notebook artifact/i,
+        );
+        const assessed = await mainService.getManifest(sourceRun.id);
+        assert.equal(assessed.complete, false);
+        assert.ok(assessed.gaps.includes("manifest.relational-integrity"));
+        await assert.rejects(
+          mainService.reproduceRun({
+            runId: sourceRun.id,
+            actorId: owner.id,
+            idempotencyKey: "acceptance-unparsed-notebook-reproduce-refused",
+          }),
+          /currently verified complete manifest/i,
+        );
+      } finally {
+        await dbHandle.db.execute(sql`
+          UPDATE science_artifact_versions
+             SET metadata = ${JSON.stringify(originalMetadata)}::jsonb
+           WHERE id = ${notebook.version.id}
+        `);
+      }
+    });
+  }
 
   let reproducedRun;
   if (sourceRun) {
@@ -1841,6 +2912,376 @@ try {
       });
       assert.equal(duplicate.run.id, reproducedRun.id);
       assert.equal(duplicate.created, false);
+    });
+
+    await acceptance("append-only numerical review is explicit and leaves manifests unchanged", async () => {
+      const sourceManifestBefore = JSON.stringify(sourceRun.manifest);
+      const candidateManifestBefore = JSON.stringify(reproducedRun.manifest);
+      await assert.rejects(
+        mainService.recordDomainValidation({
+          runId: reproducedRun.id,
+          baselineRunId: sourceRun.id,
+          reviewerId: owner.id,
+          reviewerRole: "admin",
+          kind: "numerical-equivalence",
+          metric: "synthetic-relative-l2",
+          tolerance: 1e-6,
+          observedValue: 4.2e-7,
+          units: "dimensionless",
+          methodProtocolId: "synthetic-service-protocol/v1",
+          decision: true,
+          limitationsReason: "Synthetic service fixture; not release or domain evidence.",
+        }),
+        /reviewer must be a current admin or owner/i,
+      );
+      const validation = await mainService.recordDomainValidation({
+        runId: reproducedRun.id,
+        baselineRunId: sourceRun.id,
+        reviewerId: owner.id,
+        reviewerRole: "owner",
+        kind: "numerical-equivalence",
+        metric: "synthetic-relative-l2",
+        tolerance: 1e-6,
+        observedValue: 4.2e-7,
+        units: "dimensionless",
+        methodProtocolId: "synthetic-service-protocol/v1",
+        decision: true,
+        limitationsReason: "Synthetic service fixture; not release or domain evidence.",
+      });
+      assert.equal(validation.runManifestHash, reproducedRun.manifestHash);
+      assert.equal(validation.baselineManifestHash, sourceRun.manifestHash);
+      assert.equal(validation.reviewerId, owner.id);
+      assert.equal(validation.revision, 1);
+      const page = await mainService.listDomainValidations(reproducedRun.id, { limit: 10 });
+      assert.deepEqual(page.items.map((entry) => entry.id), [validation.id]);
+      assert.equal("runOutputChecksums" in page.items[0], false);
+      assert.equal("baselineOutputChecksums" in page.items[0], false);
+      assert.equal(
+        (await mainService.getDomainValidation(reproducedRun.id, validation.id)).recordHash,
+        validation.recordHash,
+      );
+      const compared = await mainService.compareRuns(sourceRun.id, reproducedRun.id);
+      assert.equal(compared.comparison.numericallyEquivalent, true);
+      assert.deepEqual(compared.comparison.numericalValidation, {
+        passed: true,
+        metric: "synthetic-relative-l2",
+        tolerance: 1e-6,
+        observed: 4.2e-7,
+        units: "dimensionless",
+        methodProtocolId: "synthetic-service-protocol/v1",
+        limitationsReason: "Synthetic service fixture; not release or domain evidence.",
+        recordId: validation.id,
+        revision: 1,
+        reviewerId: owner.id,
+        createdAt: validation.createdAt.toISOString(),
+        recordHash: validation.recordHash,
+      });
+      const mixedCaseReviews = await Promise.race([
+        Promise.all([
+          mainService.recordDomainValidation({
+            runId: reproducedRun.id.toUpperCase(),
+            baselineRunId: sourceRun.id,
+            reviewerId: owner.id.toUpperCase(),
+            reviewerRole: "owner",
+            kind: "numerical-equivalence",
+            metric: "synthetic-relative-l2-a",
+            tolerance: 1e-6,
+            observedValue: 2e-6,
+            units: "dimensionless",
+            methodProtocolId: "synthetic-service-protocol/v2-a",
+            decision: false,
+            limitationsReason: "Synthetic superseding fixture; not release or domain evidence.",
+          }),
+          mainService.recordDomainValidation({
+            runId: reproducedRun.id,
+            baselineRunId: sourceRun.id.toUpperCase(),
+            reviewerId: owner.id,
+            reviewerRole: "owner",
+            kind: "numerical-equivalence",
+            metric: "synthetic-relative-l2-b",
+            tolerance: 1e-6,
+            observedValue: 2e-6,
+            units: "dimensionless",
+            methodProtocolId: "synthetic-service-protocol/v2-b",
+            decision: false,
+            limitationsReason: "Synthetic superseding fixture; not release or domain evidence.",
+          }),
+        ]),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error("mixed-case validation pair lock order timed out")),
+          5_000,
+        )),
+      ]);
+      assert.deepEqual(
+        mixedCaseReviews.map((entry) => entry.revision).sort((left, right) => left - right),
+        [2, 3],
+        "canonical UUID locking must serialize mixed-case forms of the same exact pair",
+      );
+      for (const entry of mixedCaseReviews) {
+        assert.equal(entry.workspaceId, workspaceA.id);
+        assert.equal(entry.runId, reproducedRun.id);
+        assert.equal(entry.baselineRunId, sourceRun.id);
+        assert.equal(entry.reviewerId, owner.id);
+      }
+      const supersedingValidation = mixedCaseReviews.reduce((latest, entry) =>
+        entry.revision > latest.revision ? entry : latest
+      );
+      assert.equal(supersedingValidation.revision, 3);
+      assert.deepEqual(
+        (await mainService.listDomainValidations(reproducedRun.id, { limit: 10 })).items
+          .map((entry) => entry.revision),
+        [3, 2, 1],
+      );
+
+      const setValidationDisplayTimes = async (olderAt, newerAt) => {
+        await dbHandle.db.execute(sql.raw(
+          "ALTER TABLE science_domain_validations DISABLE TRIGGER USER",
+        ));
+        try {
+          await dbHandle.db.execute(sql`
+            UPDATE science_domain_validations
+               SET created_at = CASE
+                 WHEN id = ${validation.id} THEN ${olderAt}
+                 WHEN id = ${supersedingValidation.id} THEN ${newerAt}
+                 ELSE created_at
+               END
+             WHERE id IN (${validation.id}, ${supersedingValidation.id})
+          `);
+        } finally {
+          await dbHandle.db.execute(sql.raw(
+            "ALTER TABLE science_domain_validations ENABLE TRIGGER USER",
+          ));
+        }
+      };
+      await setValidationDisplayTimes(
+        new Date("2099-01-01T00:00:00.000Z"),
+        new Date("2000-01-01T00:00:00.000Z"),
+      );
+      assert.equal(
+        (await mainService.compareRuns(sourceRun.id, reproducedRun.id))
+          .comparison.numericallyEquivalent,
+        false,
+        "higher revision must win even when its display timestamp is older",
+      );
+      await setValidationDisplayTimes(
+        new Date("2030-01-01T00:00:00.000Z"),
+        new Date("2030-01-01T00:00:00.000Z"),
+      );
+      assert.equal(
+        (await mainService.compareRuns(sourceRun.id, reproducedRun.id))
+          .comparison.numericallyEquivalent,
+        false,
+        "equal display timestamps must not make the authoritative decision ambiguous",
+      );
+      assert.equal(
+        (await mainService.compareRuns(reproducedRun.id, sourceRun.id))
+          .comparison.numericallyEquivalent,
+        null,
+        "numerical reviews are directional baseline-to-candidate evidence",
+      );
+
+      const tamperedHash = supersedingValidation.recordHash === "0".repeat(64)
+        ? "1".repeat(64)
+        : "0".repeat(64);
+      const alternateRunResult = await dbHandle.db.execute(sql`
+        SELECT run.id
+          FROM science_runs AS run
+          LEFT JOIN science_domain_validations AS validation
+            ON validation.run_id = run.id
+         WHERE run.id <> ${sourceRun.id}
+           AND run.id <> ${reproducedRun.id}
+           AND validation.id IS NULL
+         ORDER BY run.id
+         LIMIT 1
+      `);
+      const [alternateRun] = alternateRunResult.rows ?? alternateRunResult;
+      assert.ok(alternateRun?.id, "selector-tamper fixture requires a distinct valid run FK");
+
+      const withRecordTriggersDisabled = async (action) => {
+        await dbHandle.db.execute(sql.raw(
+          "ALTER TABLE science_domain_validations DISABLE TRIGGER USER",
+        ));
+        try {
+          await action();
+        } finally {
+          await dbHandle.db.execute(sql.raw(
+            "ALTER TABLE science_domain_validations ENABLE TRIGGER USER",
+          ));
+        }
+      };
+      const assertNewestRecordTamperFailsClosed = async (label, tamper, restore) => {
+        await withRecordTriggersDisabled(tamper);
+        assert.equal(
+          (await mainService.compareRuns(sourceRun.id, reproducedRun.id))
+            .comparison.numericallyEquivalent,
+          null,
+          `${label} on the head-selected newest record must not resurrect an older decision`,
+        );
+        await withRecordTriggersDisabled(restore);
+        assert.equal(
+          (await mainService.compareRuns(sourceRun.id, reproducedRun.id))
+            .comparison.numericallyEquivalent,
+          false,
+          `${label} fixture restoration must recover the exact newest decision`,
+        );
+      };
+
+      await assertNewestRecordTamperFailsClosed(
+        "baseline selector tamper",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET baseline_run_id = ${alternateRun.id}
+           WHERE id = ${supersedingValidation.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET baseline_run_id = ${sourceRun.id}
+           WHERE id = ${supersedingValidation.id}
+        `),
+      );
+      await assertNewestRecordTamperFailsClosed(
+        "kind selector tamper",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET kind = 'domain-validation',
+                 baseline_run_id = NULL,
+                 baseline_manifest_hash = NULL,
+                 baseline_output_checksums = NULL
+           WHERE id = ${supersedingValidation.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET kind = 'numerical-equivalence',
+                 baseline_run_id = ${sourceRun.id},
+                 baseline_manifest_hash = ${supersedingValidation.baselineManifestHash},
+                 baseline_output_checksums = ${JSON.stringify(
+                   supersedingValidation.baselineOutputChecksums,
+                 )}::jsonb
+           WHERE id = ${supersedingValidation.id}
+        `),
+      );
+      await assertNewestRecordTamperFailsClosed(
+        "revision selector tamper",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET revision = 1000000
+           WHERE id = ${supersedingValidation.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET revision = ${supersedingValidation.revision}
+           WHERE id = ${supersedingValidation.id}
+        `),
+      );
+      await assertNewestRecordTamperFailsClosed(
+        "candidate-run selector tamper",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET run_id = ${alternateRun.id}
+           WHERE id = ${supersedingValidation.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET run_id = ${reproducedRun.id}
+           WHERE id = ${supersedingValidation.id}
+        `),
+      );
+      await assertNewestRecordTamperFailsClosed(
+        "record hash tamper",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET record_hash = ${tamperedHash}
+           WHERE id = ${supersedingValidation.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validations
+             SET record_hash = ${supersedingValidation.recordHash}
+           WHERE id = ${supersedingValidation.id}
+        `),
+      );
+
+      const withHeadTriggersDisabled = async (action) => {
+        await dbHandle.db.execute(sql.raw(
+          "ALTER TABLE science_domain_validation_heads DISABLE TRIGGER USER",
+        ));
+        try {
+          await action();
+        } finally {
+          await dbHandle.db.execute(sql.raw(
+            "ALTER TABLE science_domain_validation_heads ENABLE TRIGGER USER",
+          ));
+        }
+      };
+      const headResult = await dbHandle.db.execute(sql`
+        SELECT id, validation_id, revision, record_hash, head_hash
+          FROM science_domain_validation_heads
+         WHERE workspace_id = ${workspaceA.id}
+           AND run_id = ${reproducedRun.id}
+           AND kind = 'numerical-equivalence'
+           AND scope_baseline_run_id = ${sourceRun.id}
+      `);
+      const [head] = headResult.rows ?? headResult;
+      assert.equal(head.validation_id, supersedingValidation.id);
+      const assertHeadTamperFailsClosed = async (label, tamper, restore) => {
+        await withHeadTriggersDisabled(tamper);
+        assert.equal(
+          (await mainService.compareRuns(sourceRun.id, reproducedRun.id))
+            .comparison.numericallyEquivalent,
+          null,
+          `${label} must fail closed`,
+        );
+        await withHeadTriggersDisabled(restore);
+        assert.equal(
+          (await mainService.compareRuns(sourceRun.id, reproducedRun.id))
+            .comparison.numericallyEquivalent,
+          false,
+          `${label} fixture restoration must recover the exact newest decision`,
+        );
+      };
+      await assertHeadTamperFailsClosed(
+        "head-to-record pointer mismatch",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validation_heads
+             SET validation_id = ${validation.id}
+           WHERE id = ${head.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validation_heads
+             SET validation_id = ${head.validation_id}
+           WHERE id = ${head.id}
+        `),
+      );
+      await assertHeadTamperFailsClosed(
+        "head-to-record hash mismatch",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validation_heads
+             SET record_hash = ${tamperedHash}
+           WHERE id = ${head.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validation_heads
+             SET record_hash = ${head.record_hash}
+           WHERE id = ${head.id}
+        `),
+      );
+      await assertHeadTamperFailsClosed(
+        "head anchor hash mismatch",
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validation_heads
+             SET head_hash = ${tamperedHash}
+           WHERE id = ${head.id}
+        `),
+        () => dbHandle.db.execute(sql`
+          UPDATE science_domain_validation_heads
+             SET head_hash = ${head.head_hash}
+           WHERE id = ${head.id}
+        `),
+      );
+      assert.equal(JSON.stringify((await mainService.getRun(sourceRun.id)).manifest), sourceManifestBefore);
+      assert.equal(
+        JSON.stringify((await mainService.getRun(reproducedRun.id)).manifest),
+        candidateManifestBefore,
+      );
     });
   }
 
@@ -2037,7 +3478,7 @@ try {
     const finished = await finishingWorker.getRun(submitted.run.id);
     assert.equal(finished.state, "succeeded");
     assert.equal(finished.executionGeneration, 1);
-    assert.equal((await finishingWorker.getRunDossier(finished.id)).outputs.length, 2);
+    assert.equal((await finishingWorker.getRunDossier(finished.id)).outputs.length, 3);
   });
 
   await acceptance("lease heartbeat prevents takeover during a long output stream", async () => {
@@ -2607,7 +4048,7 @@ try {
     }]);
 
     const completedFinalizingDossier = await restarted.getRunDossier(finalizing.id, 100);
-    assert.equal(completedFinalizingDossier.outputs.length, 2);
+    assert.equal(completedFinalizingDossier.outputs.length, 3);
     assert.equal(
       completedFinalizingDossier.outputs.some(
         (entry) => entry.artifactVersionId === retainedOutputLink,
@@ -2616,11 +4057,11 @@ try {
     );
     assert.equal(
       new Set(completedFinalizingDossier.outputs.map((entry) => entry.artifactVersionId)).size,
-      2,
+      3,
     );
     assert.equal(
       new Set(completedFinalizingDossier.outputs.map((entry) => entry.semanticRole)).size,
-      2,
+      3,
     );
     assert.equal(restartErrors.length, 0);
     await restartScheduler.close();
@@ -2723,248 +4164,208 @@ try {
   });
 
   if (sourceRun && sourceDossier) {
-    await acceptance("static render session opens, isolates owner, renews, and closes", async () => {
-      const output = sourceDossier.outputs.find((entry) => entry.version)?.version;
-      assert.ok(output);
-      const rendered = await mainService.createRender({
-        runId: sourceRun.id,
-        artifactVersionId: output.id,
-        mode: "static",
-        actorId: owner.id,
+    await acceptance("static render is exact-source, replay-safe, bounded, and tombstoned", async () => {
+      const source = sourceDossier.outputs.find(
+        (entry) => entry.version?.mediaType === "image/png",
+      );
+      assert.ok(source?.version);
+      const provider = new CountingStaticRenderProvider();
+      const renderProviders = new RenderProviderRegistry();
+      renderProviders.register(provider);
+      const noReferenceStore = new Proxy(store, {
+        get(target, property) {
+          if (property === "reference") {
+            return async () => {
+              throw new Error("static render must not request an artifact-store reference");
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
       });
+      const service = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store: noReferenceStore,
+        computeProviders: createComputeRegistry(),
+        renderProviders,
+        config: { ...CONFIG, maxConcurrentRenderSessionsPerWorkspace: 1 },
+        workerId: "acceptance-static-render-replay",
+      });
+      const request = {
+        runId: sourceRun.id,
+        artifactVersionId: source.version.id,
+        mode: "static",
+        idempotencyKey: "acceptance-static-render-replay",
+        actorId: owner.id,
+      };
+      const [rendered, concurrentReplay] = await Promise.all([
+        service.createRender(request),
+        service.createRender(request),
+      ]);
+      assert.equal(rendered.session.id, concurrentReplay.session.id);
+      assert.equal(provider.startCalls, 1, "concurrent replay must start one provider");
       assert.equal(rendered.session.state, "ready");
       assert.equal(rendered.mode, "static");
+      assert.equal(rendered.provider, "static");
+      assert.equal(rendered.source.artifactVersionId, source.version.id);
+      assert.equal(rendered.source.sha256, source.version.sha256);
+      assert.equal(rendered.source.mediaType, "image/png");
       assert.match(rendered.url, /^\/api\/science\/render-sessions\/[0-9a-f-]+\/gateway$/);
+
+      const lostResponseReplay = await service.createRender(request);
+      assert.equal(lostResponseReplay.session.id, rendered.session.id);
+      assert.equal(provider.startCalls, 1, "lost-response replay must not start again");
+      const callsBeforeRollbackReplay = {
+        starts: provider.startCalls,
+        health: provider.healthCalls,
+      };
+      const readOnlyService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store: noReferenceStore,
+        computeProviders: createComputeRegistry(),
+        renderProviders,
+        config: { ...CONFIG, submissionsEnabled: false },
+        workerId: "acceptance-static-render-read-only-replay",
+      });
+      assert.equal((await readOnlyService.createRender(request)).session.id, rendered.session.id);
+      assert.deepEqual(
+        { starts: provider.startCalls, health: provider.healthCalls },
+        callsBeforeRollbackReplay,
+        "read-only replay must not call the provider",
+      );
       await assert.rejects(
-        mainService.renderStatus(rendered.session.id, otherMember.id),
+        readOnlyService.createRender({
+          ...request,
+          idempotencyKey: "acceptance-static-render-new-during-rollback",
+        }),
+        /read-only mode/i,
+      );
+      await assert.rejects(
+        readOnlyService.createRender({ ...request, actorId: otherMember.id }),
+        /read-only mode/i,
+      );
+      const otherWorkspaceService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceB.id,
+        store: noReferenceStore,
+        computeProviders: createComputeRegistry(),
+        renderProviders,
+        config: { ...CONFIG, submissionsEnabled: false },
+        workerId: "acceptance-static-render-cross-workspace-replay",
+      });
+      await assert.rejects(
+        otherWorkspaceService.createRender(request),
         /not found/i,
       );
-      const status = await mainService.renderStatus(rendered.session.id, owner.id);
-      assert.equal(status.status.state, "ready");
-      const renewed = await mainService.renewRender({
+      await assert.rejects(
+        service.renderStatus(rendered.session.id, otherMember.id),
+        /not found/i,
+      );
+      assert.equal((await service.renderStatus(rendered.session.id, owner.id)).status.state, "ready");
+      assert.equal((await service.renewRender({
         sessionId: rendered.session.id,
         actorId: owner.id,
-      });
-      assert.equal(renewed.state, "ready");
-      const closed = await mainService.closeRender({
+      })).state, "ready");
+
+      if (reproducedRun) {
+        const otherSource = (await service.getRunDossier(reproducedRun.id)).outputs.find(
+          (entry) => entry.version?.mediaType === "image/png",
+        );
+        assert.ok(otherSource?.version);
+        await assert.rejects(
+          service.createRender({
+            ...request,
+            runId: reproducedRun.id,
+            artifactVersionId: otherSource.version.id,
+          }),
+          /idempotency key.*different request intent/i,
+        );
+      }
+      const closed = await service.closeRender({
         sessionId: rendered.session.id,
         actorId: owner.id,
       });
       assert.equal(closed.state, "revoked");
-    });
+      assert.equal(closed.providerHandle, null);
+      const tombstone = await getScienceRenderSessionForWorkspace(
+        dbHandle.db,
+        workspaceA.id,
+        rendered.session.id,
+      );
+      assert.equal(tombstone?.state, "revoked");
+      assert.equal(tombstone?.providerHandle, null);
+      assert.equal((await service.createRender(request)).session.id, rendered.session.id);
+      assert.equal(
+        (await readOnlyService.createRender(request)).session.id,
+        rendered.session.id,
+        "terminal replay tombstone must remain available during rollback",
+      );
 
-    await acceptance("local render rejection never renews remote state", async () => {
-      const output = sourceDossier.outputs.find((entry) => entry.version)?.version;
-      assert.ok(output);
-      for (const targetState of ["starting", "expired", "revoked"]) {
-        const provider = new LongHandleRenderProvider(32, {
-          instanceId: `render-local-${targetState}`,
-          launchState: targetState === "starting" ? "starting" : "ready",
-        });
-        const service = createService({
-          db: dbHandle.db,
-          workspaceId: workspaceA.id,
-          store,
-          computeProviders: createComputeRegistry(),
-          renderProviders: renderRegistryWith(provider),
-          workerId: `acceptance-render-local-${targetState}`,
-        });
-        const rendered = await service.createRender({
-          runId: sourceRun.id,
-          artifactVersionId: output.id,
-          mode: "remote",
-          actorId: owner.id,
-        });
-        if (targetState !== "starting") {
-          await transitionScienceRenderSession(dbHandle.db, {
-            workspaceId: workspaceA.id,
-            sessionId: rendered.session.id,
-            ownerId: owner.id,
-            to: targetState,
-          });
-        }
+      const second = await service.createRender({
+        ...request,
+        idempotencyKey: "acceptance-static-render-after-close",
+      });
+      assert.equal(second.session.state, "ready", "tombstone must not hold quota");
+      await service.closeRender({ sessionId: second.session.id, actorId: owner.id });
+
+      const failingProvider = new CountingStaticRenderProvider({ failStarts: 1 });
+      const failingRegistry = new RenderProviderRegistry();
+      failingRegistry.register(failingProvider);
+      const recoveringService = createService({
+        db: dbHandle.db,
+        workspaceId: workspaceA.id,
+        store: noReferenceStore,
+        computeProviders: createComputeRegistry(),
+        renderProviders: failingRegistry,
+        config: { ...CONFIG, maxConcurrentRenderSessionsPerWorkspace: 1 },
+        workerId: "acceptance-static-render-failure-recovery",
+      });
+      const failureRequest = {
+        ...request,
+        idempotencyKey: "acceptance-static-render-failure-recovery",
+      };
+      await assert.rejects(
+        recoveringService.createRender(failureRequest),
+        /deterministic static launch failure fixture/i,
+      );
+      const reserved = (await listScienceRenderSessions(dbHandle.db, {
+        workspaceId: workspaceA.id,
+        page: { offset: 0, limit: 200 },
+      })).items.find((session) => session.requestKeyHash === digest(failureRequest.idempotencyKey));
+      assert.ok(reserved);
+      assert.equal(reserved.state, "starting");
+      assert.equal(reserved.providerHandle, null, "failed pre-launch claim must be replayable");
+      const recovered = await recoveringService.createRender(failureRequest);
+      assert.equal(recovered.session.id, reserved.id);
+      assert.equal(recovered.session.state, "ready");
+      assert.equal(failingProvider.startCalls, 2);
+      await recoveringService.closeRender({ sessionId: recovered.session.id, actorId: owner.id });
+
+      const nonPng = sourceDossier.outputs.find(
+        (entry) => entry.version?.mediaType !== "image/png",
+      );
+      assert.ok(nonPng?.version);
+      await assert.rejects(
+        service.createRender({
+          ...request,
+          artifactVersionId: nonPng.version.id,
+          idempotencyKey: "acceptance-static-render-json-refused",
+        }),
+        /only ready inline PNG/i,
+      );
+      for (const mode of ["client", "remote"]) {
         await assert.rejects(
-          service.renewRender({
-            sessionId: rendered.session.id,
-            actorId: owner.id,
+          service.createRender({
+            ...request,
+            mode,
+            idempotencyKey: `acceptance-${mode}-render-refused`,
           }),
-          /live ready render session/i,
-        );
-        assert.deepEqual(
-          provider.renewed,
-          [],
-          `remote renew was called for local state ${targetState}`,
+          /not released.*no implicit static downgrade/i,
         );
       }
-    });
-
-    await acceptance("render provider instance drift fences every remote operation", async () => {
-      const provider = new LongHandleRenderProvider(32, {
-        instanceId: "render-drift-a",
-      });
-      const service = createService({
-        db: dbHandle.db,
-        workspaceId: workspaceA.id,
-        store,
-        computeProviders: createComputeRegistry(),
-        renderProviders: renderRegistryWith(provider),
-        workerId: "acceptance-render-drift",
-      });
-      const output = sourceDossier.outputs.find((entry) => entry.version)?.version;
-      assert.ok(output);
-      const rendered = await service.createRender({
-        runId: sourceRun.id,
-        artifactVersionId: output.id,
-        mode: "remote",
-        actorId: owner.id,
-      });
-      assert.match(rendered.session.providerHandle, /:render-drift-a:/);
-      provider.instanceId = "render-drift-b";
-
-      await assert.rejects(
-        service.renderGateway(rendered.session.id, owner.id),
-        /identity changed.*admin action/i,
-      );
-      assert.equal(provider.statusCalls, 0);
-      await assert.rejects(
-        service.renewRender({
-          sessionId: rendered.session.id,
-          actorId: owner.id,
-        }),
-        /identity changed.*admin action/i,
-      );
-      assert.deepEqual(provider.renewed, []);
-      await assert.rejects(
-        service.closeRender({
-          sessionId: rendered.session.id,
-          actorId: owner.id,
-        }),
-        /identity changed.*admin action/i,
-      );
-      assert.deepEqual(provider.closed, []);
-
-      await transitionScienceRenderSession(dbHandle.db, {
-        workspaceId: workspaceA.id,
-        sessionId: rendered.session.id,
-        ownerId: owner.id,
-        to: "expired",
-      });
-      await service.reconcile();
-      assert.deepEqual(provider.closed, []);
-    });
-
-    await acceptance("near-limit remote render handle persists at exactly 500 characters", async () => {
-      const durablePrefix = "science-render:trame:render-a:";
-      const provider = new LongHandleRenderProvider(500 - durablePrefix.length);
-      const service = createService({
-        db: dbHandle.db,
-        workspaceId: workspaceA.id,
-        store,
-        computeProviders: createComputeRegistry(),
-        renderProviders: renderRegistryWith(provider),
-        workerId: "acceptance-render-handle-limit",
-      });
-      const output = sourceDossier.outputs.find((entry) => entry.version)?.version;
-      assert.ok(output);
-      const rendered = await service.createRender({
-        runId: sourceRun.id,
-        artifactVersionId: output.id,
-        mode: "remote",
-        actorId: owner.id,
-      });
-      assert.equal(rendered.session.state, "ready");
-      assert.equal(rendered.session.providerHandle.length, 500);
-      await service.closeRender({
-        sessionId: rendered.session.id,
-        actorId: owner.id,
-      });
-      assert.deepEqual(provider.closed, [provider.handle]);
-    });
-
-    await acceptance("oversized remote render handle fails and cleans up launched provider", async () => {
-      const durablePrefix = "science-render:trame:render-a:";
-      const provider = new LongHandleRenderProvider(501 - durablePrefix.length);
-      const service = createService({
-        db: dbHandle.db,
-        workspaceId: workspaceA.id,
-        store,
-        computeProviders: createComputeRegistry(),
-        renderProviders: renderRegistryWith(provider),
-        workerId: "acceptance-render-handle-overflow",
-      });
-      const before = await listScienceRenderSessions(dbHandle.db, {
-        workspaceId: workspaceA.id,
-        state: "failed",
-        page: { offset: 0, limit: 200 },
-      });
-      const output = sourceDossier.outputs.find((entry) => entry.version)?.version;
-      assert.ok(output);
-      await assert.rejects(
-        service.createRender({
-          runId: sourceRun.id,
-          artifactVersionId: output.id,
-          mode: "remote",
-          actorId: owner.id,
-        }),
-        /500-character limit/i,
-      );
-      assert.deepEqual(provider.closed, [provider.handle]);
-      const after = await listScienceRenderSessions(dbHandle.db, {
-        workspaceId: workspaceA.id,
-        state: "failed",
-        page: { offset: 0, limit: 200 },
-      });
-      assert.equal(
-        after.items.length,
-        before.items.length,
-        "confirmed compensation close must remove the terminal render metadata",
-      );
-    });
-
-    await acceptance("failed render compensation retains the admitted fenced handle", async () => {
-      const provider = new LongHandleRenderProvider(32, {
-        instanceId: "render-admitted-a",
-        launchInstanceId: "invalid instance id",
-        closeFails: true,
-      });
-      const service = createService({
-        db: dbHandle.db,
-        workspaceId: workspaceA.id,
-        store,
-        computeProviders: createComputeRegistry(),
-        renderProviders: renderRegistryWith(provider),
-        workerId: "acceptance-render-compensation-hold",
-      });
-      const output = sourceDossier.outputs.find((entry) => entry.version)?.version;
-      assert.ok(output);
-      await assert.rejects(
-        service.createRender({
-          runId: sourceRun.id,
-          artifactVersionId: output.id,
-          mode: "remote",
-          actorId: owner.id,
-        }),
-        /bounded immutable instance ID/i,
-      );
-      assert.deepEqual(provider.closed, [provider.handle]);
-      assert.deepEqual(provider.closeFences, ["render-admitted-a"]);
-      const failed = await listScienceRenderSessions(dbHandle.db, {
-        workspaceId: workspaceA.id,
-        state: "failed",
-        page: { offset: 0, limit: 200 },
-      });
-      const retained = failed.items.find((session) =>
-        session.providerHandle?.includes(":render-admitted-a:"));
-      assert.ok(retained, "failed compensation must retain the exact durable handle");
-      await service.cleanupRetention();
-      assert.ok(
-        await getScienceRenderSessionForWorkspace(
-          dbHandle.db,
-          workspaceA.id,
-          retained.id,
-        ),
-        "cleanup must retain a handle until provider close is proven",
-      );
+      assert.equal(provider.startCalls, 2, "refused modes and media must not start a provider");
     });
 
     await acceptance("public science tool results contain no internal paths, handles, or secrets", async () => {
@@ -3022,6 +4423,12 @@ try {
           context,
         ),
       ]);
+      assert.equal(results[2].run.manifest.complete, true);
+      assert.equal(results[2].manifestAssessment.complete, true);
+      assert.deepEqual(results[2].manifestAssessment.gaps, []);
+      assert.equal(results[2].manifestAssessment.manifestHash, sourceRun.manifestHash);
+      assert.equal(results[3].complete, true);
+      assert.deepEqual(results[3].gaps, []);
       const toolSubmission = await registry.callTool(
         "science",
         "run.submit",
@@ -3042,6 +4449,81 @@ try {
       );
       results.push(toolSubmission);
       assert.equal(toolSubmission.run.state, "awaiting_approval");
+      const renderOutput = sourceDossier.outputs.find(
+        (entry) => entry.version?.mediaType === "image/png",
+      )?.version;
+      assert.ok(renderOutput);
+      const toolRender = await registry.callTool(
+        "science",
+        "render.open",
+        {
+          runId: sourceRun.id,
+          artifactVersionId: renderOutput.id,
+          mode: "static",
+          idempotencyKey: "acceptance-science-tool-render",
+        },
+        context,
+      );
+      results.push(toolRender);
+      assert.equal(toolRender.mode, "static");
+      assert.equal(toolRender.provider, "static");
+      assert.equal(toolRender.source.artifactVersionId, renderOutput.id);
+      await mainService.closeRender({
+        sessionId: toolRender.renderSessionId,
+        actorId: owner.id,
+      });
+
+      // Model a pre-hardening/corrupt terminal record whose immutable bytes
+      // still claim completeness but whose persisted hash no longer verifies.
+      // Public consumers must keep those bytes visible as evidence without
+      // treating their historical flag as the current operational verdict.
+      const originalManifestHash = sourceRun.manifestHash;
+      const staleManifestHash = originalManifestHash === "f".repeat(64)
+        ? "e".repeat(64)
+        : "f".repeat(64);
+      await dbHandle.db.execute(sql`
+        UPDATE science_runs
+           SET manifest_hash = ${staleManifestHash}
+         WHERE id = ${sourceRun.id}
+      `);
+      try {
+        const [staleStatus, staleManifest] = await Promise.all([
+          registry.callTool(
+            "science",
+            "run.status",
+            { runId: sourceRun.id, eventLimit: 20 },
+            context,
+          ),
+          registry.callTool(
+            "science",
+            "manifest.read",
+            { runId: sourceRun.id },
+            context,
+          ),
+        ]);
+        assert.equal(staleStatus.run.manifest.complete, true);
+        assert.equal(staleStatus.manifestAssessment.complete, false);
+        assert.ok(staleStatus.manifestAssessment.gaps.includes("manifest.hash.mismatch"));
+        assert.equal(staleStatus.manifestAssessment.manifestHash, staleManifestHash);
+        assert.equal(staleManifest.manifest.complete, true);
+        assert.equal(staleManifest.complete, false);
+        assert.ok(staleManifest.gaps.includes("manifest.hash.mismatch"));
+        await assert.rejects(
+          mainService.reproduceRun({
+            runId: sourceRun.id,
+            actorId: owner.id,
+            idempotencyKey: "acceptance-stale-complete-manifest-refused",
+          }),
+          /currently verified complete manifest/i,
+        );
+        results.push(staleStatus, staleManifest);
+      } finally {
+        await dbHandle.db.execute(sql`
+          UPDATE science_runs
+             SET manifest_hash = ${originalManifestHash}
+           WHERE id = ${sourceRun.id}
+        `);
+      }
       const serialized = JSON.stringify(results);
       for (const forbidden of [
         STORAGE_SECRET,

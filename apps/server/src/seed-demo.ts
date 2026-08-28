@@ -396,7 +396,7 @@ async function main(): Promise<void> {
   const audit = createAuditSink(db);
   const executor = new WorkflowExecutor({ db, bus, tools, audit });
   const runtime = new AgentRuntime({ db, bus, router, tools, embedder, audit });
-  executor.setAgentInvoker(createAgentInvoker({ db, runtime }));
+  executor.setAgentInvoker(createAgentInvoker({ db, workspaceId, runtime }));
   registerBridgeTools(tools, { db, workspaceId, executor });
   const kb: KbDeps = { db, workspaceId, embedder };
   registerKbTools(tools, kb);
@@ -433,19 +433,19 @@ async function main(): Promise<void> {
 
   // --- Activity drivers --------------------------------------------------------
   const runWorkflow = async (name: string, input: unknown) => {
-    const m = await startWorkflow(db, { workflowId: workflowIds[name]!, trigger: { mode: "manual" }, payload: input });
+    const m = await startWorkflow(db, { workspaceId, workflowId: workflowIds[name]!, trigger: { mode: "manual" }, payload: input });
     await dispatch(m.id);
     return m.id;
   };
   /** Start but DO NOT dispatch — leaves the mission `queued` = a live thread. */
   const queueWorkflow = async (name: string, input: unknown) => {
-    await startWorkflow(db, { workflowId: workflowIds[name]!, trigger: { mode: "manual" }, payload: input });
+    await startWorkflow(db, { workspaceId, workflowId: workflowIds[name]!, trigger: { mode: "manual" }, payload: input });
   };
   const queueAgent = async (name: string, message: string) => {
-    await startAgentTick(db, { agentId: agentIds[name]!, trigger: { mode: "chat" }, payload: { message } });
+    await startAgentTick(db, { workspaceId, agentId: agentIds[name]!, trigger: { mode: "chat" }, payload: { message } });
   };
   const chat = async (name: string, message: string) => {
-    const m = await startAgentTick(db, { agentId: agentIds[name]!, trigger: { mode: "chat" }, payload: { message } });
+    const m = await startAgentTick(db, { workspaceId, agentId: agentIds[name]!, trigger: { mode: "chat" }, payload: { message } });
     await dispatch(m.id);
     return m.id;
   };

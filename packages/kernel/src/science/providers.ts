@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { deflateSync } from "node:zlib";
 import { z } from "zod";
 import { canonicalJson } from "./manifest.js";
 import type { ArtifactReference } from "./artifact-store.js";
@@ -273,7 +274,63 @@ function decodeHandle(handle: string): DeterministicHandle {
   return row as unknown as DeterministicHandle;
 }
 
+function pngCrc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const kind = Buffer.from(type, "ascii");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(pngCrc32(Buffer.concat([kind, data])));
+  return Buffer.concat([length, kind, data, crc]);
+}
+
+/** Small data-derived PNG used only as an honest deterministic fixture preview. */
+function deterministicFixturePng(handle: DeterministicHandle): Buffer {
+  const width = 32;
+  const height = 32;
+  const seed = createHash("sha256")
+    .update(`${handle.runId}:${handle.generation}:${handle.parametersHash}`)
+    .digest();
+  const scanlines = Buffer.alloc((width * 4 + 1) * height);
+  for (let y = 0; y < height; y++) {
+    const row = y * (width * 4 + 1);
+    scanlines[row] = 0;
+    for (let x = 0; x < width; x++) {
+      const offset = row + 1 + x * 4;
+      const sample = seed[(x + y * 7) % seed.length];
+      scanlines[offset] = (sample + x * 5) & 0xff;
+      scanlines[offset + 1] = (seed[(x * 3 + y) % seed.length] + y * 5) & 0xff;
+      scanlines[offset + 2] = Math.round((x + y) * 255 / (width + height - 2));
+      scanlines[offset + 3] = 255;
+    }
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(scanlines, { level: 9 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
 function deterministicOutput(handle: DeterministicHandle, reference: string): Buffer {
+  if (reference.endsWith(":fixture-preview-png")) {
+    return deterministicFixturePng(handle);
+  }
   if (reference.endsWith(":vtk")) {
     const amplitude = Number.parseInt(handle.parametersHash.slice(0, 8), 16) / 0xffffffff;
     return Buffer.from(
@@ -439,20 +496,49 @@ export class DeterministicComputeProvider implements ComputeProvider {
     assertProviderInstanceFence(this.instanceId, fence);
     const value = decodeHandle(handle);
     if (value.generation !== generation) throw new Error("provider generation mismatch");
-    const refs = [`${handle}:result`, `${handle}:vtk`];
-    return refs.map((reference, index) => {
+    const specs = [
+      {
+        reference: `${handle}:result`,
+        logicalName: "result.json",
+        kind: "result" as const,
+        format: "json",
+        mediaType: "application/json",
+        metadata: { schema: "science-result.v1", measured: true },
+      },
+      {
+        reference: `${handle}:vtk`,
+        logicalName: "result.vtk",
+        kind: "geometry" as const,
+        format: "vtk",
+        mediaType: "model/vnd.vtk",
+        metadata: { dataset: "STRUCTURED_POINTS", dimensions: [2, 2, 2], preview: true },
+      },
+      {
+        reference: `${handle}:fixture-preview-png`,
+        logicalName: "fixture-preview.png",
+        kind: "image" as const,
+        format: "png",
+        mediaType: "image/png",
+        metadata: {
+          fixturePreview: true,
+          productionCompute: false,
+          derivedFrom: "deterministic fixture run and parameter hashes",
+          dimensions: [32, 32],
+        },
+      },
+    ];
+    return specs.map((spec) => {
+      const reference = spec.reference;
       const bytes = deterministicOutput(value, reference);
       return {
         reference,
-        logicalName: index === 0 ? "result.json" : "result.vtk",
-        kind: index === 0 ? "result" : "geometry",
-        format: index === 0 ? "json" : "vtk",
-        mediaType: index === 0 ? "application/json" : "model/vnd.vtk",
+        logicalName: spec.logicalName,
+        kind: spec.kind,
+        format: spec.format,
+        mediaType: spec.mediaType,
         sha256: createHash("sha256").update(bytes).digest("hex"),
         size: bytes.length,
-        metadata: index === 0
-          ? { schema: "science-result.v1", measured: true }
-          : { dataset: "STRUCTURED_POINTS", dimensions: [2, 2, 2], preview: true },
+        metadata: spec.metadata,
       } satisfies ProviderOutput;
     });
   }

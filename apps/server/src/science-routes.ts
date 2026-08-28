@@ -6,6 +6,7 @@ import type {
 import { Readable } from "node:stream";
 import {
   ScienceArtifactKind,
+  ScienceDomainValidationSubmission,
   ScienceResourceBounds,
   ScienceRunState,
 } from "@puppetmaster/shared";
@@ -17,12 +18,24 @@ import {
   type ScienceService,
 } from "@puppetmaster/kernel";
 import { z } from "zod";
+import {
+  canonicalRequestPath,
+  InvalidRequestPathError,
+} from "./request-path.js";
 
 const Uuid = z.string().uuid();
 const Page = z.object({
   offset: z.coerce.number().int().nonnegative().optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
 }).passthrough();
+const StrictPage = z.object({
+  offset: z.coerce.number().int().nonnegative().optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+}).strict();
+const ValidationPage = z.object({
+  offset: z.coerce.number().int().nonnegative().optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+}).strict();
 const ResourceRequest = ScienceResourceBounds;
 const RunArtifactInput = z.object({
   artifactVersionId: Uuid,
@@ -190,14 +203,43 @@ function publicRender<T extends {
   tokenHash: string;
   providerHandle: string | null;
   audience: string;
+  requestKeyHash: string;
+  intentFingerprint: string;
+  providerKind: string;
+  sourceSha256: string;
+  sourceMediaType: string;
+  sourceSizeBytes: number;
+  sourceLogicalName: string;
+  launchLeaseId: string | null;
+  launchLeaseExpiresAt: Date | null;
+  artifactVersionId: string | null;
 }>(session: T) {
   const {
     tokenHash: _tokenHash,
     providerHandle: _providerHandle,
     audience: _audience,
+    requestKeyHash: _requestKeyHash,
+    intentFingerprint: _intentFingerprint,
+    providerKind,
+    sourceSha256,
+    sourceMediaType,
+    sourceSizeBytes,
+    sourceLogicalName,
+    launchLeaseId: _launchLeaseId,
+    launchLeaseExpiresAt: _launchLeaseExpiresAt,
     ...safe
   } = session;
-  return safe;
+  return {
+    ...safe,
+    provider: providerKind,
+    source: {
+      artifactVersionId: session.artifactVersionId,
+      sha256: sourceSha256,
+      mediaType: sourceMediaType,
+      sizeBytes: sourceSizeBytes,
+      logicalName: sourceLogicalName,
+    },
+  };
 }
 
 function publicAdmission<T extends {
@@ -207,6 +249,82 @@ function publicAdmission<T extends {
 }>(admission: T) {
   const { workspaceId, admitted, updatedAt } = admission;
   return { workspaceId, admitted, updatedAt };
+}
+
+function publicDomainValidationSummary(item: Awaited<
+  ReturnType<ScienceService["listDomainValidations"]>
+>["items"][number]) {
+  return {
+    id: item.id,
+    runId: item.runId,
+    revision: item.revision,
+    baselineRunId: item.baselineRunId,
+    kind: item.kind,
+    metric: item.metric,
+    tolerance: item.tolerance,
+    observedValue: item.observedValue,
+    units: item.units,
+    methodProtocolId: item.methodProtocolId,
+    decision: item.decision,
+    limitationsReason: item.limitationsReason,
+    reviewerId: item.reviewerId,
+    reviewerRole: item.reviewerRole,
+    runManifestHash: item.runManifestHash,
+    baselineManifestHash: item.baselineManifestHash,
+    createdAt: item.createdAt,
+    recordHash: item.recordHash,
+  };
+}
+
+function publicDomainValidationDetail(item: Awaited<
+  ReturnType<ScienceService["getDomainValidation"]>
+>) {
+  const outputs = (entries: typeof item.runOutputChecksums) => entries.map((entry) => ({
+    artifactVersionId: entry.artifactVersionId,
+    semanticRole: entry.semanticRole,
+    sha256: entry.sha256,
+    sizeBytes: entry.sizeBytes,
+  }));
+  return {
+    id: item.id,
+    workspaceId: item.workspaceId,
+    runId: item.runId,
+    revision: item.revision,
+    baselineRunId: item.baselineRunId,
+    kind: item.kind,
+    metric: item.metric,
+    tolerance: item.tolerance,
+    observedValue: item.observedValue,
+    units: item.units,
+    methodProtocolId: item.methodProtocolId,
+    decision: item.decision,
+    limitationsReason: item.limitationsReason,
+    reviewerId: item.reviewerId,
+    reviewerRole: item.reviewerRole,
+    runManifestHash: item.runManifestHash,
+    runOutputChecksums: outputs(item.runOutputChecksums),
+    baselineManifestHash: item.baselineManifestHash,
+    baselineOutputChecksums: item.baselineOutputChecksums
+      ? outputs(item.baselineOutputChecksums)
+      : null,
+    createdAt: item.createdAt,
+    recordHash: item.recordHash,
+  };
+}
+
+function publicAdminActionQueueItem(item: Awaited<
+  ReturnType<ScienceService["listAdminActionQueue"]>
+>["items"][number]) {
+  return {
+    id: item.id,
+    kind: item.kind,
+    state: item.state,
+    ageSeconds: item.ageSeconds,
+    attempts: item.attempts,
+    nextRetryAt: item.nextRetryAt,
+    reason: item.reason,
+    links: item.links.map(({ rel, href }) => ({ rel, href })),
+  };
 }
 
 function parseSingleRange(header: string | undefined, size: number) {
@@ -251,6 +369,8 @@ function flattenRunDossier(
     sha256: entry.version?.sha256 ?? null,
     sizeBytes: entry.version?.sizeBytes ?? null,
     mediaType: entry.version?.mediaType ?? null,
+    logicalName: entry.artifact?.logicalName ?? null,
+    format: entry.artifact?.format ?? null,
   });
   return {
     ...publicRun(dossier.run),
@@ -287,8 +407,14 @@ export function registerScienceRoutes(
   // distributed policy, but the application still bounds authenticated and
   // signed-capability traffic when deployed without one.
   app.addHook("preHandler", async (request, reply) => {
-    const path = request.url.split("?")[0] ?? request.url;
-    if (!path.startsWith("/api/science")) return;
+    let path: string;
+    try {
+      path = canonicalRequestPath(request.url);
+    } catch (error) {
+      if (!(error instanceof InvalidRequestPathError)) throw error;
+      return reply.code(400).send({ error: "invalid request path" });
+    }
+    if (path !== "/api/science" && !path.startsWith("/api/science/")) return;
     const now = Date.now();
     if (rateBuckets.size >= 10_000) {
       for (const [key, bucket] of rateBuckets) {
@@ -345,6 +471,17 @@ export function registerScienceRoutes(
       actorId: actor(request),
     });
     return { admission: publicAdmission(admission) };
+  }));
+
+  app.get("/api/science/admin/action-queue", route(async (request) => {
+    const query = StrictPage.parse(request.query);
+    const actionQueue = await service.listAdminActionQueue({
+      page: { offset: query.offset, limit: query.limit },
+    });
+    return {
+      ...actionQueue,
+      items: actionQueue.items.map(publicAdminActionQueueItem),
+    };
   }));
 
   app.get("/api/science/studies", route(async (request) => {
@@ -703,12 +840,13 @@ export function registerScienceRoutes(
     const { runId } = z.object({ runId: Uuid }).parse(request.params);
     const body = z.object({
       generation: z.number().int().nonnegative(),
-      reason: z.string().trim().max(1_000).optional(),
+      reason: z.string().trim().min(1).max(1_000).optional(),
     }).strict().parse(request.body);
     const result = await service.cancelRun({
       runId,
       expectedGeneration: body.generation,
       actorId: actor(request),
+      reason: body.reason,
     });
     return { run: publicRun(result.run), accepted: result.accepted };
   }));
@@ -734,6 +872,57 @@ export function registerScienceRoutes(
           }
         : null,
     };
+  }));
+
+  app.get("/api/science/runs/:runId/validations", route(async (request) => {
+    const { runId } = z.object({ runId: Uuid }).parse(request.params);
+    const query = ValidationPage.parse(request.query);
+    const validations = await service.listDomainValidations(runId, {
+      offset: query.offset,
+      limit: query.limit,
+    });
+    return {
+      ...validations,
+      items: validations.items.map(publicDomainValidationSummary),
+    };
+  }));
+
+  app.get("/api/science/runs/:runId/validations/:validationId", route(async (request) => {
+    const { runId, validationId } = z.object({
+      runId: Uuid,
+      validationId: Uuid,
+    }).strict().parse(request.params);
+    return {
+      validation: publicDomainValidationDetail(
+        await service.getDomainValidation(runId, validationId),
+      ),
+    };
+  }));
+
+  app.post("/api/science/runs/:runId/validations", route(async (request, reply) => {
+    const { runId } = z.object({ runId: Uuid }).parse(request.params);
+    const reviewer = request.authUser;
+    if (!reviewer || (reviewer.role !== "admin" && reviewer.role !== "owner")) {
+      return reply.code(403).send({ error: "requires admin role" });
+    }
+    const body = ScienceDomainValidationSubmission.parse(request.body);
+    const validation = await service.recordDomainValidation({
+      runId,
+      ...body,
+      reviewerId: reviewer.id,
+      reviewerRole: reviewer.role,
+    });
+    return reply.code(201).send({
+      validation: publicDomainValidationDetail(validation),
+    });
+  }));
+
+  app.get("/api/science/runs/:runId/comparison", route(async (request) => {
+    const { runId } = z.object({ runId: Uuid }).parse(request.params);
+    const { candidateRunId } = z.object({
+      candidateRunId: Uuid,
+    }).strict().parse(request.query);
+    return service.compareRuns(runId, candidateRunId);
   }));
 
   app.post("/api/science/runs/:runId/reproduce", route(async (request, reply) => {
@@ -764,20 +953,24 @@ export function registerScienceRoutes(
   app.post("/api/science/runs/:runId/render-sessions", route(async (request, reply) => {
     const { runId } = z.object({ runId: Uuid }).parse(request.params);
     const body = z.object({
-      artifactVersionId: Uuid.optional(),
-      mode: z.enum(["client", "remote", "static"]).optional(),
-      audience: z.string().max(500).optional(),
+      artifactVersionId: Uuid,
+      mode: z.enum(["client", "remote", "static"]),
+      idempotencyKey: z.string().trim().min(1).max(200),
     }).strict().parse(request.body ?? {});
     const result = await service.createRender({
       runId,
       artifactVersionId: body.artifactVersionId,
       mode: body.mode,
+      idempotencyKey: body.idempotencyKey,
       actorId: actor(request),
     });
-    return reply.code(201).send({
+    return reply.code(result.created ? 201 : result.session.state === "starting" ? 202 : 200).send({
       session: publicRender(result.session),
       renderUrl: result.url,
       mode: result.mode,
+      provider: result.provider,
+      source: result.source,
+      created: result.created,
       expiresAt: result.expiresAt,
     });
   }));

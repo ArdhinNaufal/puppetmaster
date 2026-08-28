@@ -78,6 +78,16 @@ export const ActionConfig = z.object({
   server: z.string().min(1),
   tool: z.string().min(1),
   args: z.record(z.unknown()).default({}),
+  /**
+   * A deliberately narrow durable wait contract. The first implementation is
+   * restricted by the linter and executor to the read-only
+   * `science.run.status` tool; arbitrary or mutating tools cannot opt into
+   * repeated deferred execution.
+   */
+  defer: z
+    .object({ kind: z.literal("science_run_terminal") })
+    .strict()
+    .optional(),
 });
 export type ActionConfig = z.infer<typeof ActionConfig>;
 
@@ -129,6 +139,7 @@ export type WorkflowDefinition = z.infer<typeof WorkflowDefinition>;
 export const MissionStatus = z.enum([
   "queued",
   "running",
+  "waiting",
   "awaiting_approval",
   "succeeded",
   "failed",
@@ -155,6 +166,7 @@ export type Mission = z.infer<typeof Mission>;
 export const StepStatus = z.enum([
   "pending",
   "running",
+  "waiting",
   "succeeded",
   "failed",
   "skipped",

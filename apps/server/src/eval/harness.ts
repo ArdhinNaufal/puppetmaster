@@ -70,7 +70,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
     registerBenchTools(tools, { db, workspaceId, executor: new LocalCommandExecutor() });
     const executor = new WorkflowExecutor({ db, bus, tools, checkRunner: createBuiltinCheckRunner({ db, executor: new LocalCommandExecutor() }) });
     const runtime = new AgentRuntime({ db, bus, router, tools, embedder });
-    executor.setAgentInvoker(createAgentInvoker({ db, runtime }));
+    executor.setAgentInvoker(createAgentInvoker({ db, workspaceId, runtime }));
 
     let subjectId: string;
     let missionId: string;
@@ -84,6 +84,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
       });
       subjectId = agent.id;
       const mission = await startAgentTick(db, {
+        workspaceId,
         agentId: agent.id,
         trigger: { mode: "eval" },
         payload: { message: task.message ?? "" },
@@ -96,6 +97,7 @@ async function runTaskOnce(task: GoldenTask): Promise<{ pass: boolean; trajector
       subjectId = created.workflow.id;
       const seeded = task.setup ? await task.setup(db, { workspaceId }) : {};
       const mission = await startWorkflow(db, {
+        workspaceId,
         workflowId: created.workflow.id,
         trigger: { mode: "eval" },
         payload: { ...(task.input as Record<string, unknown> | undefined), ...seeded },

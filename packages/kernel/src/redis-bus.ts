@@ -1,8 +1,29 @@
-import { Redis } from "ioredis";
+import { Redis, type RedisOptions } from "ioredis";
 import type { BusEvent, EventBus } from "./bridge.js";
 
 const STREAM_KEY = "puppetmaster:bus";
 const MAXLEN = 10_000;
+export const REDIS_EVENT_PUBLISH_TIMEOUT_MS = 1_500;
+
+export interface RedisEventBusOptions {
+  publishTimeoutMs?: number;
+  /** Dependency seam for deterministic transport-failure verification. */
+  clientFactory?: (url: string, role: "writer" | "reader") => Redis;
+}
+
+export function redisEventBusConnectionOptions(
+  role: "writer" | "reader",
+  publishTimeoutMs = REDIS_EVENT_PUBLISH_TIMEOUT_MS,
+): RedisOptions {
+  return role === "writer"
+    ? {
+        maxRetriesPerRequest: 1,
+        enableOfflineQueue: false,
+        connectTimeout: publishTimeoutMs,
+        commandTimeout: publishTimeoutMs,
+      }
+    : { maxRetriesPerRequest: null };
+}
 
 /**
  * Redis-streams implementation of the kernel bus. `publish` appends to a single
@@ -16,14 +37,22 @@ export class RedisEventBus implements EventBus {
   private handlers = new Set<(event: BusEvent) => void>();
   private running = false;
   private lastId = "$";
+  private readonly publishTimeoutMs: number;
 
-  constructor(url: string) {
-    this.writer = new Redis(url, { maxRetriesPerRequest: null });
-    this.reader = new Redis(url, { maxRetriesPerRequest: null });
+  constructor(url: string, options: RedisEventBusOptions = {}) {
+    const publishTimeoutMs = options.publishTimeoutMs ?? REDIS_EVENT_PUBLISH_TIMEOUT_MS;
+    if (!Number.isSafeInteger(publishTimeoutMs) || publishTimeoutMs < 1 || publishTimeoutMs > 60_000) {
+      throw new Error("Redis event publish timeout must be an integer between 1 and 60000 ms");
+    }
+    this.publishTimeoutMs = publishTimeoutMs;
+    const clientFactory = options.clientFactory ?? ((redisUrl: string, role: "writer" | "reader") =>
+      new Redis(redisUrl, redisEventBusConnectionOptions(role, publishTimeoutMs)));
+    this.writer = clientFactory(url, "writer");
+    this.reader = clientFactory(url, "reader");
   }
 
   async publish(event: BusEvent): Promise<void> {
-    await this.writer.xadd(
+    const operation = this.writer.xadd(
       STREAM_KEY,
       "MAXLEN",
       "~",
@@ -32,6 +61,21 @@ export class RedisEventBus implements EventBus {
       "data",
       JSON.stringify(event),
     );
+    // Stream delivery is advisory: authoritative state is committed in the
+    // database before callers publish. Redis failure or disconnection must not
+    // strand that committed API/tick work, nor retain an unbounded offline
+    // command queue while Redis is unavailable.
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, this.publishTimeoutMs);
+      void operation.then(finish, finish);
+    });
   }
 
   subscribe(handler: (event: BusEvent) => void): () => void {

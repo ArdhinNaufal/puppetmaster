@@ -86,7 +86,12 @@
   flagging divergence between expected and recorded activation).
 
 ### 3.3 The Bridge (differentiator)
-- Internal event bus (Redis streams) with typed events: `mission.*`, `agent.*`, `workflow.*`, `approval.*`.
+- Internal event bus (Redis Streams) with typed events: `mission.*`, `agent.*`,
+  `workflow.*`, `approval.*`. For Science Operations these are bounded advisory
+  notifications: database state and persisted run-event records are
+  authoritative, subscribers start at the latest stream ID, and there is no
+  durable Redis replay cursor. Reconnect performs a database/REST resync.
+  BullMQ scheduling is a separate Redis-backed contract.
 - **Agent → workflow:** workflows are exposed to agents as MCP tools (`workflow.run`, `workflow.create_draft`), so an agent can launch or even draft workflows.
 - **Workflow → agent:** the Agent node sends a task to an agent and awaits its structured result (sync with timeout, or async continuation).
 - Shared mission context: a workflow started by an agent carries the agent's mission ID; traces nest.
@@ -294,9 +299,10 @@ orchestrator. Its implementation is split deliberately between planning and exec
   resumes cleanup after restart, and quarantines malformed or tampered evidence. The isolated
   holder owns cancellation independently of the local `docker exec` client; normal cleanup proves
   exact run ID/generation holder removal before removing scratch/state volumes.
-- Run state, stream events, usage, mission state, and terminal audit evidence are durable.
-  Workspace-scoped WebSocket updates are best-effort accelerators over polling and paged event
-  recovery, not the source of truth.
+- Database run state, persisted event records, usage, mission state, and
+  terminal audit evidence are durable. Redis/WebSocket notifications are
+  best-effort accelerators over polling and paged database event recovery, not
+  the source of truth.
 - Startup reconciliation runs before queue intake. It handles ledger rows and also enumerates
   pre-intent `running` claims, proves exact-generation (or legacy generation-zero) termination,
   removes disposable artifacts, and terminalizes the guarded run/mission. Shutdown rejects new

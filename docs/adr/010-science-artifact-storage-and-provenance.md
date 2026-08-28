@@ -2,10 +2,12 @@
 
 ## Status
 
-Accepted for filesystem and S3-compatible adapter contracts (2026-07-29).
+Accepted for filesystem and S3-compatible adapter contracts (2026-07-29;
+evidence reconciled 2026-08-24).
 
-Live MinIO/S3 durability, retention, and backup/restore evidence is still
-pending and is not implied by this ADR.
+A dedicated loopback MinIO/S3 adapter lane passes. Target object-store
+durability, TLS/IAM, versioning, retention, and backup/restore evidence is
+still pending and is not implied by this ADR.
 
 ## Context
 
@@ -33,7 +35,15 @@ Bytes are managed by `ArtifactStore`:
   accepted, streaming and completion may converge after revocation so that
   quarantined bytes and reservations are not stranded.
 - Upload intent creates a one-use opaque token and an empty quarantine object.
-- Upload streams are bounded and hashed while being written.
+- Upload streams are bounded and hashed while being written. External client
+  transfers have a whole-store absolute deadline and a body-idle deadline.
+  A database-authoritative workspace-row fence limits concurrent external
+  streams across server instances; internal provider-output ingestion does not
+  consume that client allowance.
+- A timed-out external transfer stops lease renewal, cancels the request body
+  and iterator, waits for the store writer to settle after abort, and records a
+  quarantined reservation eligible for immediate cleanup. Failed object
+  discard remains retained and quota-charged for backoff cleanup.
 - Completion compares declared and observed size/SHA-256, rejects active or
   inconsistent media types, and performs bounded structure/signature checks for
   admitted pilot formats before promotion.
@@ -67,10 +77,21 @@ direction and semantic role. A successful run stores:
 
 Manifest completeness is an explicit assessment. Success alone is insufficient.
 At minimum, a complete manifest needs exact inputs and outputs, an approved
-execution, a non-empty dependency lock, checksummed validation, and either a
-code/notebook/solver artifact role or a verified source revision. Reproduction
-is refused if the current compute-profile snapshot or provider adapter version
-differs from the captured manifest.
+execution, a non-empty dependency lock, checksummed validation, and a linked
+immutable `ready` input whose uploaded bytes parsed as `ipynb` and whose run
+role is `code`, `notebook`, or `solver`. Raw
+`parameters.sourceRevision` is informational user input, no VCS resolver
+verifies it, and the verified top-level manifest field remains `null`.
+
+The canonical manifest bytes and their SHA-256 remain immutable. Reads also
+return a current structural and relational assessment derived from those bytes
+and the current database links/profile/version metadata. That top-level
+`complete`/`gaps` verdict can become incomplete if legacy or corrupted
+relations no longer support the stored claim; it does not rewrite the manifest
+or its hash. Declared historical gaps are preserved rather than erased by a
+later reassessment. Reproduction is refused when this current assessment is
+incomplete or when the compute-profile snapshot/provider adapter differs from
+the captured manifest.
 
 No general provenance graph is introduced in v1. The run input/output relation
 and manifest are the source of truth for the MVP lineage questions.
@@ -107,8 +128,8 @@ Negative:
 - Object bytes and metadata need a coordinated backup/restore procedure.
 - There is no resumable append protocol; an interrupted upload starts a new
   intent.
-- Retention deletion, object-versioning policy, live MinIO/S3 validation, and a
-  demonstrated disaster-recovery drill remain pending.
+- Retention policy, target object-versioning policy, and a demonstrated target
+  disaster-recovery drill remain pending.
 
 ## Verification
 
@@ -120,10 +141,16 @@ Contract and deterministic adapter behavior are represented by:
 - `scripts/verify-science-lifecycle.mjs`
 - `packages/kernel/src/science/manifest.ts`
 
-The S3 verifier uses a bounded local mock. It is not evidence for a real
-MinIO/S3 deployment, bucket policy, object versioning, or restore.
-The current post-migration-11 aggregate/root rerun is pending; this ADR records
-the intended and source-asserted boundary, not a fresh release pass.
+The deterministic S3 verifier uses a bounded local mock, and a separate
+dedicated loopback MinIO/S3 adapter lane passes immutable promotion, reads,
+ranges, duplicate refusal, receipts, and exact deletion. Neither result proves
+the target bucket policy, TLS/IAM, object versioning, backup, or restore. The
+fresh deterministic aggregate is
+`SCIENCE GOLDEN PASS^3: 18 isolated deterministic suites; 34 evidence classes
+verified on every pass`. It includes adversarial provenance cases for parsed
+notebook identity, raw-revision refusal, stored-gap preservation, relational
+forgery, current public verdicts, and reproduction refusal; it is not
+scientific-domain validation.
 
 ## Reconsider when
 

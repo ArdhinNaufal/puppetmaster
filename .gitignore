@@ -1,4 +1,6 @@
 node_modules/
+.pnpm-store/
+.tmp/
 dist/
 build/
 *.log
@@ -6,6 +8,10 @@ build/
 .env.*
 !.env.example
 coverage/
+test-results/
+playwright-report/
+__pycache__/
+*.py[cod]
 .DS_Store
 dump.rdb
 .pmdata/

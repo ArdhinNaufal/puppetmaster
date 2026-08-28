@@ -1,4 +1,4 @@
-import { VerifyNodeConfig, WorkflowGraph } from "@puppetmaster/shared";
+import { ActionConfig, VerifyNodeConfig, WorkflowGraph } from "@puppetmaster/shared";
 import type { ToolInfo } from "./tools.js";
 
 /**
@@ -119,8 +119,28 @@ export function lintWorkflowGraph(
   // Per-node policy checks.
   for (const n of graph.nodes) {
     if (n.kind === "action") {
-      const cfg = n.config as { server?: string; tool?: string };
+      const parsedAction = ActionConfig.safeParse(n.config);
+      const cfg = parsedAction.success
+        ? parsedAction.data
+        : n.config as { server?: string; tool?: string; defer?: unknown };
       const info = toolInfo && cfg.server && cfg.tool ? toolInfo(cfg.server, cfg.tool) : null;
+      if (cfg.defer !== undefined) {
+        const exactDeferredStatus =
+          parsedAction.success &&
+          parsedAction.data.defer?.kind === "science_run_terminal" &&
+          parsedAction.data.server === "science" &&
+          parsedAction.data.tool === "run.status";
+        if (!exactDeferredStatus || (info !== null && info?.tier !== "read_auto")) {
+          issues.push({
+            severity: "error",
+            code: "unsafe-deferred-action",
+            message:
+              `node "${n.label}": durable defer is restricted to the read-only ` +
+              "science.run.status tool",
+            nodeId: n.id,
+          });
+        }
+      }
       if (toolInfo && cfg.server && cfg.tool && !info) {
         issues.push({
           severity: "warning",

@@ -7,6 +7,8 @@ import {
   MissionStep,
   SCIENCE_RUN_TRANSITIONS,
   ScienceArtifactVersion,
+  ScienceDomainValidationSummary,
+  ScienceDomainValidationSubmission,
   ScienceManifest,
   ScienceRunEvent,
   ScienceUpload,
@@ -86,7 +88,7 @@ assert.equal(
   createHash("sha256").update(canonicalScienceJson(left)).digest("hex"),
   createHash("sha256").update(canonicalScienceJson(right)).digest("hex"),
 );
-const comparedNumerics = compareManifests(
+const manifestOnlyComparison = compareManifests(
   { inputs: [], parameters: {}, compute: {}, environment: {}, outputs: [] },
   {
     inputs: [],
@@ -98,33 +100,139 @@ const comparedNumerics = compareManifests(
       kind: "numerical-equivalence",
       passed: true,
       metric: "relative-l2",
-      tolerance: { relative: 1e-6, absolute: 1e-9 },
+      tolerance: 1e-6,
       observed: 4.2e-7,
       units: "dimensionless",
       rawPayload: { mustNotEscape: true },
     }],
   },
 );
-assert.equal(comparedNumerics.numericallyEquivalent, true);
-assert.deepEqual(comparedNumerics.numericalValidation, {
+assert.equal(manifestOnlyComparison.numericallyEquivalent, null);
+assert.equal(manifestOnlyComparison.numericalValidation, null);
+const linkedNumericalEvidence = {
   passed: true,
   metric: "relative-l2",
-  tolerance: { relative: 1e-6, absolute: 1e-9 },
+  tolerance: 1e-6,
   observed: 4.2e-7,
   units: "dimensionless",
-});
-for (const incomplete of [
-  { kind: "numerical-equivalence", passed: true, tolerance: 1e-6 },
-  { kind: "numerical-equivalence", passed: true, metric: "relative-l2" },
-  { kind: "numerical-equivalence", passed: true, metric: "relative-l2", tolerance: {} },
-]) {
-  const unsupported = compareManifests(
-    { validations: [{ ...incomplete, metric: "baseline-only", tolerance: 1 }] },
-    { validations: [incomplete] },
-  );
-  assert.equal(unsupported.numericallyEquivalent, null);
-  assert.equal(unsupported.numericalValidation, null);
-}
+  methodProtocolId: "synthetic-contract-protocol/v1",
+  limitationsReason: "Synthetic contract fixture; not release evidence.",
+  recordId: ids.run,
+  revision: 1,
+  reviewerId: ids.user,
+  createdAt: "2026-08-14T00:00:00.000Z",
+  recordHash: shaA,
+};
+const comparedNumerics = compareManifests(
+  { inputs: [], parameters: {}, compute: {}, environment: {}, outputs: [] },
+  { inputs: [], parameters: {}, compute: {}, environment: {}, outputs: [] },
+  linkedNumericalEvidence,
+);
+assert.equal(comparedNumerics.numericallyEquivalent, true);
+assert.deepEqual(comparedNumerics.numericalValidation, linkedNumericalEvidence);
+assert.equal(ScienceDomainValidationSubmission.safeParse({
+  kind: "numerical-equivalence",
+  metric: "relative-l2",
+  tolerance: 1e-6,
+  observedValue: 4.2e-7,
+  units: "dimensionless",
+  methodProtocolId: "synthetic-contract-protocol/v1",
+  decision: true,
+  limitationsReason: "Synthetic contract fixture; not release evidence.",
+}).success, false, "numerical equivalence must name its baseline run");
+assert.equal(ScienceDomainValidationSubmission.safeParse({
+  kind: "domain-validation",
+  baselineRunId: ids.run,
+  metric: "mesh-jacobian-minimum",
+  tolerance: 0.1,
+  observedValue: 0.2,
+  units: "dimensionless",
+  methodProtocolId: "synthetic-contract-protocol/v1",
+  decision: true,
+  limitationsReason: "Synthetic contract fixture; not release evidence.",
+}).success, false, "a domain-only review cannot imply baseline equivalence");
+assert.equal(ScienceDomainValidationSubmission.safeParse({
+  kind: "domain-validation",
+  metric: "mesh-jacobian-minimum",
+  tolerance: 0.1,
+  observedValue: 0.2,
+  units: "dimensionless",
+  methodProtocolId: "synthetic-contract-protocol/v1",
+  decision: true,
+  limitationsReason: "Synthetic contract fixture; not release evidence.",
+  reviewerId: ids.user,
+}).success, false, "client input must not be able to spoof reviewer identity");
+assert.equal(ScienceDomainValidationSubmission.safeParse({
+  kind: "domain-validation",
+  metric: "mesh-jacobian-minimum",
+  tolerance: 0.1,
+  observedValue: 0.2,
+  units: "dimensionless",
+  methodProtocolId: "synthetic-contract-protocol/v1",
+  decision: true,
+  limitationsReason: "Synthetic contract fixture; not release evidence.",
+  createdAt: "2026-08-14T00:00:00.000Z",
+}).success, false, "client input must not control the display timestamp");
+const mixedCaseBaseline = "A0000000-0000-4000-8000-00000000000B";
+assert.equal(
+  ScienceDomainValidationSubmission.parse({
+    kind: "numerical-equivalence",
+    baselineRunId: mixedCaseBaseline,
+    metric: "relative-l2",
+    tolerance: 1e-6,
+    observedValue: 4.2e-7,
+    units: "dimensionless",
+    methodProtocolId: "synthetic-contract-protocol/v1",
+    decision: true,
+    limitationsReason: "Synthetic contract fixture; not release evidence.",
+  }).baselineRunId,
+  mixedCaseBaseline.toLowerCase(),
+  "validation UUID inputs must be canonical before repository equality, locking, and hashing",
+);
+const validationSummary = {
+  id: ids.run,
+  runId: ids.run,
+  revision: 1,
+  baselineRunId: null,
+  kind: "domain-validation",
+  metric: "mesh-jacobian-minimum",
+  tolerance: 0.1,
+  observedValue: 0.2,
+  units: "dimensionless",
+  methodProtocolId: "synthetic-contract-protocol/v1",
+  decision: true,
+  limitationsReason: "Synthetic contract fixture; not release evidence.",
+  reviewerId: ids.user,
+  reviewerRole: "owner",
+  runManifestHash: shaA,
+  baselineManifestHash: null,
+  createdAt: new Date("2026-08-14T00:00:00.000Z"),
+  recordHash: shaA,
+};
+assert.equal(ScienceDomainValidationSummary.safeParse(validationSummary).success, true);
+assert.deepEqual(
+  ScienceDomainValidationSummary.parse({
+    ...validationSummary,
+    id: mixedCaseBaseline,
+    runId: mixedCaseBaseline,
+    reviewerId: mixedCaseBaseline,
+  }),
+  {
+    ...validationSummary,
+    id: mixedCaseBaseline.toLowerCase(),
+    runId: mixedCaseBaseline.toLowerCase(),
+    reviewerId: mixedCaseBaseline.toLowerCase(),
+  },
+  "validation UUID projections must be canonicalized deterministically",
+);
+assert.equal(ScienceDomainValidationSummary.safeParse({
+  ...validationSummary,
+  runOutputChecksums: [],
+}).success, false, "collection projections must reject checksum arrays");
+assert.equal(ScienceDomainValidationSummary.safeParse({
+  ...validationSummary,
+  revision: 0,
+}).success, false, "validation revisions must be positive");
 
 assert.throws(() => ScienceArtifactVersion.parse({
   id: ids.run,
@@ -228,6 +336,7 @@ assert.throws(() => ScienceRunEvent.parse({
 assert.throws(
   () => createComputeProvidersFromEnv({
     NODE_ENV: "production",
+    SCIENCE_ENABLED: "1",
     SCIENCE_RUNTIME_URL: "http://science-runtime:8080",
   }),
   /SCIENCE_RUNTIME_TOKEN/,
@@ -235,6 +344,7 @@ assert.throws(
 assert.throws(
   () => createRenderProvidersFromEnv({
     NODE_ENV: "production",
+    SCIENCE_ENABLED: "1",
     SCIENCE_RENDER_URL: "http://science-render:8080",
   }),
   /SCIENCE_RENDER_TOKEN/,
@@ -242,6 +352,7 @@ assert.throws(
 assert.throws(
   () => createComputeProvidersFromEnv({
     NODE_ENV: "production",
+    SCIENCE_ENABLED: "1",
     SCIENCE_RUNTIME_URL: "http://science-runtime:8080",
     SCIENCE_RUNTIME_TOKEN: "runtime-token",
   }),
@@ -250,6 +361,7 @@ assert.throws(
 assert.throws(
   () => createRenderProvidersFromEnv({
     NODE_ENV: "production",
+    SCIENCE_ENABLED: "1",
     SCIENCE_RENDER_URL: "http://science-render:8080",
     SCIENCE_RENDER_TOKEN: "render-token",
   }),
@@ -257,17 +369,20 @@ assert.throws(
 );
 assert.throws(
   () => createArtifactStoreFromEnv({
+    SCIENCE_ENABLED: "1",
     SCIENCE_RUNTIME_URL: "http://science-runtime:8090",
   }, "science-contract-signing-secret"),
   /SCIENCE_PUBLIC_BASE_URL/,
 );
 assert.throws(
   () => createArtifactStoreFromEnv({
+    SCIENCE_ENABLED: "1",
     SCIENCE_PUBLIC_BASE_URL: "https://user:password@control.invalid",
   }, "science-contract-signing-secret"),
   /without credentials/,
 );
 const externallyReachableStore = createArtifactStoreFromEnv({
+  SCIENCE_ENABLED: "1",
   SCIENCE_ARTIFACT_ROOT: "apps/server/.science-contract-unused",
   SCIENCE_PUBLIC_BASE_URL: "http://control-plane.internal:43119/puppetmaster",
 }, "science-contract-signing-secret");

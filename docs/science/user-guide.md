@@ -2,17 +2,17 @@
 
 **Audience:** non-technical users, laboratory or engineering operators,
 workspace administrators, and entry-level programmers  
-**Edition:** 2026-08-12  
-**Applies to:** the current Puppetmaster Science Operations control-plane slice
+**Applies to:** the current Puppetmaster Science Operations local
+control-plane and exact-source static-workflow slice
 
 > [!IMPORTANT]
-> Science Operations is currently a locally implemented, deterministic
-> control-plane development slice. It is **not a production scientific-compute
-> release**, and the MVP definition of done is **NOT MET**. The bundled compute
-> providers do not execute user notebooks or OCI images. Jupyter Enterprise
-> Gateway, trame remote rendering, OCCT tessellation, live PostgreSQL/Redis/S3
-> certification, target SLOs, disaster-recovery proof, and domain scientific
-> validation remain release gates.
+> Science Operations has a verified local control-plane and deterministic
+> exact-source static workflow. It is **not a production scientific-compute
+> release**, and the original MVP definition of done is **NOT MET**. The bundled
+> provider does not execute user notebooks or OCI images. Jupyter Enterprise
+> Gateway execution, live rootless OCI execution, trame remote rendering, OCCT
+> tessellation, target TLS/load/HA/SLO/CVE/disaster-recovery proof, and named
+> scientific-domain validation remain release gates.
 
 > [!CAUTION]
 > Use only data explicitly approved as `non_regulated`. Do not upload health,
@@ -123,7 +123,9 @@ select the previous version as its parent.
 
 Submitting a run creates durable records and normally places the run in
 `awaiting_approval`. Execution happens later. The authorization decision is in
-the shared `AUTHORIZATIONS` inbox, not inside the Science run dossier.
+the NEXUS `AUTHORIZATIONS` task, not inside the Science run dossier. Science
+uses the full application stage, so the shell side panels are not shown while
+the Science view is open.
 
 ### 2.4 REST is the durable truth
 
@@ -133,9 +135,16 @@ be stale. Refresh before making a decision.
 
 ### 2.5 Provenance is not scientific validation
 
-`manifest.complete=true` means required provenance fields are present and no
-provenance gaps were recorded. It does not prove numerical equivalence,
-bitwise reproducibility, or scientific correctness.
+The manifest endpoint's top-level `complete=true` means the current structural
+and relational assessment found the required provenance and no recorded gap.
+The nested manifest and its SHA-256 remain immutable historical bytes, so a
+current verdict may become incomplete without rewriting history. It does not
+prove numerical equivalence, bitwise reproducibility, or scientific
+correctness.
+
+Human/domain review is stored separately as an append-only validation record.
+Creating one does not edit either run manifest. Its reviewer ID and role come
+from the signed-in session, not from request data.
 
 ---
 
@@ -152,14 +161,23 @@ inherits the permissions of the lower roles.
 | Upload versions and submit runs while admitted | No | Yes | Yes |
 | Approve or deny pending authorizations | No | Yes | Yes |
 | Cancel a run or close a render session | No | Yes | Yes |
-| Reproduce a run or request comparison | No | Yes | Yes |
+| Reproduce a run | No | Yes | Yes |
+| Request a same-workspace run comparison | Yes | Yes | Yes |
+| Read immutable domain/numerical validation records | Yes | Yes | Yes |
+| Author an immutable validation record through the FUI or API | No | No | Yes |
+| Review the redacted admin action queue | No | No | Yes |
 | Change workspace pilot admission | No | No | Yes |
 | Create or update compute profiles | No | No | Yes |
 | Purge one exact, unreferenced version by checksum | No | No | Yes |
 
-Current interface note: a member may see a run comparison control, but the
-server currently requires builder rights for the comparison POST request. A
-member should ask a builder to perform the comparison.
+Comparison is a read: a member may use the FUI control or the member-readable
+comparison GET for two same-workspace runs with manifests. Reproduction creates
+a new run and still requires builder rights plus workspace admission.
+
+Admins also see the paginated `ADMIN ACTION QUEUE`. It shows only bounded,
+redacted reconciliation/cleanup reasons and typed navigation controls. It is not
+provider-wide discovery. The fresh installed-browser Science gate covers the
+released local journey; it does not add provider-wide orphan discovery.
 
 Automation must use an accountable builder identity. Do not use a shared owner
 account.
@@ -184,19 +202,56 @@ Ask these questions before creating anything:
 Do not continue if regulated data, secrets, an unproved provider, or unclear
 ownership is involved.
 
-### A safe practice example
+If you do not yet have an account, workspace membership, or the expected role,
+start with the repository's [complete getting-started guide](../GETTING-STARTED.md)
+and [installation guide](../INSTALL.md). After sign-in, the application header
+shows the workspace name and your signed-in role. Stop if either is not the one
+you expected.
 
-This guide uses a fictional, non-regulated study named **Cantilever Beam
-Tutorial** with:
+### 4.1 Member-only five-minute inspection path
 
-- a data artifact `load-cases.csv`;
-- a notebook artifact `cantilever-analysis.ipynb`;
-- semantic roles `loads` and `notebook`;
+A member can inspect retained evidence without creating or changing Science
+resources:
+
+1. Open **SCIENCE OPERATIONS** and verify the workspace name and member role in
+   the application header.
+2. Select the intended study, then select an artifact and an exact `ready`
+   version. Check its version number, SHA-256, size, and media type.
+3. In the `RUN` tab, select a `succeeded` run. Read its input/output references,
+   recent events, and manifest hash. A member must not interpret `succeeded` as
+   scientific correctness.
+4. Open `MANIFEST`. Read the completeness verdict, every gap, declared
+   limitations, exact lineage, environment snapshot, and the separate
+   `DOMAIN VALIDATION LEDGER`.
+5. If another manifested run is available on the current run page, use
+   `COMPARE` and read each identity dimension separately. `NOT ASSESSED` means
+   numerical equivalence has not been established.
+6. Use `STRUCTURED TABLE`, `LOAD STATIC PREVIEW`, or the bounded client geometry
+   diagnostic when appropriate. These member-readable previews do not create a
+   render session. Starting a short-lived static render session requires
+   builder rights.
+
+If an expected study, version, run, manifest, or validation is missing, record
+the visible ID and UTC time and ask the owning builder. Do not borrow a higher
+privilege account or probe another workspace.
+
+### 4.2 Safe checked-in practice data
+
+This guide uses a non-regulated study named **Deterministic Fixture Tutorial**
+with two checked-in files:
+
+- data artifact `thermal-boundary.csv` from
+  `services/science-runtime/fixtures/data/thermal-boundary.csv`;
+- notebook artifact `deterministic-pilot.ipynb` from
+  `services/science-runtime/fixtures/notebooks/deterministic-pilot.ipynb`;
+- semantic roles `boundary_conditions` and `notebook`;
 - explicit units and a seed in the parameters; and
 - small development resource requests.
 
 This example teaches the control-plane workflow. The bundled deterministic
 provider may generate fixture outputs, but it does not execute the notebook.
+Use these files only in a disposable local development workspace; they are test
+corpus, not scientific evidence.
 
 ---
 
@@ -235,6 +290,10 @@ message, not as the complete audit trail.
 | Right dossier | `RUN`, `CONFIGURE`, and `MANIFEST` tabs. |
 | Stat row | Selected study/run, queue age, wall time, resources, and manifest state. |
 | Bottom strip | `INGEST → PREPARE → AUTHORIZE → EXECUTE → VERIFY → RELEASE / RE-RUN`. |
+
+Science occupies the full stage. To decide a pending authorization, leave the
+Science view for NEXUS and open its `AUTHORIZATIONS` task, or press
+**Ctrl+K**/**Command+K** and choose `TASK // AUTHORIZATIONS`.
 
 ### 5.3 Holding a control
 
@@ -278,9 +337,25 @@ Open `COMPUTE PROFILE CONTROL · ADMIN`, select `NEW`, and enter:
 Then hold the create control. Resource fields are ceilings, not recommended
 defaults.
 
-The current FUI accepts a non-empty dependency-lock JSON object, for example
-`{ "python": "3.11.9" }`, and does not expose a network-policy field. The REST
-contract may set `network` to exactly `none`; that is an API/operator option.
+The digest, kernel, and dependency lock are provenance claims. Obtain them from
+the admitted provider/deployment record; never invent values merely to satisfy
+the form. For the checked-in deterministic tutorial only, the retained browser
+fixture uses these explicitly non-production values:
+
+| Field | Deterministic tutorial value |
+|---|---|
+| Name | `Deterministic Fixture Tutorial — non-production` |
+| Provider | `local_container` |
+| Image digest | `sha256:1445edcf2ab7a2400b0851810d78bf572ad104afc8518f5cd207d88c528b72d6` |
+| Kernel | `python-fixture-v1` |
+| CPU / memory / GPU / wall ceiling | `1000` millicores / `512` MiB / `0` / `300` seconds |
+| Dependency lock JSON | `{ "python": "fixture" }` |
+
+Those values identify the deterministic contract fixture; they do not identify
+an executable OCI image or prove provider safety. The current FUI accepts a
+non-empty dependency-lock JSON object and does not expose a network-policy
+field. The REST contract may set `network` to exactly `none`; that is an
+API/operator option.
 
 Do not select Jupyter Enterprise Gateway simply because it appears in a list.
 JEG is currently NO-GO and no production adapter is registered. The bundled
@@ -289,7 +364,7 @@ local and HTTP fixtures do not execute user code.
 ### Step 3 — Builder: create a study
 
 1. In `01 // STUDIES`, choose `+ CREATE STUDY`.
-2. Enter `Cantilever Beam Tutorial`.
+2. Enter `Deterministic Fixture Tutorial`.
 3. Hold `HOLD TO CREATE`.
 4. Select the new study.
 
@@ -303,19 +378,36 @@ workshop-project link, but the current FUI does not expose those edit controls.
 
 1. Select the study.
 2. Choose `⇪ INGEST ARTIFACT`.
-3. Enter logical name `load-cases.csv`.
+3. Enter logical name `thermal-boundary.csv`.
 4. Choose kind `DATASET` and format `csv`.
-5. Select the file.
+5. Select
+   `services/science-runtime/fixtures/data/thermal-boundary.csv` from the
+   repository checkout.
 6. Hold `HOLD TO INGEST`.
 
 The browser hashes the file before upload. The browser path refuses files over
-256 MiB. For a larger object, stop and ask an operator to use the same
-intent/stream/complete REST contract with a streaming client, subject to the
-configured object-size limit. Live S3 operation is not yet proved. Uploads are
-whole-file and restart-only—there is no multipart resume or append.
+256 MiB. This release does not document a supported self-service large-file
+client. For a larger object, stop and ask the platform owner whether an approved
+authenticated integration exists. Do not split, append, or improvise a signed
+URL. Uploads are whole-file and restart-only—there is no multipart resume or
+append.
 
-Repeat the flow for `cantilever-analysis.ipynb`, kind `NOTEBOOK`, format
-`ipynb`.
+The server also enforces an absolute whole-transfer deadline, an idle deadline
+between received chunks, and a per-workspace external-stream cap shared across
+server instances. If a deadline or capacity check rejects the transfer, do not
+append or continue the old body. Refresh the version state; a timed-out
+reservation is quarantined for safe cleanup, and uploading the file again
+requires a new whole-file intent.
+
+The shipped defaults are one hour total, one minute without a received chunk,
+and four simultaneous external uploads per workspace. An operator may tighten
+or relax those values within documented bounds, so the deployment's actual
+limits may differ. These server limits do not enlarge the browser's 256 MiB
+self-service limit.
+
+Repeat the flow for
+`services/science-runtime/fixtures/notebooks/deterministic-pilot.ipynb`, logical
+name `deterministic-pilot.ipynb`, kind `NOTEBOOK`, format `ipynb`.
 
 Wait for each version to become `ready`. Only ready versions can be run inputs.
 
@@ -324,19 +416,19 @@ Wait for each version to become `ready`. Only ready versions can be run inputs.
 1. Open the `CONFIGURE` tab.
 2. Select an enabled compute profile.
 3. Select the ready notebook and data versions.
-4. Give them semantic roles such as `notebook` and `loads`.
+4. Give them semantic roles `notebook` and `boundary_conditions`.
 5. Enter a JSON object for parameters:
 
    ```json
    {
      "units": {
-       "length": "mm",
-       "force": "N"
+       "time": "s",
+       "temperature": "K",
+       "pressure": "Pa"
      },
      "randomSeeds": {
-       "main": 42
-     },
-     "meshSizeMm": 2
+       "main": 7
+     }
    }
    ```
 
@@ -351,8 +443,10 @@ immutable input links, and an authorization request.
 
 ### Step 6 — Builder or higher: decide the authorization
 
-1. Expand the shared `AUTHORIZATIONS` side panel in the application shell; it
-   may be collapsed.
+1. Open **NEXUS** from the main navigation, then open the `AUTHORIZATIONS`
+   task. A faster path from Science is **Ctrl+K**/**Command+K**, followed by
+   `TASK // AUTHORIZATIONS`; the application changes to NEXUS and opens the
+   task pane.
 2. Match the Science request to the study/run context, then inspect its prompt
    and evidence.
 3. To approve, hold `HOLD TO AUTHORIZE`.
@@ -392,10 +486,16 @@ the record and follow the operator runbook.
 After a successful run:
 
 1. Inspect output version SHA-256, size, type, and semantic role.
-2. Open the `MANIFEST` tab.
-3. Read `MANIFEST COMPLETE` or `MANIFEST INCOMPLETE`.
-4. If incomplete, read every named gap.
-5. Review the profile image digest, kernel, adapter version, parameters, units,
+2. In the deterministic tutorial, confirm the PNG version metadata contains
+   `fixturePreview=true` and `productionCompute=false`. The current FUI does not
+   display those two keys; use the exact authenticated API check in
+   [§16.11](#1611-inspect-the-exact-output-metadata-and-manifest), or ask an
+   accountable builder/admin to perform it. If either label is absent or
+   different, stop and ask an operator which provider produced it.
+3. Open the `MANIFEST` tab.
+4. Read `MANIFEST COMPLETE` or `MANIFEST INCOMPLETE`.
+5. If incomplete, read every named gap.
+6. Review the profile image digest, kernel, adapter version, parameters, units,
    seeds, approvals, validations, limitations, and input/output lineage.
 
 Do not translate `MANIFEST COMPLETE` into “scientifically correct.”
@@ -411,12 +511,67 @@ The current FUI lists candidates only from the current paginated run page; page
 through the run list if the candidate is absent, or use the REST API.
 The result reports exact input, parameter, environment, and output identity as
 separate facts. Numerical equivalence remains `NOT ASSESSED` unless a candidate
-validation supplies a named metric, tolerance, and decision.
+has an explicit append-only numerical-equivalence record linked to that exact
+baseline. Both current manifest hashes and both output-checksum snapshots must
+still match the record.
 
 ### Step 11 — Close temporary visualization resources
 
 Unload a client geometry preview when finished. If a render session exists,
 choose `CLOSE RENDER`. Closing remains available after workspace revocation.
+
+### 6.12 What the built-in Science workflow automates today
+
+The template catalog includes **Science: reproducible notebook run**. In the
+released local path, it completes this fail-closed sequence:
+
+1. Inspect the exact artifact and immutable ready version.
+2. Request a provider quote. An unavailable quote stops the mission.
+3. Show one bounded review record containing the checksum, quote, parameters,
+   and resource request.
+4. Submit exactly that reviewed record as an asynchronous Science run. A
+   changed or uninspected input is refused.
+5. Enter mission state `waiting` on that exact run. Migration 14 stores this
+   wait durably, so a server restart does not require a guessed timer or a new
+   submission.
+6. Resume only after the run reaches a terminal database state. A failed or
+   cancelled run fails the workflow. A succeeded run without a complete
+   manifest also fails closed.
+7. Select one bounded, ready, run-linked PNG and require a 64-character
+   lowercase SHA-256. If the run has no eligible PNG, the mission stops before
+   opening a render.
+8. Show a second human approval that names the exact PNG source. This approval
+   authorizes only static display; it does not authorize client, remote, or
+   trame rendering.
+9. Open that exact PNG with `mode="static"` and a stable idempotency key derived
+   from the reviewed run key. A lost-response replay returns the same intent
+   rather than allocating another session.
+10. Read the final manifest and verify that the render source still matches the
+    selected version/checksum.
+
+The first authorization reviews the submission intent. Science submission also
+creates its own normal run approval, which binds the immutable compute-profile
+snapshot and image digest. The later render approval is separate because it
+names the exact output that will become visible.
+
+With the bundled deterministic provider, the selected PNG is data-derived but
+is explicitly labelled `fixturePreview=true` and `productionCompute=false`.
+This proves the workflow, approval, wait/recovery, checksum, replay, and display
+path. It does not prove that a notebook ran or that the image is scientifically
+valid.
+
+If a mission stays `waiting`, do not approve it again, clone it, or invent a
+delay. Check the target Science run. The mission resumes through its durable
+wait after terminal state; an expired continuation claim is recovered by
+startup/periodic recovery. Cancelling the parent workflow cancels only its wait,
+not the independent Science run.
+
+For entry-level programmers, action arguments may refer to an earlier completed
+step with an exact placeholder such as
+`{{steps.review_evidence.resourceRequest}}`. The referenced JSON value keeps its
+type, so an object remains an object rather than becoming text. Only letters,
+numbers, underscores, and hyphens are accepted in the step ID. Missing steps or
+properties stop the workflow instead of silently submitting different data.
 
 ---
 
@@ -448,7 +603,7 @@ reactivated.
 
 | State | Meaning | Can be a run input? |
 |---|---|:---:|
-| `pending` | Admission exists but final byte promotion is not complete. | No |
+| `pending` | A reserved version exists, but final byte promotion is not complete. | No |
 | `ready` | Bytes and checksum were finalized. | Yes |
 | `quarantined` | Validation, checksum, or format processing failed. | No |
 | `expired` | Content was retired; the immutable tombstone remains. | No |
@@ -553,7 +708,8 @@ The canonical manifest can include:
 - exact input and output version IDs, hashes, sizes, and semantic roles;
 - compute profile, immutable image digest, kernel, resource request, and
   adapter version;
-- dependency lock and source revision when available;
+- dependency lock plus a linked immutable `ready` notebook whose bytes parsed
+  as `ipynb` under the `code`, `notebook`, or `solver` role;
 - canonical parameters, units, seeds, and environment facts;
 - actor, approvals, policies, tool calls, and timestamps;
 - state history, validations, and explicit limitations; and
@@ -564,6 +720,13 @@ The canonical manifest can include:
 If required provenance is missing, the manifest is incomplete and names its
 gaps. Fixing a gap means creating new evidence or a new run—not editing the
 historical manifest.
+
+Read the endpoint/FUI's top-level completeness and gaps as the current verdict.
+The nested manifest is the exact historical record protected by its displayed
+SHA-256. A raw `parameters.sourceRevision` is only a user note: the platform
+does not fetch a version-control system to verify it, the manifest's verified
+top-level `sourceRevision` stays `null`, and it cannot replace the parsed
+notebook input.
 
 ### 9.3 Comparison dimensions
 
@@ -578,6 +741,110 @@ The comparison result keeps these dimensions separate:
 Matching hashes prove the exact bytes match. Different hashes do not by
 themselves say whether results are scientifically equivalent. Numerical
 equivalence is unknown unless a named metric and tolerance are recorded.
+
+### 9.4 Read the immutable validation ledger (all members)
+
+Select a run and open its `MANIFEST` tab. The `DOMAIN VALIDATION LEDGER` is
+separate from the canonical manifest and is readable by every workspace
+member.
+
+1. Use `PREVIOUS RECORDS` and `NEXT RECORDS` to move through bounded pages.
+2. Select a retained revision. The detail panel shows the decision, metric,
+   observed value, tolerance, units, method/protocol, reviewer, creation time,
+   mandatory limitations/reason, candidate and baseline identities, exact
+   manifest hashes, record hash, and bound output checksums.
+3. Treat `PASS` as a named human decision for only the recorded evidence and
+   limitations. It is not a general claim that the model, software, or platform
+   is correct.
+
+The summary list deliberately omits the potentially large checksum arrays; the
+selected detail fetch returns them. If the list is empty, scientific validation
+has not been established for that run.
+
+### 9.5 Append a review in the FUI (admin/owner)
+
+An admin or owner can expand `APPEND DOMAIN REVIEW · ADMIN / OWNER` below the
+ledger. The selected candidate must be succeeded, have an intact manifest, and
+contain at least one manifested output.
+
+1. Choose `STANDALONE DOMAIN VALIDATION` when the decision applies only to the
+   selected candidate. This mode deliberately has no baseline and makes no
+   numerical-equivalence claim.
+2. Choose `LINKED NUMERICAL EQUIVALENCE` only when comparing the candidate with
+   a distinct succeeded baseline. Choose that baseline from the eligible runs
+   on the current run page. If the required baseline is not offered, do not
+   substitute another run; use the authenticated API or return after arranging
+   a bounded page containing the exact pair.
+3. Enter the approved metric, a finite nonnegative tolerance, the finite
+   observed value, units, and the exact method or protocol identifier.
+4. Choose `PASS` or `FAIL` and write a nonempty limitations/reason statement.
+   State the tested range and exclusions; a bare “looks correct” is not usable
+   scientific evidence.
+5. Hold `HOLD TO APPEND REVIEW` until the confirmation completes. Releasing
+   early cancels the action. The success announcement names the immutable
+   revision and record hash prefix.
+
+There is intentionally no reviewer field: reviewer ID and role come from the
+signed-in session. There are also no edit or delete controls. If a decision is
+wrong, append a corrected revision and explain why. Workspace pilot revocation
+does not block this metadata review, but a global read-only policy still fails
+closed and its server error is shown.
+
+Never invent scientific values. Automated browser values and documentation
+examples are labelled **synthetic/non-release** and cannot satisfy a named
+domain review or release sign-off.
+
+### 9.6 Append a review through the API (entry-level programmer)
+
+Use the API when the exact baseline is not on the current FUI page or when an
+approved integration records the review. For a standalone domain review, POST
+to `/api/science/runs/:candidateRunId/validations` without `baselineRunId` and
+use `kind: "domain-validation"`. For a numerical-equivalence decision, use
+`kind: "numerical-equivalence"` and include the distinct succeeded baseline run
+ID.
+
+**Synthetic/non-release API example — never use these fabricated values as
+scientific evidence:**
+
+```json
+{
+  "kind": "numerical-equivalence",
+  "baselineRunId": "00000000-0000-4000-8000-000000000001",
+  "metric": "relative-L2 pressure error",
+  "tolerance": 0.000001,
+  "observedValue": 0.00000042,
+  "units": "dimensionless",
+  "methodProtocolId": "synthetic-non-release-protocol/v1",
+  "decision": true,
+  "limitationsReason": "Validated only for the declared steady-state inlet range."
+}
+```
+
+Do not send `reviewerId`, `reviewerRole`, `createdAt`, manifest hashes, output
+checksums, or `recordHash`. The server derives those fields from the session
+and the immutable succeeded runs. Extra fields are rejected.
+
+After creation, whether through the FUI or API:
+
+1. Read `GET /api/science/runs/:candidateRunId/validations` and retain the
+   returned positive `revision`, record ID, and SHA-256 `recordHash`. The list
+   is capped at 100 summaries and deliberately omits output-checksum arrays.
+2. Read the checksum-bound detail at
+   `GET /api/science/runs/:candidateRunId/validations/:validationId`. Confirm
+   the reviewer ID is the signed-in admin/owner and the protocol ID,
+   limitations, manifest hashes, and checksum snapshots are correct.
+3. Run the comparison with the exact baseline. The system follows one
+   database-maintained head for that candidate, review kind, and baseline. The
+   decision is used only while the head anchor, exact pointed record ID and
+   revision, record self-hash, both manifest hashes, and output-checksum
+   snapshots still match. If any selector, pointer, or hash is inconsistent,
+   the result becomes unknown; the system does not search an older review for
+   a more favorable answer. `createdAt` is database-assigned display
+   information and never decides which correction wins.
+4. If the review is wrong, do not edit or delete it. Append a new review with a
+   corrected decision and an explicit reason; history remains visible. If the
+   newest revision is damaged or mislinked, comparison reports numerical
+   evidence as unavailable instead of falling back to an older decision.
 
 ---
 
@@ -618,15 +885,23 @@ diagnostic. The legend is metadata-driven, not derived from rendered pixels.
 
 ### 10.4 Render sessions
 
-The backend has a short-lived render-session contract, but trame remote
-rendering is currently NO-GO. The current FUI does not provide a trustworthy
-remote-mode selector. Do not interpret a ready iframe or configured renderer
-as production admission.
+The released session workflow is a short-lived static PNG view. Choose one
+exact ready PNG output no larger than **8 MiB (8,388,608 bytes)** from the
+selected run, then hold `HOLD TO START RENDER`. The selector shows the immutable
+name, size, and checksum; the image, caption, legend, and metadata remain bound
+to that same stored source. If no eligible PNG exists, the control refuses the
+request. JSON, VTK, STEP, oversized PNG, client, and remote requests are not
+silently converted to static.
 
-If render support is explicitly admitted in a future environment, the selected
-artifact version must be an output linked to the selected run. An unrelated
-version returns a conflict. Close the session when finished; close remains
-available after workspace revocation.
+A retry after a network error reuses the same request key, so a lost response
+cannot allocate another session. Close keeps the session visible until the
+server confirms the idempotent delete. A successful close releases quota and
+artifact retention while keeping a short replay tombstone. Close and an exact
+already-created replay remain available after workspace revocation; genuinely
+new sessions remain blocked.
+
+trame remote rendering remains **NO-GO**. The FUI does not offer a remote-mode
+selector, and a configured HTTP adapter is not production admission.
 
 ---
 
@@ -730,10 +1005,10 @@ Failures are retained and retried with backoff.
 | `BUS DISCONNECTED` | Live display updates are unavailable. | Use `↻ REFRESH`; treat REST state as authoritative. |
 | “Your role cannot perform…” / 403 | Your role is below the required level. | Ask a builder or admin; do not borrow an account. |
 | No enabled profile | No usable profile is configured. | Ask an admin to configure a registered, separately admitted provider. |
-| File exceeds browser hash limit | Browser path is over 256 MiB. | Stop and ask an operator to use the documented streaming REST upload contract; live S3 remains unproved. |
+| File exceeds browser hash limit | Browser path is over 256 MiB. | Stop. This release has no documented self-service large-file client. Ask the platform owner whether an approved authenticated integration exists; do not split or append the object. |
 | Version remains `pending` | Upload or promotion has not finished. | Wait, refresh, and inspect the operation log; do not use it as input. |
 | Version is `quarantined` | Checksum/format/finalization failed. | Preserve it for diagnosis; do not flip it to ready. |
-| Run remains `awaiting_approval` | Human decision is pending. | Use the shared `AUTHORIZATIONS` inbox. |
+| Run remains `awaiting_approval` | Human decision is pending. | Open the NEXUS `AUTHORIZATIONS` task, directly or through **Ctrl+K**/**Command+K** -> `TASK // AUTHORIZATIONS`. |
 | Approval returns conflict | State, quota, or admission changed. | Refresh the run and admission decision; decide from current state. |
 | Run remains `queued` | Scheduler/provider turn is pending. | Check authenticated readiness and operator diagnostics; do not create a duplicate key. |
 | Run remains `cancelling` | Provider terminal proof is missing. | Preserve generation and handle; follow the operator runbook. |
@@ -845,6 +1120,11 @@ A recoverable point includes:
 
 Redis persistence supports queue durability but is not a backup.
 
+The retained loopback evidence includes a complete PostgreSQL migration 1-16
+lifecycle, a Redis sentinel surviving `WAITAOF` and process restart, and a live
+MinIO/S3 adapter lane. Those are component checks, not a coordinated recovery
+point or target disaster-recovery drill.
+
 Restore into isolation with egress and submissions disabled. Verify migrations,
 object size/SHA-256, manifest hashes, and exact provider generations. Start
 read-only and re-admit workspaces individually with reasons. Do not bulk-admit.
@@ -856,10 +1136,24 @@ missing, so production recovery is not certified.
 
 ## 16. Beginner programmer guide
 
-This chapter assumes basic JSON but no prior Puppetmaster knowledge. Its
-TypeScript snippets are same-origin browser/project fragments that build on one
-another; the Node.js hashing example is a separately labeled server-side
-alternative.
+This chapter assumes basic JSON but no prior Puppetmaster knowledge. It uses
+plain JavaScript in a disposable local development workspace so authentication
+stays in the normal same-origin browser session.
+
+Run the examples this way:
+
+1. Start the local development application and sign in with an accountable
+   owner/admin account for the admission/profile steps. A builder account is
+   sufficient after those administrative steps are complete.
+2. Open the local Puppetmaster origin, sign in, and verify the workspace.
+3. Open the browser developer tools **Console** on that same origin.
+4. Paste each JavaScript block in this chapter in order and keep the tab open.
+   The examples store non-secret tutorial IDs under
+   `globalThis.scienceTutorial` and stable idempotency keys in `localStorage`.
+
+These examples are for the checked-in deterministic fixtures only. Do not paste
+unreviewed code into a browser session, and do not use a production session for
+this tutorial.
 
 ### 16.1 Authentication model
 
@@ -876,15 +1170,29 @@ Except for a fully signed artifact capability URL, every Science route requires
 authentication and workspace membership. Foreign-workspace IDs are generally
 returned as 404 to avoid revealing their existence.
 
-### 16.2 A small TypeScript request helper
+### 16.2 Install the plain-JavaScript helpers
 
-```ts
-type ApiErrorBody = {
-  error?: string;
-  issues?: Array<{ path: string; message: string }>;
-};
+```js
+globalThis.scienceTutorial ??= {};
+var tutorial = globalThis.scienceTutorial;
 
-async function scienceRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryAfterMilliseconds(value, fallbackMs = 3_000) {
+  if (!value) return fallbackMs;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(60_000, Math.max(1_000, seconds * 1_000));
+  }
+  const date = Date.parse(value);
+  return Number.isFinite(date)
+    ? Math.min(60_000, Math.max(1_000, date - Date.now()))
+    : fallbackMs;
+}
+
+async function scienceRequest(path, init = {}) {
   const headers = new Headers(init.headers);
   if (typeof init.body === "string") {
     headers.set("content-type", "application/json");
@@ -897,11 +1205,27 @@ async function scienceRequest<T>(path: string, init: RequestInit = {}): Promise<
   });
 
   if (!response.ok) {
-    const problem = (await response.json().catch(() => ({}))) as ApiErrorBody;
-    throw new Error(`${response.status}: ${problem.error ?? response.statusText}`);
+    const problem = await response.json().catch(() => ({}));
+    const issues = Array.isArray(problem.issues)
+      ? ` (${problem.issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")})`
+      : "";
+    const error = new Error(
+      `${response.status}: ${problem.error ?? response.statusText}${issues}`,
+    );
+    error.status = response.status;
+    error.retryAfter = response.headers.get("retry-after");
+    throw error;
   }
 
-  return (await response.json()) as T;
+  return response.json();
+}
+
+async function sha256Text(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 }
 ```
 
@@ -913,17 +1237,18 @@ duplicating route strings.
 
 ### 16.3 Check workspace admission
 
-```ts
-const result = await scienceRequest<{
-  admission: { workspaceId: string; admitted: boolean; updatedAt: string | null };
-}>("/api/science/workspace-admission");
-
-console.log(result.admission.admitted);
+```js
+var admissionResult = await scienceRequest("/api/science/workspace-admission");
+tutorial.admission = admissionResult.admission;
+console.log(tutorial.admission);
+if (!tutorial.admission.admitted) {
+  throw new Error("This workspace is not admitted; an admin must record the decision first.");
+}
 ```
 
 An admin can change it with a strict body:
 
-```ts
+```js
 await scienceRequest("/api/science/workspace-admission", {
   method: "PATCH",
   body: JSON.stringify({
@@ -937,188 +1262,289 @@ The public response intentionally omits the row ID and updater identity.
 
 ### 16.4 Create a study
 
-```ts
-const { study } = await scienceRequest<{ study: { id: string; name: string } }>(
-  "/api/science/studies",
-  {
-    method: "POST",
-    body: JSON.stringify({
-      name: "Cantilever Beam Tutorial",
-      description: "Non-regulated control-plane exercise",
-      classification: "non_regulated",
-    }),
-  },
-);
+```js
+var studyResult = await scienceRequest("/api/science/studies", {
+  method: "POST",
+  body: JSON.stringify({
+    name: "Deterministic Fixture Tutorial",
+    description: "Non-regulated deterministic control-plane exercise",
+    classification: "non_regulated",
+  }),
+});
+tutorial.study = studyResult.study;
+console.log("Study", tutorial.study.id, tutorial.study.name);
 ```
 
 Study names are 1–200 characters; descriptions are at most 20,000. Archive is
 irreversible.
 
-### 16.5 Create an artifact
+Study creation is not idempotent. If the response is lost, list studies and
+find the exact created record before attempting another POST.
 
-```ts
-const { artifact } = await scienceRequest<{ artifact: { id: string } }>(
-  `/api/science/studies/${encodeURIComponent(study.id)}/artifacts`,
-  {
+### 16.5 Create the data and notebook artifacts
+
+```js
+async function createTutorialArtifact(logicalName, kind, format) {
+  const result = await scienceRequest(
+    `/api/science/studies/${encodeURIComponent(tutorial.study.id)}/artifacts`,
+    {
     method: "POST",
-    body: JSON.stringify({
-      logicalName: "load-cases.csv",
-      kind: "dataset",
-      format: "csv",
-    }),
-  },
-);
-```
-
-### 16.6 Calculate SHA-256 safely in Node.js
-
-For a file too large to read into memory, stream it:
-
-```ts
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
-
-const filePath = "./load-cases.csv";
-const hash = createHash("sha256");
-for await (const chunk of createReadStream(filePath)) hash.update(chunk);
-
-const expectedSha256 = hash.digest("hex");
-const expectedSizeBytes = (await stat(filePath)).size;
-```
-
-The digest must be exactly 64 lowercase hexadecimal characters.
-
-### 16.7 Upload in three steps
-
-This browser-only example starts from the file selected in
-`<input id="science-file" type="file">`:
-
-```ts
-const input = document.querySelector<HTMLInputElement>("#science-file");
-const file = input?.files?.[0];
-if (!file) throw new Error("Select a file before uploading.");
-
-const browserHashLimitBytes = 256 * 1024 * 1024;
-if (file.size > browserHashLimitBytes) {
-  throw new Error("The FUI cannot ingest files over 256 MiB; contact an operator.");
+      body: JSON.stringify({ logicalName, kind, format }),
+    },
+  );
+  return result.artifact;
 }
 
-const expectedSizeBytes = file.size;
-const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-const expectedSha256 = Array.from(new Uint8Array(digest), (byte) =>
-  byte.toString(16).padStart(2, "0"),
-).join("");
-```
+tutorial.dataArtifact = await createTutorialArtifact(
+  "thermal-boundary.csv",
+  "dataset",
+  "csv",
+);
+tutorial.notebookArtifact = await createTutorialArtifact(
+  "deterministic-pilot.ipynb",
+  "notebook",
+  "ipynb",
+);
 
-#### Step A — request an upload intent
-
-```ts
-const intent = await scienceRequest<{
-  uploadToken: string;
-  uploadUrl?: string;
-  expiresAt: string;
-}>(`/api/science/artifacts/${encodeURIComponent(artifact.id)}/uploads`, {
-  method: "POST",
-  body: JSON.stringify({
-    expectedSizeBytes,
-    expectedSha256,
-    filename: "load-cases.csv",
-    mediaType: "text/csv",
-  }),
+console.log({
+  dataArtifactId: tutorial.dataArtifact.id,
+  notebookArtifactId: tutorial.notebookArtifact.id,
 });
 ```
 
-The token and URL are short-lived capabilities. Never log them. Use the
-returned `uploadUrl` exactly; do not reconstruct a signed URL.
+Artifact creation is also non-idempotent. On an ambiguous response, list the
+study's artifacts and reconcile by ID and logical name before retrying.
 
-#### Step B — send the complete raw file
+### 16.6 Pick, hash, and upload both checked-in files
 
-```ts
-const uploadTarget = intent.uploadUrl ??
-  `/api/science/uploads/${encodeURIComponent(intent.uploadToken)}`;
+The example below creates its own temporary file picker; it does not depend on
+an element in the Puppetmaster DOM. Run it once, then choose the named file from
+the repository checkout when each picker opens.
 
-const uploadResponse = await fetch(uploadTarget, {
-  method: "PUT",
-  headers: { "content-type": "application/octet-stream" },
-  body: file,
-  credentials: "same-origin",
-});
+```js
+function chooseLocalFile(expectedName) {
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.hidden = true;
+    input.addEventListener("change", () => {
+      const file = input.files?.[0];
+      input.remove();
+      if (!file) return reject(new Error("No file was selected."));
+      if (file.name !== expectedName) {
+        return reject(new Error(`Expected ${expectedName}, received ${file.name}.`));
+      }
+      resolve(file);
+    }, { once: true });
+    document.body.append(input);
+    input.click();
+  });
+}
 
-if (!uploadResponse.ok) throw new Error(`Upload failed: ${uploadResponse.status}`);
+async function sha256File(file) {
+  const browserHashLimitBytes = 256 * 1024 * 1024;
+  if (file.size > browserHashLimitBytes) {
+    throw new Error(
+      "This tutorial supports files up to 256 MiB. Stop and use only an approved large-file integration.",
+    );
+  }
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+async function uploadTutorialFile(artifactId, file, mediaType) {
+  const expectedSha256 = await sha256File(file);
+  const intent = await scienceRequest(
+    `/api/science/artifacts/${encodeURIComponent(artifactId)}/uploads`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        expectedSizeBytes: file.size,
+        expectedSha256,
+        filename: file.name,
+        mediaType,
+      }),
+    },
+  );
+
+  // The token and URL are short-lived capabilities. Never print or persist them.
+  const uploadTarget = intent.uploadUrl ??
+    `/api/science/uploads/${encodeURIComponent(intent.uploadToken)}`;
+  const uploadResponse = await fetch(uploadTarget, {
+    method: "PUT",
+    headers: { "content-type": "application/octet-stream" },
+    body: file,
+    credentials: "same-origin",
+  });
+  if (!uploadResponse.ok) {
+    throw new Error(`Upload failed: ${uploadResponse.status}`);
+  }
+
+  const version = await scienceRequest(
+    `/api/science/uploads/${encodeURIComponent(intent.uploadToken)}/complete`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        mediaType,
+        metadata: { filename: file.name },
+      }),
+    },
+  );
+  if (version.status !== "ready" || version.sha256 !== expectedSha256) {
+    throw new Error(`Version did not finalize as the expected ready bytes: ${version.status}`);
+  }
+  return version;
+}
 ```
 
-For larger files, an operator must use this same intent/stream/complete REST
-contract from a streaming client, subject to the configured object-size limit.
-The current live S3 path is not proved.
+Choose `services/science-runtime/fixtures/data/thermal-boundary.csv` first:
 
-#### Step C — complete the upload
+```js
+var dataFile = await chooseLocalFile("thermal-boundary.csv");
+tutorial.dataVersion = await uploadTutorialFile(
+  tutorial.dataArtifact.id,
+  dataFile,
+  "text/csv",
+);
+console.log("Ready data version", tutorial.dataVersion.id);
+```
 
-```ts
-const version = await scienceRequest<{
-  id: string;
-  status: "ready" | "pending" | "quarantined" | "expired";
-  sha256: string;
-}>(`/api/science/uploads/${encodeURIComponent(intent.uploadToken)}/complete`, {
-  method: "POST",
-  body: JSON.stringify({
-    mediaType: "text/csv",
-    metadata: { filename: "load-cases.csv" },
-  }),
-});
+Then choose
+`services/science-runtime/fixtures/notebooks/deterministic-pilot.ipynb`:
+
+```js
+var notebookFile = await chooseLocalFile("deterministic-pilot.ipynb");
+tutorial.notebookVersion = await uploadTutorialFile(
+  tutorial.notebookArtifact.id,
+  notebookFile,
+  "application/x-ipynb+json",
+);
+console.log("Ready notebook version", tutorial.notebookVersion.id);
 ```
 
 The completion response is the public version object directly, not
-`{artifactVersion: ...}`.
+`{artifactVersion: ...}`. Uploads are whole-file and restart-only. Completion is
+safe to retry after an ambiguous completion response; do not blindly repeat a
+claimed PUT, append bytes, or create a second intent before checking completion.
 
-Uploads are one complete transfer, not multipart or resumable. A second claimed
-PUT conflicts. If PUT ended ambiguously, try completion once. If the bytes are
-not available, create a new intent and resend the whole object. Completion is
-safe to retry and returns the already completed version.
+This release does not document a supported self-service upload client for files
+over 256 MiB. Do not treat the server's streaming implementation as an
+authorization to improvise CLI session handling or signed URLs.
 
-### 16.8 Submit a run
+### 16.7 Select the exact approved profile and validate its ceilings
 
-```ts
-const profilePage = await scienceRequest<{
-  items: Array<{ id: string; name: string; enabled: boolean }>;
-}>("/api/science/compute-profiles?enabled=true&limit=200");
+List enabled profiles, then paste the exact UUID supplied by the administrator
+who created the deterministic tutorial profile. Do not select “the first
+enabled profile.”
 
-const profile = profilePage.items.find((item) => item.enabled);
-if (!profile) {
-  throw new Error(
-    "No enabled compute profile is available; ask an admin to configure an admitted provider.",
-  );
+```js
+var profilePage = await scienceRequest(
+  "/api/science/compute-profiles?enabled=true&limit=200",
+);
+console.table(profilePage.items.map((profile) => ({
+  id: profile.id,
+  name: profile.name,
+  provider: profile.providerKind,
+  imageDigest: profile.imageDigest,
+  kernel: profile.kernelName,
+  cpuMillicores: profile.resourceBounds.cpuMillicores,
+  memoryMb: profile.resourceBounds.memoryMb,
+  gpuCount: profile.resourceBounds.gpuCount,
+  wallTimeSeconds: profile.resourceBounds.wallTimeSeconds,
+})));
+
+var approvedProfileId = prompt(
+  "Paste the exact deterministic tutorial compute-profile UUID supplied by the admin:",
+)?.trim();
+if (!approvedProfileId) throw new Error("An exact approved profile ID is required.");
+
+tutorial.profile = profilePage.items.find(
+  (profile) => profile.id === approvedProfileId,
+);
+if (!tutorial.profile?.enabled) {
+  throw new Error("The exact approved profile is absent or disabled.");
 }
 
-const idempotencyKey = "tutorial-run-001";
+var expectedFixtureDigest =
+  "sha256:1445edcf2ab7a2400b0851810d78bf572ad104afc8518f5cd207d88c528b72d6";
+if (
+  tutorial.profile.providerKind !== "local_container" ||
+  tutorial.profile.imageDigest !== expectedFixtureDigest ||
+  tutorial.profile.kernelName !== "python-fixture-v1" ||
+  tutorial.profile.config?.dependencyLock?.python !== "fixture"
+) {
+  throw new Error("The selected profile does not match the documented deterministic fixture identity.");
+}
 
-const submission = await scienceRequest<{
-  run: { id: string; executionGeneration: number; state: string };
-  missionId: string;
-  approvalId: string;
-  created: boolean;
-}>(`/api/science/studies/${encodeURIComponent(study.id)}/runs`, {
-  method: "POST",
-  body: JSON.stringify({
-    computeProfileId: profile.id,
-    resourceRequest: {
-      cpuMillicores: 500,
-      memoryMb: 256,
-      gpuCount: 0,
-      wallTimeSeconds: 60,
+tutorial.resourceRequest = {
+  cpuMillicores: 500,
+  memoryMb: 256,
+  gpuCount: 0,
+  wallTimeSeconds: 60,
+};
+for (const [field, requested] of Object.entries(tutorial.resourceRequest)) {
+  const ceiling = tutorial.profile.resourceBounds[field];
+  if (!Number.isInteger(ceiling) || requested > ceiling) {
+    throw new Error(`${field} request ${requested} exceeds profile ceiling ${ceiling}.`);
+  }
+}
+console.log("Approved profile and resource request verified", tutorial.profile.id);
+```
+
+### 16.8 Submit an idempotent run with both inputs
+
+The example fingerprints the exact request intent and stores one random
+idempotency key under that fingerprint before POST. Re-running the same block
+after an ambiguous response therefore reuses the same key. Changing the
+profile, resources, inputs, roles, or parameters produces a deliberate new
+intent and a different stored key.
+
+```js
+tutorial.runIntent = {
+  computeProfileId: tutorial.profile.id,
+  resourceRequest: tutorial.resourceRequest,
+  inputs: [
+    {
+      artifactVersionId: tutorial.notebookVersion.id,
+      semanticRole: "notebook",
     },
-    inputs: [
-      {
-        artifactVersionId: version.id,
-        semanticRole: "loads",
-      },
-    ],
-    parameters: {
-      units: { length: "mm", force: "N" },
-      randomSeeds: { main: 42 },
+    {
+      artifactVersionId: tutorial.dataVersion.id,
+      semanticRole: "boundary_conditions",
     },
-    idempotencyKey,
-  }),
+  ],
+  parameters: {
+    units: { time: "s", temperature: "K", pressure: "Pa" },
+    randomSeeds: { main: 7 },
+  },
+};
+
+var runIntentHash = await sha256Text(JSON.stringify(tutorial.runIntent));
+var runKeyStorageName = `science-tutorial:run-key:${runIntentHash}`;
+var idempotencyKey = localStorage.getItem(runKeyStorageName);
+if (!idempotencyKey) {
+  idempotencyKey = crypto.randomUUID();
+  localStorage.setItem(runKeyStorageName, idempotencyKey);
+}
+tutorial.runIdempotencyKey = idempotencyKey;
+
+tutorial.submission = await scienceRequest(
+  `/api/science/studies/${encodeURIComponent(tutorial.study.id)}/runs`,
+  {
+    method: "POST",
+    body: JSON.stringify({
+      ...tutorial.runIntent,
+      idempotencyKey: tutorial.runIdempotencyKey,
+    }),
+  },
+);
+console.log({
+  runId: tutorial.submission.run.id,
+  approvalId: tutorial.submission.approvalId,
+  created: tutorial.submission.created,
+  idempotencyKey: tutorial.runIdempotencyKey,
 });
 ```
 
@@ -1131,8 +1557,8 @@ same profile, resources, canonical parameters, actor, and sorted input links.
 The approval endpoint is shared application infrastructure, not under
 `/api/science`:
 
-```ts
-await scienceRequest(`/api/approvals/${encodeURIComponent(submission.approvalId)}`, {
+```js
+await scienceRequest(`/api/approvals/${encodeURIComponent(tutorial.submission.approvalId)}`, {
   method: "POST",
   body: JSON.stringify({ approved: true }),
 });
@@ -1141,46 +1567,115 @@ await scienceRequest(`/api/approvals/${encodeURIComponent(submission.approvalId)
 The strict body is `{approved: true}` or `{approved: false}`. Builder rights or
 higher are required.
 
-### 16.10 Poll the run and cancel safely
+### 16.10 Wait for a terminal run and cancel safely
 
-```ts
-const dossier = await scienceRequest<{
-  run: {
-    id: string;
-    state: string;
-    executionGeneration: number;
-    inputs: unknown[];
-    outputs: unknown[];
-    recentEvents: unknown[];
-  };
-}>(`/api/science/runs/${encodeURIComponent(submission.run.id)}?eventLimit=50`);
+This bounded loop honors `Retry-After`, polls no faster than every three
+seconds, and stops after 120 attempts. A local timeout is not permission to
+submit a duplicate run; keep the run ID and refetch it later.
+
+```js
+async function waitForTerminalRun(runId, maxAttempts = 120) {
+  const terminal = new Set(["succeeded", "failed", "cancelled"]);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetch(
+      `/api/science/runs/${encodeURIComponent(runId)}?eventLimit=50`,
+      { credentials: "same-origin" },
+    );
+    if (response.status === 429) {
+      await sleep(retryAfterMilliseconds(response.headers.get("retry-after")));
+      continue;
+    }
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(`${response.status}: ${problem.error ?? response.statusText}`);
+    }
+    const dossier = await response.json();
+    console.log(`Attempt ${attempt}: ${dossier.run.state}`);
+    if (terminal.has(dossier.run.state)) return dossier;
+    await sleep(3_000);
+  }
+  throw new Error(`Run ${runId} did not reach a terminal state within the bounded wait.`);
+}
+
+tutorial.dossier = await waitForTerminalRun(tutorial.submission.run.id);
+if (tutorial.dossier.run.state !== "succeeded") {
+  throw new Error(
+    `Run ended ${tutorial.dossier.run.state}: ${tutorial.dossier.run.error ?? "no error supplied"}`,
+  );
+}
 ```
 
-To cancel, use the latest generation from the latest GET:
+The following cancellation block is reference for a separate run that is still
+active. **Do not run it after the tutorial run has succeeded.** To cancel an
+active run, use the latest generation from a fresh GET:
 
-```ts
-await scienceRequest(`/api/science/runs/${encodeURIComponent(dossier.run.id)}/cancel`, {
+```js
+var latestDossier = await scienceRequest(
+  `/api/science/runs/${encodeURIComponent(tutorial.submission.run.id)}?eventLimit=50`,
+);
+await scienceRequest(`/api/science/runs/${encodeURIComponent(latestDossier.run.id)}/cancel`, {
   method: "POST",
   body: JSON.stringify({
-    generation: dossier.run.executionGeneration,
+    generation: latestDossier.run.executionGeneration,
     reason: "Operator requested cancellation",
   }),
 });
 ```
 
-The route currently accepts a reason but does not persist it through the
-service. Do not rely on cancellation-reason attribution. On 409, GET the run
-again before deciding whether another cancel request is appropriate.
+The optional reason is trimmed, limited to 1,000 characters, and retained in
+the run event and semantic audit context. Write a concise operator reason; it
+is attribution and operational evidence, not scientific validation. On 409,
+GET the run again before deciding whether another cancel request is appropriate.
 
-### 16.11 Fetch the manifest
+### 16.11 Inspect the exact output metadata and manifest
 
-```ts
-const manifestResult = await scienceRequest<{
-  manifest: unknown;
-  manifestHash: string;
-  complete: boolean;
-  gaps: string[];
-}>(`/api/science/runs/${encodeURIComponent(dossier.run.id)}/manifest`);
+The current FUI does not display the deterministic fixture flags. Bind the
+check to one exact run output, then read that immutable artifact version:
+
+```js
+var staticRenderMaxBytes = 8 * 1024 * 1024;
+tutorial.pngOutput = tutorial.dossier.run.outputs.find((output) =>
+  output.direction === "output" &&
+  output.mediaType === "image/png" &&
+  Number.isInteger(output.sizeBytes) &&
+  output.sizeBytes <= staticRenderMaxBytes &&
+  /^[0-9a-f]{64}$/.test(output.sha256 ?? ""),
+);
+if (!tutorial.pngOutput) {
+  throw new Error("No checksummed run-linked PNG output at or below 8 MiB exists.");
+}
+
+var versionResult = await scienceRequest(
+  `/api/science/artifact-versions/${encodeURIComponent(tutorial.pngOutput.artifactVersionId)}`,
+);
+tutorial.pngVersion = versionResult.artifactVersion;
+if (
+  tutorial.pngVersion.status !== "ready" ||
+  tutorial.pngVersion.sha256 !== tutorial.pngOutput.sha256 ||
+  tutorial.pngVersion.sizeBytes !== tutorial.pngOutput.sizeBytes ||
+  tutorial.pngVersion.mediaType !== "image/png" ||
+  tutorial.pngVersion.metadata?.fixturePreview !== true ||
+  tutorial.pngVersion.metadata?.productionCompute !== false
+) {
+  throw new Error("The exact PNG is not a ready deterministic fixture preview.");
+}
+console.log({
+  artifactVersionId: tutorial.pngVersion.id,
+  sha256: tutorial.pngVersion.sha256,
+  sizeBytes: tutorial.pngVersion.sizeBytes,
+  fixturePreview: tutorial.pngVersion.metadata.fixturePreview,
+  productionCompute: tutorial.pngVersion.metadata.productionCompute,
+});
+
+tutorial.manifestResult = await scienceRequest(
+  `/api/science/runs/${encodeURIComponent(tutorial.dossier.run.id)}/manifest`,
+);
+if (!tutorial.manifestResult.complete || tutorial.manifestResult.gaps.length !== 0) {
+  throw new Error(
+    `Manifest is incomplete: ${tutorial.manifestResult.gaps.join(", ") || "unnamed gap"}`,
+  );
+}
+console.log("Complete manifest", tutorial.manifestResult.manifestHash);
 ```
 
 A 404 is normal before a manifest exists. After a reported successful run, a
@@ -1190,30 +1685,43 @@ missing manifest needs investigation.
 
 Create/replay a reproduction:
 
-```ts
-await scienceRequest(`/api/science/runs/${encodeURIComponent(dossier.run.id)}/reproduce`, {
+```js
+var reproductionStorageName =
+  `science-tutorial:reproduction-key:${tutorial.dossier.run.id}`;
+var reproductionKey = localStorage.getItem(reproductionStorageName);
+if (!reproductionKey) {
+  reproductionKey = crypto.randomUUID();
+  localStorage.setItem(reproductionStorageName, reproductionKey);
+}
+await scienceRequest(`/api/science/runs/${encodeURIComponent(tutorial.dossier.run.id)}/reproduce`, {
   method: "POST",
-  body: JSON.stringify({ idempotencyKey: "tutorial-reproduction-001" }),
+  body: JSON.stringify({ idempotencyKey: reproductionKey }),
 });
 ```
 
-Compare to another run:
+Compare to another same-workspace run after both manifests exist:
 
-```ts
-await scienceRequest(`/api/science/runs/${encodeURIComponent(dossier.run.id)}/reproduce`, {
-  method: "POST",
-  body: JSON.stringify({ candidateRunId: "<candidate-run-uuid>" }),
-});
+```js
+var candidateRunId = prompt("Paste the exact same-workspace candidate run UUID:")?.trim();
+if (!candidateRunId) throw new Error("A candidate run ID is required.");
+var comparison = await scienceRequest(
+  `/api/science/runs/${encodeURIComponent(tutorial.dossier.run.id)}/comparison?candidateRunId=${encodeURIComponent(candidateRunId)}`,
+);
+console.log(comparison);
 ```
 
-Send exactly one of `idempotencyKey` or `candidateRunId`. The schema currently
-accepts both, but comparison wins; depending on that ambiguity is unsafe.
+Comparison is a member-readable GET and creates no run. Keep it separate from
+the builder-only reproduction POST. Numerical equivalence remains unknown
+unless the database's current append-only validation head points to an intact
+record that binds both current manifest hashes and both output-checksum
+snapshots and records the named metric, tolerance, observation, and decision.
+That review is separate from both immutable run manifests.
 
 ### 16.13 Read artifact content and ranges
 
-```ts
-const response = await fetch(
-  `/api/science/artifact-versions/${encodeURIComponent(version.id)}/content`,
+```js
+var response = await fetch(
+  `/api/science/artifact-versions/${encodeURIComponent(tutorial.pngVersion.id)}/content`,
   {
     headers: { range: "bytes=0-1023" },
     credentials: "same-origin",
@@ -1224,21 +1732,117 @@ if (response.status !== 200 && response.status !== 206) {
   throw new Error(`Content read failed: ${response.status}`);
 }
 
-const firstKilobyte = await response.arrayBuffer();
+var firstKilobyte = await response.arrayBuffer();
 ```
 
 Exactly one range is supported: `bytes=N-M`, `bytes=N-`, or `bytes=-N`. Invalid
 or unsatisfiable ranges return 416 and `Content-Range: bytes */<size>`. The ETag
 is `"sha256-<digest>"`, but conditional GET is not an implemented contract.
 
-### 16.14 Events
+### 16.14 Open and close an exact static result
+
+Start only from the exact `ready`, run-linked PNG verified in §16.11. Its
+maximum accepted size is **8 MiB (8,388,608 bytes)**. The route may return 202
+with `state="starting"` and `renderUrl=null`; replay the same body and key until
+it becomes ready or the bounded retry ends.
+
+```js
+async function openExactStaticRender(runId, pngOutput, maxAttempts = 12) {
+  const maxBytes = 8 * 1024 * 1024;
+  if (
+    pngOutput.mediaType !== "image/png" ||
+    !/^[0-9a-f]{64}$/.test(pngOutput.sha256 ?? "") ||
+    !Number.isInteger(pngOutput.sizeBytes) ||
+    pngOutput.sizeBytes > maxBytes
+  ) {
+    throw new Error("Static render requires one checksummed PNG no larger than 8 MiB.");
+  }
+
+  const renderKey = `tutorial-static-${runId}-${pngOutput.artifactVersionId}`;
+  const body = JSON.stringify({
+    artifactVersionId: pngOutput.artifactVersionId,
+    mode: "static",
+    idempotencyKey: renderKey,
+  });
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetch(
+      `/api/science/runs/${encodeURIComponent(runId)}/render-sessions`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        credentials: "same-origin",
+      },
+    );
+    if (response.status === 429 || response.status >= 500) {
+      await sleep(retryAfterMilliseconds(response.headers.get("retry-after"), 1_000));
+      continue;
+    }
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(`${response.status}: ${problem.error ?? response.statusText}`);
+    }
+
+    const opened = await response.json();
+    if (
+      opened.session.source.artifactVersionId !== pngOutput.artifactVersionId ||
+      opened.session.source.sha256 !== pngOutput.sha256 ||
+      opened.session.source.mediaType !== "image/png" ||
+      opened.session.source.sizeBytes !== pngOutput.sizeBytes
+    ) {
+      throw new Error("The render response is not bound to the reviewed PNG.");
+    }
+    if (opened.session.state === "ready" && opened.renderUrl) return opened;
+    if (opened.session.state !== "starting" || opened.renderUrl !== null) {
+      throw new Error(`Unexpected render state: ${opened.session.state}`);
+    }
+    await sleep(1_000);
+  }
+  throw new Error("Static render did not become ready within the bounded replay window.");
+}
+
+tutorial.openedRender = await openExactStaticRender(
+  tutorial.dossier.run.id,
+  tutorial.pngOutput,
+);
+
+var imageResponse = await fetch(tutorial.openedRender.renderUrl, {
+  credentials: "same-origin",
+});
+if (!imageResponse.ok) throw new Error(`Static result failed: ${imageResponse.status}`);
+if (imageResponse.headers.get("content-type")?.split(";", 1)[0] !== "image/png") {
+  throw new Error("Static gateway did not return image/png.");
+}
+```
+
+Do not send `client` or `remote`; the released route refuses both. On a network
+error or 5xx, retry with the same `renderKey`, run ID, and artifact-version ID.
+An explicit 409 means that key is already bound to a different intent: fetch
+current state and do not generate keys in a blind loop.
+
+Close by exact session ID. If the response is lost, retry the same DELETE; do
+not discard the ID locally until the server confirms success.
+
+```js
+await scienceRequest(
+  `/api/science/render-sessions/${encodeURIComponent(tutorial.openedRender.session.id)}`,
+  { method: "DELETE" },
+);
+```
+
+The server retains a short replay tombstone after close. It does not consume a
+render slot or hold the source bytes, but it prevents an ambiguous close/retry
+from changing request identity.
+
+### 16.15 Events
 
 Authenticated WebSocket `/api/events` delivers workspace-filtered JSON events.
 Use them as a prompt to refetch affected REST resources. There is no exposed
 Science replay/resume cursor, so never treat the event stream as the durable
 record.
 
-### 16.15 Pagination
+### 16.16 Pagination
 
 The server uses offset pagination:
 
@@ -1250,7 +1854,7 @@ Read `nextOffset` from the response and use it as the next `offset`. Limits are
 1–200. The web client's property name `nextCursor` is an adapter over the
 numeric offset; arbitrary nonnumeric cursors are not implemented by the server.
 
-### 16.16 Error handling and retry rules
+### 16.17 Error handling and retry rules
 
 | HTTP | Meaning | Beginner response |
 |---:|---|---|
@@ -1270,6 +1874,10 @@ Safe retry summary:
 - **Upload PUT:** do not append or blindly replay after claim.
 - **Upload completion:** safe to retry.
 - **Cancellation:** refetch and use the exact current generation.
+- **Static render start:** same key and same exact run/source/mode after a
+  timeout or 5xx; changed intent must use a deliberate new key.
+- **Static render close:** retain the session ID and retry the same DELETE until
+  success.
 - **Rate limit:** honor `Retry-After`.
 - **Conflict:** never loop blindly.
 
@@ -1306,8 +1914,13 @@ admin or owner.
 | `GET /api/science/runs/:runId` | Read dossier and recent events. | Member |
 | `POST /api/science/runs/:runId/cancel` | Cancel exact generation. | Builder |
 | `GET /api/science/runs/:runId/manifest` | Read canonical manifest. | Member |
-| `POST /api/science/runs/:runId/reproduce` | Reproduce or compare. | Builder |
-| `POST /api/science/runs/:runId/render-sessions` | Start bounded render session. | Builder |
+| `GET /api/science/runs/:runId/validations` | List up to 100 bounded immutable-review summaries separately from the manifest. | Member |
+| `GET /api/science/runs/:runId/validations/:validationId` | Read one scoped review with its checksum bindings. | Member |
+| `POST /api/science/runs/:runId/validations` | Append one session-attributed domain or linked numerical review. | Admin |
+| `POST /api/science/runs/:runId/reproduce` | Create an idempotent reproduction run. | Builder |
+| `GET /api/science/runs/:runId/comparison?candidateRunId=...` | Compare two same-workspace manifests without creating work. | Member |
+| `GET /api/science/admin/action-queue` | List paginated redacted reconciliation/cleanup actions. | Admin |
+| `POST /api/science/runs/:runId/render-sessions` | Start/replay an exact ready, run-linked static PNG session up to 8 MiB (8,388,608 bytes). Body requires `artifactVersionId`, `mode: "static"`, and a 1-200 character `idempotencyKey`. | Builder |
 | `POST /api/science/render-sessions/:id/renew` | Renew admitted session. | Builder |
 | `DELETE /api/science/render-sessions/:id` | Close session. | Builder |
 | `POST /api/approvals/:approvalId` | Approve or deny shared authorization. | Builder |
@@ -1408,6 +2021,8 @@ fields.
 
 ## 20. Related documentation
 
+- [Complete getting-started guide](../GETTING-STARTED.md)
+- [General installation and account setup](../INSTALL.md)
 - [Science Operations overview](./README.md)
 - [Installation and configuration](./installation-and-configuration.md)
 - [Provider contracts](./provider-contracts.md)
@@ -1421,9 +2036,8 @@ fields.
 - [ADR-011: compute lifecycle](../adr/011-science-compute-provider-and-lifecycle.md)
 - [ADR-012: render-session authentication](../adr/012-science-render-session-authentication.md)
 
-The evidence matrix currently contains pre-migration-11 rows and historical
-aggregate counts that conflict with newer admission documentation. Until it is
-reconciled and post-migration-11 aggregate evidence is retained, use current
-source, the installation guide, ADRs, and known limitations for capability
-interpretation. Do not treat historical pass counts as current production
-certification.
+The evidence matrix records the focused migration-12 validation results and
+marks the retained aggregate/root timings as pre-migration-12 until rerun. Use
+current source, the installation guide, ADRs, and known limitations together
+for capability interpretation. No local pass count is production or named
+scientific-domain certification.

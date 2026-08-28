@@ -18,7 +18,8 @@ export interface RenderSource {
   mediaType: string;
   size: number;
   sha256: string;
-  reference: ArtifactReference;
+  /** Remote providers require a scoped reference. Static inline rendering does not. */
+  reference?: ArtifactReference;
 }
 
 export interface RenderLaunch {

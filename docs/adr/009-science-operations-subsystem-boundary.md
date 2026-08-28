@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted for the implemented control-plane boundary (2026-07-29).
+Accepted for the implemented control-plane boundary (2026-07-29; evidence
+reconciled 2026-08-24).
 
 This decision does not admit Jupyter Enterprise Gateway, trame, OCCT, or a
 production notebook executor. Their separate evidence gates remain no-go.
@@ -32,6 +33,10 @@ existing control plane:
 - Each science run has exactly one `science` mission. Run events carry
   workspace, study, run, and mission correlation; database state remains
   authoritative after a WebSocket disconnect or process restart.
+- Science Redis Streams are bounded advisory notifications, not a ledger.
+  Subscribers begin at the latest stream ID and retain no durable replay
+  cursor; after disconnect or publish failure they reread authoritative
+  database state. BullMQ queue admission/retry is a separate Redis contract.
 - Artifact bytes remain behind `ArtifactStore`; compute and rendering remain
   behind `ComputeProvider` and `RenderSessionProvider`.
 - Administrative artifact purge remains inside the same RBAC/service/repository
@@ -61,10 +66,14 @@ existing control plane:
   the `system/science-db` fallback. Append-only events and operational-only
   updates suppress duplicate churn. The secondary semantic sink remains
   best-effort and cannot make a committed mutation retryable. Migration 11 adds
-  the default-deny workspace-admission row and its atomic audit trigger. The
-  ordered ledger therefore runs through migration 11, including finalizer
-  fencing, cleanup backoff, renewable transfer leases, provider reservations
-  through commit, and persisted pilot admission.
+  the default-deny workspace-admission row and its atomic audit trigger;
+  migrations 12-13 add append-only validation plus monotonic hash-bound scope
+  heads; migration 14 adds durable workflow waits; migration 15 adds exact
+  render replay/source state; and migration 16 adds database-authoritative
+  external-upload stream fencing. The ordered ledger therefore runs through
+  migration 16. The audited Science-domain table count remains 12 because
+  `workflow_waits` is shared workflow infrastructure and migrations 15-16 add
+  columns/indexes rather than Science-domain tables.
 - Startup and the periodic bounded single-flight task run the same full
   reconciliation: cleanup plus database-to-queue recovery for non-terminal
   runs. Database state remains authoritative over Redis delivery.
@@ -140,11 +149,14 @@ Boundary and concurrency checks are represented by:
 - `scripts/verify-science-authz.mjs`
 - `.dependency-cruiser.cjs`
 
-The source verifiers cover migration 11, default deny, redacted/member GET,
-admin-only reasoned PATCH, database-authoritative cross-instance decisions,
-and the accepted-work convergence boundary. Their current post-v11 aggregate
-and root reruns are explicitly pending; no pass is inferred here. Release
-status and missing external evidence are tracked in
+The source verifiers cover the complete 1-16 ledger, default deny,
+redacted/member GET, admin-only reasoned PATCH, database-authoritative
+cross-instance decisions, accepted-work convergence, advisory Redis behavior,
+and workspace-scoped recovery. The fresh deterministic aggregate is
+`SCIENCE GOLDEN PASS^3: 18 isolated deterministic suites; 34 evidence classes
+verified on every pass`; the dedicated loopback PostgreSQL lifecycle also
+passes 16/16. These are local control-plane results, not target HA/load/DR or
+provider execution evidence. Release status and missing external evidence are tracked in
 `docs/science/evidence-matrix.md`.
 
 ## Reconsider when

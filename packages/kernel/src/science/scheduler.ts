@@ -70,6 +70,20 @@ const DEFAULT_TRANSIENT_RETRY_MS = 500;
 const HEALTH_TIMEOUT_MS = 2_000;
 const REDIS_PRODUCER_COMMAND_TIMEOUT_MS = 1_500;
 
+function scienceSchedulerQueueIdentifier(
+  value: string | undefined,
+  fallback: string,
+  label: string,
+): string {
+  const normalized = value?.trim() || fallback;
+  if (!/^[A-Za-z0-9_-]{1,120}$/.test(normalized)) {
+    throw new Error(
+      `science scheduler ${label} must be 1-120 ASCII letters, digits, underscores, or hyphens`,
+    );
+  }
+  return normalized;
+}
+
 async function waitForRedisReady(connection: Redis): Promise<void> {
   if (connection.status === "ready") return;
   if (connection.status === "end") {
@@ -151,8 +165,24 @@ export class QueueScienceScheduler implements ScienceScheduler {
       concurrency?: number;
       transientRetryMs?: number;
       onError?: (message: string, error: unknown) => void;
+      /** Test/deployment isolation hook. Omit to retain the production queue. */
+      queueName?: string;
+      /** BullMQ key prefix. Omit to retain BullMQ's default prefix. */
+      queuePrefix?: string;
     },
   ) {
+    const queueName = scienceSchedulerQueueIdentifier(
+      opts?.queueName,
+      SCIENCE_QUEUE_NAME,
+      "queue name",
+    );
+    const queuePrefix = opts?.queuePrefix === undefined
+      ? undefined
+      : scienceSchedulerQueueIdentifier(
+          opts.queuePrefix,
+          "",
+          "queue prefix",
+        );
     const producerConnection = scienceSchedulerConnectionOptions(url, "producer");
     const workerConnection: ConnectionOptions = scienceSchedulerConnectionOptions(
       url,
@@ -163,7 +193,7 @@ export class QueueScienceScheduler implements ScienceScheduler {
       Math.min(opts?.transientRetryMs ?? DEFAULT_TRANSIENT_RETRY_MS, 60_000),
     );
     this.producerConnection = new Redis(producerConnection);
-    this.queue = new Queue(SCIENCE_QUEUE_NAME, {
+    this.queue = new Queue(queueName, {
       // BullMQ and the workspace currently resolve separate patch releases of
       // ioredis; the runtime client contract is compatible despite their
       // nominally incompatible private TypeScript members.
@@ -174,9 +204,10 @@ export class QueueScienceScheduler implements ScienceScheduler {
       skipWaitingForReady: true,
       // The worker connection still performs BullMQ's Redis version check.
       skipVersionCheck: true,
+      ...(queuePrefix ? { prefix: queuePrefix } : {}),
     });
     this.worker = new Worker(
-      SCIENCE_QUEUE_NAME,
+      queueName,
       async (job: Job, token?: string) => {
         let result: ScienceTickResult;
         try {
@@ -208,6 +239,7 @@ export class QueueScienceScheduler implements ScienceScheduler {
         connection: workerConnection,
         autorun: false,
         concurrency: Math.max(1, Math.min(opts?.concurrency ?? 4, 32)),
+        ...(queuePrefix ? { prefix: queuePrefix } : {}),
       },
     );
     this.queue.on("error", (error) => {

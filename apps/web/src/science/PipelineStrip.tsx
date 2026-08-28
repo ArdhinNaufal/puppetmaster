@@ -1,4 +1,4 @@
-import type { ScienceArtifact, ScienceManifest, ScienceRun } from "../api.js";
+import type { ScienceArtifact, ScienceManifestResult, ScienceRun } from "../api.js";
 
 type StageState = "pending" | "active" | "done" | "failed" | "gap" | "ready";
 
@@ -12,7 +12,7 @@ interface Stage {
 function deriveStages(
   artifacts: ScienceArtifact[],
   run: ScienceRun | null,
-  manifest: ScienceManifest | null,
+  assessment: Pick<ScienceManifestResult, "complete" | "gaps"> | null,
 ): Stage[] {
   const readyArtifacts = artifacts.filter((artifact) => artifact.latestVersion?.status === "ready").length;
   const runState = run?.state ?? null;
@@ -73,17 +73,19 @@ function deriveStages(
       state: runState === "finalizing"
         ? "active"
         : runState === "succeeded"
-          ? manifest?.complete ? "done" : "gap"
+          ? assessment?.complete ? "done" : "gap"
           : terminalFailure ? "failed" : "pending",
       detail: runState === "succeeded"
-        ? manifest?.complete ? "Manifest complete" : "Manifest incomplete"
+        ? assessment?.complete
+          ? "Manifest complete"
+          : `Manifest incomplete${assessment?.gaps.length ? `: ${assessment.gaps.join(", ")}` : ""}`
         : runState === "finalizing" ? "Outputs, checksums, and manifest are finalizing" : "Awaiting finalized outputs",
     },
     {
       id: "release",
       label: "RELEASE / RE-RUN",
-      state: runState === "succeeded" && manifest?.complete ? "ready" : "pending",
-      detail: runState === "succeeded" && manifest?.complete
+      state: runState === "succeeded" && assessment?.complete ? "ready" : "pending",
+      detail: runState === "succeeded" && assessment?.complete
         ? "Manifest is eligible for deliberate release or re-run"
         : "Requires a successful run and complete manifest",
     },
@@ -93,9 +95,9 @@ function deriveStages(
 export function PipelineStrip(props: {
   artifacts: ScienceArtifact[];
   run: ScienceRun | null;
-  manifest: ScienceManifest | null;
+  assessment: Pick<ScienceManifestResult, "complete" | "gaps"> | null;
 }) {
-  const stages = deriveStages(props.artifacts, props.run, props.manifest);
+  const stages = deriveStages(props.artifacts, props.run, props.assessment);
   return (
     <ol className="sci-pipeline" aria-label="Scientific computation pipeline">
       {stages.map((stage, index) => (

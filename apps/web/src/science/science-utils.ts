@@ -2,8 +2,11 @@ import { useEffect, useState } from "react";
 import { ApiError, type ScienceRunState } from "../api.js";
 
 export const SCIENCE_PAGE_SIZE = 24;
+export const SCIENCE_STATIC_RENDER_MAX_BYTES = 8 * 1024 * 1024;
 /** Web Crypto digests whole buffers. Keep the browser path bounded; larger
- * artifacts must use the server/S3 ingest path instead of risking tab OOM. */
+ * artifacts must use the same upload-intent/stream/complete REST contract from
+ * an operator-controlled streaming client instead of risking tab OOM. This
+ * does not imply that a separate S3 user workflow is available. */
 export const SCIENCE_CLIENT_HASH_MAX_BYTES = 256 * 1024 * 1024;
 export const SCIENCE_ACTIVE_RUN_STATES = new Set<ScienceRunState>([
   "awaiting_approval",
@@ -16,7 +19,12 @@ export const SCIENCE_ACTIVE_RUN_STATES = new Set<ScienceRunState>([
 
 export function scienceError(error: unknown): string {
   if (error instanceof ApiError) {
-    if (error.status === 404) return "Science service is not installed on this server.";
+    if (error.status === 404) {
+      const detail = error.message.trim();
+      return !detail || detail.toLowerCase() === "not found"
+        ? "Science service is not installed on this server."
+        : detail;
+    }
     if (error.status === 403) return "Your role cannot perform this Science operation.";
     if (error.status === 409) return error.message || "Science state changed; refresh and try again.";
     return error.message || `Science request failed (${error.status}).`;
@@ -59,7 +67,7 @@ export function shortHash(value: string | null | undefined, length = 12): string
 export async function sha256Blob(blob: Blob): Promise<string> {
   if (blob.size > SCIENCE_CLIENT_HASH_MAX_BYTES) {
     throw new Error(
-      `Browser checksum limit is ${fmtBytes(SCIENCE_CLIENT_HASH_MAX_BYTES)}; use the server/S3 ingest path for this artifact.`,
+      `Browser checksum limit is ${fmtBytes(SCIENCE_CLIENT_HASH_MAX_BYTES)}; contact an operator to use the documented streaming REST upload contract for this artifact.`,
     );
   }
   if (!globalThis.crypto?.subtle) {

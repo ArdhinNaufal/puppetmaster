@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { once } from "node:events";
 import { createReadStream, createWriteStream } from "node:fs";
 import {
   mkdir,
@@ -47,13 +48,46 @@ export interface ArtifactStoreHealth {
   detail?: string;
 }
 
+function artifactAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error("artifact operation aborted");
+}
+
+function awaitArtifactOperation<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) {
+    void operation.catch(() => {});
+    return Promise.reject(artifactAbortReason(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(artifactAbortReason(signal)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
 export interface ArtifactStore {
   readonly adapter: string;
   createQuarantine(key: string): Promise<string>;
   writeQuarantine(
     quarantineKey: string,
     body: AsyncIterable<Uint8Array>,
-    opts: { maxBytes: number },
+    /** On abort, implementations must stop writer activity and settle before returning. */
+    opts: { maxBytes: number; signal?: AbortSignal },
   ): Promise<ArtifactWriteReceipt>;
   openQuarantine(
     quarantineKey: string,
@@ -225,7 +259,7 @@ export class FilesystemArtifactStore implements ArtifactStore {
   async writeQuarantine(
     quarantineKey: string,
     body: AsyncIterable<Uint8Array>,
-    opts: { maxBytes: number },
+    opts: { maxBytes: number; signal?: AbortSignal },
   ): Promise<ArtifactWriteReceipt> {
     if (!quarantineKey.startsWith(".quarantine/")) {
       throw new Error("write target is not a quarantine key");
@@ -233,18 +267,32 @@ export class FilesystemArtifactStore implements ArtifactStore {
     if (!Number.isSafeInteger(opts.maxBytes) || opts.maxBytes < 0) {
       throw new Error("maxBytes must be a nonnegative safe integer");
     }
+    opts.signal?.throwIfAborted();
     const path = pathWithin(this.root, quarantineKey);
-    const before = await stat(path);
+    const before = await awaitArtifactOperation(stat(path), opts.signal);
+    opts.signal?.throwIfAborted();
     if (before.size !== 0) {
       throw new Error("upload already contains bytes; start a new upload intent");
     }
 
     const output = createWriteStream(path, { flags: "r+", mode: 0o600 });
+    let outputAborted = false;
+    const abortOutput = () => {
+      if (outputAborted) return;
+      outputAborted = true;
+      const reason = opts.signal?.reason;
+      output.destroy(
+        reason instanceof Error ? reason : new Error("artifact quarantine write aborted"),
+      );
+    };
+    opts.signal?.addEventListener("abort", abortOutput, { once: true });
+    if (opts.signal?.aborted) abortOutput();
     const hash = createHash("sha256");
     let size = 0;
     let complete = false;
     try {
       for await (const raw of body) {
+        opts.signal?.throwIfAborted();
         const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
         size += chunk.length;
         if (size > opts.maxBytes) {
@@ -252,17 +300,16 @@ export class FilesystemArtifactStore implements ArtifactStore {
         }
         hash.update(chunk);
         if (!output.write(chunk)) {
-          await new Promise<void>((accept, reject) => {
-            output.once("drain", accept);
-            output.once("error", reject);
-          });
+          await once(output, "drain", { signal: opts.signal });
         }
       }
+      opts.signal?.throwIfAborted();
       output.end();
       await finished(output);
       complete = true;
       return { quarantineKey, sha256: hash.digest("hex"), size };
     } finally {
+      opts.signal?.removeEventListener("abort", abortOutput);
       if (!complete) {
         // `createWriteStream` opens asynchronously. On an early size/stream
         // rejection, wait for its terminal event before the caller removes
@@ -644,7 +691,7 @@ export class S3CompatibleArtifactStore implements ArtifactStore {
   writeQuarantine(
     quarantineKey: string,
     body: AsyncIterable<Uint8Array>,
-    opts: { maxBytes: number },
+    opts: { maxBytes: number; signal?: AbortSignal },
   ): Promise<ArtifactWriteReceipt> {
     return this.quarantine.writeQuarantine(quarantineKey, body, opts);
   }

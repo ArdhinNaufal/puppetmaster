@@ -420,7 +420,7 @@ function SnapshotBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {
   );
 }
 
-const LIVE_MISSION = new Set(["queued", "running", "awaiting_approval"]);
+const LIVE_MISSION = new Set(["queued", "running", "waiting", "awaiting_approval"]);
 
 /** The OPERATION panel reborn as a docked pane: the tracked mission's live dossier. */
 function OperationLogBody({ nx }: { ctx: Record<string, unknown>; nx: NX }) {

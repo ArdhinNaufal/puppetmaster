@@ -1,0 +1,122 @@
+name: puppetmaster
+
+# Opt-in deployment-shaped Science object storage. Use with the base Compose
+# file only after supplying non-placeholder SCIENCE_S3_* credentials. The
+# bucket is intentionally created without versioning because the current
+# byte-before-quota-release purge contract rejects delete markers/version IDs.
+services:
+  science-minio-volume-init:
+    profiles: ["science-minio"]
+    image: quay.io/minio/minio@sha256:064117214caceaa8d8a90ef7caa58f2b2aeb316b5156afe9ee8da5b4d83e12c8
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown -R 1000:1000 /data
+    volumes:
+      - science_minio_data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  science-minio:
+    profiles: ["science-minio"]
+    image: quay.io/minio/minio@sha256:064117214caceaa8d8a90ef7caa58f2b2aeb316b5156afe9ee8da5b4d83e12c8
+    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    user: "1000:1000"
+    environment:
+      MINIO_ROOT_USER: ${SCIENCE_S3_ACCESS_KEY_ID:?SCIENCE_S3_ACCESS_KEY_ID is required}
+      MINIO_ROOT_PASSWORD: ${SCIENCE_S3_SECRET_ACCESS_KEY:?SCIENCE_S3_SECRET_ACCESS_KEY is required}
+    depends_on:
+      science-minio-volume-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${SCIENCE_MINIO_PORT:-9000}:9000"
+    expose:
+      - "9000"
+    volumes:
+      - science_minio_data:/data
+    networks:
+      - science_control
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: "2.0"
+    mem_limit: 2g
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+      nproc: 128
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    stop_grace_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  science-minio-bootstrap:
+    profiles: ["science-minio"]
+    image: quay.io/minio/minio@sha256:064117214caceaa8d8a90ef7caa58f2b2aeb316b5156afe9ee8da5b4d83e12c8
+    user: "1000:1000"
+    environment:
+      MINIO_ROOT_USER: ${SCIENCE_S3_ACCESS_KEY_ID:?SCIENCE_S3_ACCESS_KEY_ID is required}
+      MINIO_ROOT_PASSWORD: ${SCIENCE_S3_SECRET_ACCESS_KEY:?SCIENCE_S3_SECRET_ACCESS_KEY is required}
+      SCIENCE_S3_BUCKET: ${SCIENCE_S3_BUCKET:?SCIENCE_S3_BUCKET is required}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set science http://science-minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" >/dev/null
+        mc mb --ignore-existing "science/$${SCIENCE_S3_BUCKET}" >/dev/null
+        version_json="$$(mc version info --json "science/$${SCIENCE_S3_BUCKET}")"
+        case "$${version_json}" in
+          *'"status":""'*) ;;
+          *) echo "Science MinIO bucket must remain unversioned" >&2; exit 1 ;;
+        esac
+        mc anonymous set none "science/$${SCIENCE_S3_BUCKET}" >/dev/null
+    depends_on:
+      science-minio:
+        condition: service_healthy
+    networks:
+      - science_control
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+      - /home:rw,noexec,nosuid,nodev,size=8m,mode=0750
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  server:
+    environment:
+      SCIENCE_STORAGE_DRIVER: s3
+      SCIENCE_S3_ENDPOINT: http://science-minio:9000
+      SCIENCE_S3_REGION: ${SCIENCE_S3_REGION:-us-east-1}
+      SCIENCE_S3_BUCKET: ${SCIENCE_S3_BUCKET:?SCIENCE_S3_BUCKET is required}
+      SCIENCE_S3_ACCESS_KEY_ID: ${SCIENCE_S3_ACCESS_KEY_ID:?SCIENCE_S3_ACCESS_KEY_ID is required}
+      SCIENCE_S3_SECRET_ACCESS_KEY: ${SCIENCE_S3_SECRET_ACCESS_KEY:?SCIENCE_S3_SECRET_ACCESS_KEY is required}
+    depends_on:
+      science-minio-bootstrap:
+        condition: service_completed_successfully
+
+volumes:
+  science_minio_data:

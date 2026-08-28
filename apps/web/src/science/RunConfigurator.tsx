@@ -168,7 +168,7 @@ export function RunConfigurator(props: {
         </select>
       </label>
       {selectedProfile && (
-        <div className="sci-profile-readout" aria-label="Selected compute profile">
+        <div className="sci-profile-readout" role="group" aria-label="Selected compute profile">
           <span>IMAGE <b>{selectedProfile.imageDigest || "N/A"}</b></span>
           <span>AVAILABILITY <b>{selectedProfile.availability?.toUpperCase() ?? "N/A"}</b></span>
           <span>

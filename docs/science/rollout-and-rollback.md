@@ -19,8 +19,9 @@ Required evidence:
 - existing non-Science deterministic suite remains green;
 - additive migrations do not change existing application behavior;
 - dependency boundaries remain valid;
-- backup includes the new tables even while unused, including migration-11
-  workspace admission rows and audit.
+- backup includes the new state even while unused: migration-11 admission,
+  migrations 12-13 validation rows/heads and audit, migration-14
+  `workflow_waits`, and migration-15 render replay/source fields.
 
 `SCIENCE_ENABLED=0` makes Science routes unreadable as well as unwritable. It is
 appropriate before any Science data exists, not the preferred rollback after a
@@ -35,6 +36,7 @@ Scope:
 - inline scheduler;
 - deterministic TypeScript provider;
 - static/table/client diagnostic views;
+- exact-source static PNG session and built-in durable reviewed workflow;
 - synthetic, non-regulated fixtures only.
 
 Admission:
@@ -46,13 +48,31 @@ Admission:
 - an admin records a bounded reason to admit only the deterministic development
   workspace, and another service instance observes the committed database row;
 - a builder completes the approval-to-manifest flow;
-- manifest gaps are displayed honestly.
+- manifest gaps are displayed honestly; provenance can be complete only when a
+  linked immutable `ready` input parsed as `ipynb` and carries the `code`,
+  `notebook`, or `solver` role. Raw `parameters.sourceRevision` is informational,
+  top-level `sourceRevision` remains `null`, and no VCS resolver exists.
 
-This stage is development evidence only. Current post-v11 aggregate/root reruns
-are pending; historical pre-v11 passes do not satisfy this stage.
+This stage is development evidence only. The current deterministic result is
+`SCIENCE GOLDEN PASS^3: 18 isolated deterministic suites; 34 evidence classes verified on every pass`.
+Fresh recursive typecheck/build and the installed-browser Science gate (4/4)
+also pass. The built-in workflow now waits durably for terminal Science state,
+selects one bounded checksummed PNG, requests human approval of that exact
+visible source, opens a replay-safe static session, and reads the complete
+manifest. The deterministic provider labels the data-derived image
+`fixturePreview=true` and `productionCompute=false`; none of this proves
+notebook execution or scientific validity.
 
 The focused scheduler verifier proves deterministic run/generation job IDs and
-inline transient retry. It is not Redis/BullMQ durability evidence.
+inline transient retry. A separate loopback Redis/BullMQ lane passes, including
+a sentinel that survived `WAITAOF` and an exact Redis process restart. Target
+replication/failover/latency remains external.
+
+That BullMQ result applies to scheduler jobs, not event replay. Redis stream
+publication is advisory and bounded to 1,500 ms with no writer offline queue;
+Science database state is authoritative. Subscribers start from the latest
+stream ID and keep no durable replay cursor, so reconnect/restart recovery must
+reread the database rather than replay the event bus.
 
 ## Stage 2: deployment-shaped read-only
 
@@ -76,7 +96,23 @@ Scope:
 
 Admission:
 
-- fresh install and upgrade from pre-Science schema pass on PostgreSQL;
+- production preflight and rendered-Compose parity are retained: enabled
+  production refuses PGlite, inline Redis, and filesystem storage; read-only
+  may omit compute; writable mode requires runtime URL/token/public base and
+  explicit admission;
+- the deployment verifier passes fail-closed preflight, same-origin web
+  delivery, and Compose parity;
+- the production nginx image runs as UID/GID 101 with a read-only root,
+  dropped capabilities, bounded resources/tmpfs, no privilege escalation, and
+  no secrets or Docker socket; loopback HTTP and installed-Chrome same-origin
+  WebSocket probes pass;
+- fresh installation through migration 16 passes on a dedicated loopback
+  PostgreSQL instance with exact marker `science lifecycle (pg): ok`;
+- the loopback Redis/AOF and dedicated unversioned MinIO/S3 lanes pass;
+- external upload controls use exact defaults of 3,600,000 ms absolute timeout,
+  60,000 ms idle timeout, and 4 concurrent external streams per workspace;
+  allowed ranges are 1-86,400,000 ms, 1-3,600,000 ms (idle must not exceed
+  absolute), and 1-128 streams respectively;
 - target object store passes checksum, range, conditional-write, cleanup, and
   failure tests;
 - backup and restore are demonstrated under one recovery-point ID;
@@ -84,11 +120,21 @@ Admission:
 - rate limits, logs, and secret redaction are reviewed behind the intended
   reverse proxy.
 
-Public `/api/health` proves only that the HTTP process is live. Use an
-authenticated `/api/readiness` request for the cached Science dependency
-snapshot and authenticated `/api/bootstrap` for queue kind. Ensure the reverse
+Public `/api/health` proves only that the HTTP process is live. Public
+`/api/readyz` exposes a detail-free cached readiness result and returns 503 on a
+required dependency failure. Use authenticated `/api/readiness` for the redacted
+dependency snapshot and authenticated `/api/bootstrap` for queue kind. Ensure the reverse
 proxy omits signed query strings from its own access logs; the application
 serializer already removes them.
+
+External-stream admission is database-authoritative across server instances: a
+workspace-row lock serializes the count and claim of unexpired external transfer
+leases before an artifact-store writer opens. On an absolute or idle deadline,
+the service stops lease renewal, cancels the request transport and iterator,
+waits for the store writer to settle after abort, and commits a quarantined row
+eligible for immediate cleanup. Retention must delete the partial quarantine
+object before deleting the reservation and releasing quota; discard failure
+keeps the row charged and retries with persisted backoff.
 
 This stage must remain read-only if there is no previously admitted compute
 provider.
@@ -101,7 +147,13 @@ Prerequisites:
   lifecycle suite;
 - target-hardware upload, queue, provision, event freshness, run, recovery,
   storage, and concurrency SLOs are measured and accepted;
-- browser accessibility/fallback gates pass;
+- the fresh installed-browser Science journey passes 4/4;
+- the usable FUI lets a nontechnical admin/owner inspect and append an immutable
+  validation record while all members read its history. A named domain expert
+  and accepted workload-specific tolerance protocol are still required;
+- a fresh database has applied migrations 1-16, including durable workflow
+  waits, exact render replay/source state, and the database-authoritative
+  external-upload stream fence;
 - the rollback drill preserves manifests and artifacts;
 - pilot workspace, users, corpus, quotas, and on-call owner are named.
 
@@ -113,14 +165,18 @@ Initial policy:
   enabling writes;
 - non-regulated corpus only;
 - one allowlisted immutable image/kernel;
-- low concurrency and upload caps;
+- low concurrency and upload caps, including an explicitly reviewed
+  `SCIENCE_MAX_CONCURRENT_EXTERNAL_UPLOAD_STREAMS` value;
 - no trame, JEG, or OCCT unless each has separately passed Stage 4;
-- daily orphan/quarantine review;
+- daily review of the admin-only, redacted
+  `/api/science/admin/action-queue`, plus provider-side discovery for executions
+  that never obtained a database row;
 - retained run, audit, provider, and storage evidence.
 
-Persisted default-deny workspace admission is implemented, but the current
-post-v11 rerun is pending and there is no admitted real notebook executor.
-Stage 3 therefore remains blocked.
+Persisted default-deny workspace admission, the reviewer FUI, durable static
+workflow, and local browser gate are implemented, but there is no admitted real
+notebook executor and no target operational/scientific acceptance. Stage 3
+therefore remains blocked.
 
 For a future admitted HTTP executor, production also requires
 `SCIENCE_RUNTIME_ADMISSION=approved`, a bearer token, and health declaring
@@ -138,7 +194,23 @@ Requires authenticated start/channels/interrupt/shutdown, generation and
 idempotency fencing, reconnect/restart, image/provisioner identity, scoped
 storage, default-deny network, and orphan-cleanup evidence.
 
+The current prerequisite verifies authenticated HTTPS, version floor, exact
+instance fence, immutable kernelspec/image allowlist, bounded control responses,
+recovery correlation, read-only orphan inventory, exact-handle cancellation,
+and secret redaction. It is deliberately not registered as a
+`ComputeProvider`; submit, channels, and output collection remain **NOT
+PROVEN**.
+
 Current decision: **NO-GO**.
+
+### OCI executor
+
+The deterministic candidate gate passes for rootless endpoint policy, state
+ownership, seccomp, argv, quotas, idempotency, fencing, recovery, cancellation,
+bounded output/HTTP, tombstones, and cleanup. The observed host daemon exposed
+`seccomp` and `cgroupns`, not rootless mode, and no real notebook corpus ran.
+
+Current decision: **NO-GO for live admission; deterministic candidate only**.
 
 ### trame
 
@@ -166,6 +238,8 @@ Monitor:
 - lease heartbeat age;
 - cancelling runs and provider reachability;
 - upload quarantine count/age and checksum failures;
+- external-upload deadline failures and live database transfer-lease counts;
+- Redis advisory event-bus disconnects separately from BullMQ job health;
 - render sessions by state/expiry and failed cleanup;
 - artifact bytes/object count;
 - API 4xx/5xx/429 rates;
@@ -195,7 +269,11 @@ Unknown telemetry must remain `N/A`, not zero.
    `submissionsEnabled=false`.
 3. Resolve active work:
    - allow safe runs to finish; or
-   - cancel the exact generation and wait for provider terminal state.
+   - cancel the exact generation with a bounded incident reason and wait for
+     provider terminal state. For an active or draft run, the reason is retained
+     in the run event plus atomic and semantic audit. For an awaiting-approval
+     run, the authoritative reason is retained in atomic and semantic audit
+     only; its approval event carries `approvalId` and `decision`.
 4. Close render sessions and reconcile leaked provider handles.
 5. Capture a database plus artifact recovery point and verify checksums.
 6. Keep Science readable for manifest/artifact export and incident review.
@@ -258,6 +336,11 @@ Enter read-only mode immediately for:
 - deterministic suite result;
 - reviewer and go/no-go decision.
 
-No retained rollback drill is currently available, and current post-v11
-aggregate/root results remain pending. The MVP definition of done therefore
-remains **NOT MET**.
+No retained coordinated target rollback drill is currently available. Local
+evidence is current: golden PASS^3 covers 18 isolated deterministic suites and
+34 evidence classes; build/typecheck and the installed-browser 4/4 pass; and
+dedicated loopback PostgreSQL 16/16, Redis/AOF restart, MinIO/S3, and hardened
+nginx lanes pass. These results do not replace target rollback, TLS/load/HA/SLO,
+CVE, real rootless/notebook or executable-JEG, trame/OCCT, or named domain
+review gates. The original MVP and production release decisions remain **NOT
+MET**.

@@ -51,6 +51,9 @@ const WRITABLE_CONFIG = {
   maxUploadBytes: 8 * 1024 * 1024,
   maxWorkspaceStorageBytes: 64 * 1024 * 1024,
   uploadTtlSeconds: 60,
+  externalUploadAbsoluteTimeoutMs: 60_000,
+  externalUploadIdleTimeoutMs: 10_000,
+  maxConcurrentExternalUploadStreamsPerWorkspace: 4,
   renderTtlSeconds: 60,
   maxConcurrentRunsPerWorkspace: 4,
   maxConcurrentRenderSessionsPerWorkspace: 8,
@@ -318,7 +321,15 @@ try {
   );
   const completedDossier = await liveService.getRunDossier(completedRun.id, 100);
   assert.equal(completedDossier.inputs.length, 1);
-  assert.equal(completedDossier.outputs.length, 2);
+  assert.equal(completedDossier.outputs.length, 3);
+  const completedPreview = completedDossier.outputs.find(
+    (entry) => entry.version?.mediaType === "image/png",
+  );
+  assert.ok(completedPreview?.version, "completed run must retain its static PNG preview");
+  assert.equal(completedPreview.version.metadata.fixturePreview, true);
+  assert.equal(completedPreview.version.metadata.productionCompute, false);
+  assert.match(completedPreview.version.sha256, /^[0-9a-f]{64}$/);
+  assert.ok(completedPreview.version.sizeBytes > 0);
   const artifactSnapshots = await snapshotArtifacts(liveService, completedDossier);
 
   // This accepted but not yet dispatched run proves read-only rollback retains
@@ -397,7 +408,16 @@ try {
     100,
   );
   assert.equal(restoredDossier.inputs.length, 1);
-  assert.equal(restoredDossier.outputs.length, 2);
+  assert.equal(restoredDossier.outputs.length, 3);
+  const restoredPreview = restoredDossier.outputs.find(
+    (entry) => entry.version?.mediaType === "image/png",
+  );
+  assert.ok(restoredPreview?.version, "restored run must retain its static PNG preview");
+  assert.equal(restoredPreview.version.id, completedPreview.version.id);
+  assert.equal(restoredPreview.version.sha256, completedPreview.version.sha256);
+  assert.equal(restoredPreview.version.sizeBytes, completedPreview.version.sizeBytes);
+  assert.equal(restoredPreview.version.metadata.fixturePreview, true);
+  assert.equal(restoredPreview.version.metadata.productionCompute, false);
   for (const link of [...restoredDossier.inputs, ...restoredDossier.outputs]) {
     assert.ok(link.version, `restored run link ${link.id} has no version`);
     const expected = artifactSnapshots.get(link.version.id);

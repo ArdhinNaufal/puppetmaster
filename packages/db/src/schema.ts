@@ -2,6 +2,7 @@ import {
   bigint,
   boolean,
   check,
+  doublePrecision,
   index,
   integer,
   jsonb,
@@ -885,6 +886,8 @@ export const scienceUploads = pgTable(
     state: text("state").notNull().default("pending"),
     error: text("error"),
     transferLeaseId: uuid("transfer_lease_id"),
+    transferLeaseExpiresAt: timestamp("transfer_lease_expires_at", { withTimezone: true }),
+    externalTransfer: boolean("external_transfer").notNull().default(false),
     finalizationLeaseId: uuid("finalization_lease_id"),
     cleanupAttempts: integer("cleanup_attempts").notNull().default(0),
     cleanupNotBefore: timestamp("cleanup_not_before", { withTimezone: true }),
@@ -900,6 +903,12 @@ export const scienceUploads = pgTable(
       t.expiresAt,
     ),
     artifactIdx: index("science_uploads_artifact_idx").on(t.artifactId, t.createdAt),
+    externalTransferIdx: index("science_uploads_external_transfer_idx").on(
+      t.workspaceId,
+      t.externalTransfer,
+      t.state,
+      t.transferLeaseExpiresAt,
+    ),
     validSize: check(
       "science_uploads_size_check",
       sql`${t.expectedSizeBytes} >= 0 AND ${t.receivedBytes} >= 0 AND ${t.receivedBytes} <= ${t.expectedSizeBytes}`,
@@ -1011,6 +1020,236 @@ export const scienceRuns = pgTable(
   }),
 );
 
+/**
+ * Durable workflow suspension on one exact asynchronous Science run. The
+ * Science lifecycle marks pending rows ready in the same transaction as the
+ * terminal run state; queue delivery is only a recoverable notification.
+ */
+export const workflowWaits = pgTable(
+  "workflow_waits",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    missionId: uuid("mission_id")
+      .notNull()
+      .references(() => missions.id, { onDelete: "cascade" }),
+    nodeId: text("node_id").notNull(),
+    kind: text("kind").notNull(),
+    targetRunId: uuid("target_run_id")
+      .notNull()
+      .references(() => scienceRuns.id, { onDelete: "restrict" }),
+    state: text("state").notNull().default("pending"),
+    generation: integer("generation").notNull().default(0),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqMissionNode: unique("workflow_waits_mission_node_unique").on(t.missionId, t.nodeId),
+    targetStateIdx: index("workflow_waits_target_state_idx").on(t.targetRunId, t.state),
+    recoveryIdx: index("workflow_waits_recovery_idx").on(t.state, t.claimExpiresAt, t.updatedAt),
+    validKind: check(
+      "workflow_waits_kind_check",
+      sql`${t.kind} = 'science_run_terminal'`,
+    ),
+    validState: check(
+      "workflow_waits_state_check",
+      sql`${t.state} IN ('pending', 'ready', 'claimed', 'consumed', 'cancelled')`,
+    ),
+    nonnegativeGeneration: check(
+      "workflow_waits_generation_check",
+      sql`${t.generation} >= 0`,
+    ),
+    pairedClaim: check(
+      "workflow_waits_claim_check",
+      sql`(${t.state} = 'claimed' AND ${t.claimToken} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL)
+        OR (${t.state} <> 'claimed' AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL)`,
+    ),
+  }),
+);
+
+/**
+ * Append-only human/domain review evidence. The database migration installs a
+ * mutation-rejection trigger; this declaration intentionally exposes no
+ * mutable lifecycle fields.
+ */
+export const scienceDomainValidations = pgTable(
+  "science_domain_validations",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "restrict" }),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => scienceRuns.id, { onDelete: "restrict" }),
+    revision: integer("revision").notNull(),
+    baselineRunId: uuid("baseline_run_id")
+      .references(() => scienceRuns.id, { onDelete: "restrict" }),
+    kind: text("kind").notNull(),
+    metric: text("metric").notNull(),
+    tolerance: doublePrecision("tolerance").notNull(),
+    observedValue: doublePrecision("observed_value").notNull(),
+    units: text("units").notNull(),
+    methodProtocolId: text("method_protocol_id").notNull(),
+    decision: boolean("decision").notNull(),
+    limitationsReason: text("limitations_reason").notNull(),
+    reviewerId: uuid("reviewer_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    reviewerRole: text("reviewer_role").notNull(),
+    runManifestHash: text("run_manifest_hash").notNull(),
+    runOutputChecksums: jsonb("run_output_checksums").notNull(),
+    baselineManifestHash: text("baseline_manifest_hash"),
+    baselineOutputChecksums: jsonb("baseline_output_checksums"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    recordHash: text("record_hash").notNull().unique(),
+  },
+  (t) => ({
+    uniqRunRevision: unique("science_domain_validations_run_revision_unique").on(
+      t.runId,
+      t.revision,
+    ),
+    runRevisionIdx: index("science_domain_validations_run_revision_idx").on(
+      t.runId,
+      t.revision,
+    ),
+    comparisonIdx: index("science_domain_validations_comparison_idx").on(
+      t.runId,
+      t.baselineRunId,
+      t.kind,
+      t.revision,
+    ),
+    validRevision: check(
+      "science_domain_validations_revision_check",
+      sql`${t.revision} > 0`,
+    ),
+    validKind: check(
+      "science_domain_validations_kind_check",
+      sql`${t.kind} IN ('domain-validation', 'numerical-equivalence')`,
+    ),
+    validMetric: check(
+      "science_domain_validations_metric_check",
+      sql`char_length(btrim(${t.metric})) BETWEEN 1 AND 200`,
+    ),
+    validTolerance: check(
+      "science_domain_validations_tolerance_check",
+      sql`${t.tolerance} >= 0 AND ${t.tolerance} < 'Infinity'::double precision`,
+    ),
+    validObserved: check(
+      "science_domain_validations_observed_check",
+      sql`${t.observedValue} > '-Infinity'::double precision
+          AND ${t.observedValue} < 'Infinity'::double precision`,
+    ),
+    validUnits: check(
+      "science_domain_validations_units_check",
+      sql`char_length(btrim(${t.units})) BETWEEN 1 AND 100`,
+    ),
+    validProtocol: check(
+      "science_domain_validations_protocol_check",
+      sql`char_length(btrim(${t.methodProtocolId})) BETWEEN 1 AND 300`,
+    ),
+    validLimitations: check(
+      "science_domain_validations_limitations_check",
+      sql`char_length(btrim(${t.limitationsReason})) BETWEEN 1 AND 2000`,
+    ),
+    validReviewerRole: check(
+      "science_domain_validations_reviewer_role_check",
+      sql`${t.reviewerRole} IN ('admin', 'owner')`,
+    ),
+    validRunHash: check(
+      "science_domain_validations_run_manifest_hash_check",
+      sql`${t.runManifestHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validRecordHash: check(
+      "science_domain_validations_record_hash_check",
+      sql`${t.recordHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validOutputChecksums: check(
+      "science_domain_validations_outputs_check",
+      sql`jsonb_typeof(${t.runOutputChecksums}) = 'array'
+          AND jsonb_array_length(${t.runOutputChecksums}) > 0`,
+    ),
+    validBaseline: check(
+      "science_domain_validations_baseline_check",
+      sql`(
+        ${t.kind} = 'domain-validation'
+        AND ${t.baselineRunId} IS NULL
+        AND ${t.baselineManifestHash} IS NULL
+        AND ${t.baselineOutputChecksums} IS NULL
+      ) OR (
+        ${t.kind} = 'numerical-equivalence'
+        AND ${t.baselineRunId} IS NOT NULL
+        AND ${t.baselineRunId} <> ${t.runId}
+        AND ${t.baselineManifestHash} ~ '^[0-9a-f]{64}$'
+        AND jsonb_typeof(${t.baselineOutputChecksums}) = 'array'
+        AND jsonb_array_length(${t.baselineOutputChecksums}) > 0
+      )`,
+    ),
+  }),
+);
+
+/**
+ * Mutable, actor-audited pointer to the authoritative latest validation for
+ * one exact canonical scope. Domain-only reviews use the candidate run itself
+ * as `scopeBaselineRunId`; numerical reviews use their distinct baseline run.
+ * The database guard permits only monotonic pointer advancement.
+ */
+export const scienceDomainValidationHeads = pgTable(
+  "science_domain_validation_heads",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "restrict" }),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => scienceRuns.id, { onDelete: "restrict" }),
+    kind: text("kind").notNull(),
+    scopeBaselineRunId: uuid("scope_baseline_run_id")
+      .notNull()
+      .references(() => scienceRuns.id, { onDelete: "restrict" }),
+    validationId: uuid("validation_id")
+      .notNull()
+      .unique()
+      .references(() => scienceDomainValidations.id, { onDelete: "restrict" }),
+    revision: integer("revision").notNull(),
+    recordHash: text("record_hash").notNull(),
+    headHash: text("head_hash").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniqScope: unique("science_domain_validation_heads_scope_unique").on(
+      t.workspaceId,
+      t.runId,
+      t.kind,
+      t.scopeBaselineRunId,
+    ),
+    validRevision: check(
+      "science_domain_validation_heads_revision_check",
+      sql`${t.revision} > 0`,
+    ),
+    validKindAndScope: check(
+      "science_domain_validation_heads_scope_check",
+      sql`(
+        ${t.kind} = 'domain-validation'
+        AND ${t.scopeBaselineRunId} = ${t.runId}
+      ) OR (
+        ${t.kind} = 'numerical-equivalence'
+        AND ${t.scopeBaselineRunId} <> ${t.runId}
+      )`,
+    ),
+    validRecordHash: check(
+      "science_domain_validation_heads_record_hash_check",
+      sql`${t.recordHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validHeadHash: check(
+      "science_domain_validation_heads_head_hash_check",
+      sql`${t.headHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+  }),
+);
+
 export const scienceRunArtifacts = pgTable(
   "science_run_artifacts",
   {
@@ -1086,11 +1325,23 @@ export const scienceRenderSessions = pgTable(
       onDelete: "cascade",
     }),
     providerHandle: text("provider_handle"),
+    requestKeyHash: text("request_key_hash").notNull(),
+    intentFingerprint: text("intent_fingerprint").notNull(),
+    providerKind: text("provider_kind").notNull(),
+    mode: text("mode").notNull(),
+    sourceSha256: text("source_sha256").notNull(),
+    sourceMediaType: text("source_media_type").notNull(),
+    sourceSizeBytes: bigint("source_size_bytes", { mode: "number" }).notNull(),
+    sourceLogicalName: text("source_logical_name").notNull(),
     tokenHash: text("token_hash").notNull().unique(),
     audience: text("audience").notNull(),
     state: text("state").notNull().default("starting"),
     cleanupAttempts: integer("cleanup_attempts").notNull().default(0),
     cleanupNotBefore: timestamp("cleanup_not_before", { withTimezone: true }),
+    launchLeaseId: uuid("launch_lease_id"),
+    launchLeaseExpiresAt: timestamp("launch_lease_expires_at", { withTimezone: true }),
+    replayExpiresAt: timestamp("replay_expires_at", { withTimezone: true }).notNull(),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
     ownerId: uuid("owner_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
@@ -1105,6 +1356,11 @@ export const scienceRenderSessions = pgTable(
       t.state,
       t.expiresAt,
     ),
+    requestKeyUnique: unique("science_render_sessions_workspace_owner_request_unique").on(
+      t.workspaceId,
+      t.ownerId,
+      t.requestKeyHash,
+    ),
     validTarget: check(
       "science_render_sessions_target_check",
       sql`${t.runId} IS NOT NULL OR ${t.artifactVersionId} IS NOT NULL`,
@@ -1112,6 +1368,38 @@ export const scienceRenderSessions = pgTable(
     validTokenHash: check(
       "science_render_sessions_token_hash_check",
       sql`${t.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validRequestKeyHash: check(
+      "science_render_sessions_request_key_hash_check",
+      sql`${t.requestKeyHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validIntentFingerprint: check(
+      "science_render_sessions_intent_fingerprint_check",
+      sql`${t.intentFingerprint} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validSourceSha256: check(
+      "science_render_sessions_source_sha256_check",
+      sql`${t.sourceSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    validMode: check(
+      "science_render_sessions_mode_check",
+      sql`${t.mode} IN ('client', 'remote', 'static')`,
+    ),
+    validProviderKind: check(
+      "science_render_sessions_provider_kind_check",
+      sql`${t.providerKind} ~ '^[A-Za-z0-9_-]{1,80}$'`,
+    ),
+    validSourceMetadata: check(
+      "science_render_sessions_source_metadata_check",
+      sql`${t.sourceSizeBytes} >= 0 AND char_length(${t.sourceMediaType}) BETWEEN 1 AND 200 AND char_length(${t.sourceLogicalName}) BETWEEN 1 AND 500`,
+    ),
+    validReplayHorizon: check(
+      "science_render_sessions_replay_horizon_check",
+      sql`${t.replayExpiresAt} >= ${t.expiresAt}`,
+    ),
+    validLaunchLease: check(
+      "science_render_sessions_launch_lease_check",
+      sql`(${t.launchLeaseId} IS NULL AND ${t.launchLeaseExpiresAt} IS NULL) OR (${t.launchLeaseId} IS NOT NULL AND ${t.launchLeaseExpiresAt} IS NOT NULL)`,
     ),
     validState: check(
       "science_render_sessions_state_check",
@@ -1162,6 +1450,9 @@ export const schema = {
   scienceUploads,
   scienceComputeProfiles,
   scienceRuns,
+  workflowWaits,
+  scienceDomainValidations,
+  scienceDomainValidationHeads,
   scienceRunArtifacts,
   scienceRunEvents,
   scienceRenderSessions,

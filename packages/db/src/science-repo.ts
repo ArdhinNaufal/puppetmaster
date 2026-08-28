@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import {
   SCIENCE_TERMINAL_RUN_STATES,
+  ScienceAdminActionKind,
+  ScienceAdminActionReason,
   ScienceArtifact,
   ScienceArtifactKind,
   ScienceArtifactStatus,
@@ -10,6 +12,9 @@ import {
   ScienceComputeProfile,
   ScienceComputeProviderKind,
   ScienceComputeSnapshot,
+  ScienceDomainValidationRecord,
+  ScienceDomainValidationSummary,
+  ScienceDomainValidationSubmission,
   ScienceManifest,
   ScienceOciDigest,
   SciencePageInput,
@@ -25,13 +30,16 @@ import {
   ScienceSha256,
   ScienceStudy,
   ScienceUpload,
+  ScienceValidationOutputChecksum,
   ScienceWorkspaceAdmission,
   ScienceUploadState,
+  assessScienceManifest,
   canTransitionScienceRun,
   canonicalScienceJson,
   type SciencePage,
 } from "@puppetmaster/shared";
 import type { Db } from "./client.js";
+import { markWorkflowWaitsReadyForScienceRun } from "./durability-repo.js";
 import {
   approvals,
   memberships,
@@ -41,6 +49,8 @@ import {
   scienceArtifacts,
   scienceArtifactVersions,
   scienceComputeProfiles,
+  scienceDomainValidationHeads,
+  scienceDomainValidations,
   scienceRenderSessions,
   scienceRunArtifacts,
   scienceRunEvents,
@@ -56,6 +66,8 @@ export type ScienceArtifactRow = typeof scienceArtifacts.$inferSelect;
 export type ScienceArtifactVersionRow = typeof scienceArtifactVersions.$inferSelect;
 export type ScienceUploadRow = typeof scienceUploads.$inferSelect;
 export type ScienceComputeProfileRow = typeof scienceComputeProfiles.$inferSelect;
+export type ScienceDomainValidationRow = typeof scienceDomainValidations.$inferSelect;
+export type ScienceDomainValidationHeadRow = typeof scienceDomainValidationHeads.$inferSelect;
 export type ScienceRunRow = typeof scienceRuns.$inferSelect;
 export type ScienceRunArtifactRow = typeof scienceRunArtifacts.$inferSelect;
 export type ScienceRunEventRow = typeof scienceRunEvents.$inferSelect;
@@ -68,6 +80,20 @@ export interface ScienceRunSubmitAttempt {
   idempotencyKey: string;
   createdAt: Date;
   sequence: number;
+}
+
+export interface ScienceAdminActionQueueRecord {
+  id: string;
+  kind: ScienceAdminActionKind;
+  state: string;
+  detectedAt: Date;
+  attempts: number;
+  nextRetryAt: Date | null;
+  reason: ScienceAdminActionReason;
+  studyId: string | null;
+  runId: string | null;
+  artifactId: string | null;
+  artifactVersionId: string | null;
 }
 
 export class ScienceConflictError extends Error {
@@ -105,6 +131,21 @@ function normalizeJson(value: unknown, label: string): unknown {
 
 function sameJson(left: unknown, right: unknown): boolean {
   return canonicalScienceJson(left) === canonicalScienceJson(right);
+}
+
+function isParsedIpynbArtifactVersion(
+  version: Pick<ScienceArtifactVersionRow, "status" | "metadata">,
+  artifact: Pick<ScienceArtifactRow, "kind" | "format">,
+): boolean {
+  const metadata = version.metadata;
+  return version.status === "ready" &&
+    artifact.kind === "notebook" &&
+    artifact.format.trim().toLowerCase().replace(/^\./, "") === "ipynb" &&
+    metadata !== null &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata) &&
+    (metadata as Record<string, unknown>).detectedFormat === "ipynb" &&
+    (metadata as Record<string, unknown>).formatValidation === "parsed";
 }
 
 function canonicalText(value: string, label: string, max: number): string {
@@ -263,6 +304,14 @@ function parseProfile(row: ScienceComputeProfileRow) {
   return ScienceComputeProfile.parse(row);
 }
 
+function parseDomainValidation(row: ScienceDomainValidationRow) {
+  return ScienceDomainValidationRecord.parse(row);
+}
+
+function parseDomainValidationSummary(value: unknown) {
+  return ScienceDomainValidationSummary.parse(value);
+}
+
 function parseRun(row: ScienceRunRow) {
   return ScienceRun.parse(row);
 }
@@ -277,6 +326,208 @@ function parseRunEvent(row: ScienceRunEventRow) {
 
 function parseRenderSession(row: ScienceRenderSessionRow) {
   return ScienceRenderSession.parse(row);
+}
+
+interface RawScienceAdminActionQueueRecord {
+  id: string;
+  kind: string;
+  state: string;
+  detected_at: Date | string;
+  attempts: number | string;
+  next_retry_at: Date | string | null;
+  reason: string;
+  study_id: string | null;
+  run_id: string | null;
+  artifact_id: string | null;
+  artifact_version_id: string | null;
+}
+
+function parseAdminActionQueueRecord(
+  row: RawScienceAdminActionQueueRecord,
+): ScienceAdminActionQueueRecord {
+  const detectedAt = row.detected_at instanceof Date
+    ? row.detected_at
+    : new Date(row.detected_at);
+  const nextRetryAt = row.next_retry_at === null
+    ? null
+    : row.next_retry_at instanceof Date
+      ? row.next_retry_at
+      : new Date(row.next_retry_at);
+  if (Number.isNaN(detectedAt.getTime()) || (nextRetryAt && Number.isNaN(nextRetryAt.getTime()))) {
+    throw new Error("Science admin action queue returned an invalid timestamp");
+  }
+  const attempts = Number(row.attempts);
+  if (!Number.isSafeInteger(attempts) || attempts < 0) {
+    throw new Error("Science admin action queue returned an invalid attempt count");
+  }
+  return {
+    id: ScienceWorkspaceAdmission.shape.workspaceId.parse(row.id),
+    kind: ScienceAdminActionKind.parse(row.kind),
+    state: canonicalText(row.state, "Science admin action state", 64),
+    detectedAt,
+    attempts,
+    nextRetryAt,
+    reason: ScienceAdminActionReason.parse(row.reason),
+    studyId: row.study_id,
+    runId: row.run_id,
+    artifactId: row.artifact_id,
+    artifactVersionId: row.artifact_version_id,
+  };
+}
+
+/**
+ * Workspace-scoped union of durable resources that currently require an
+ * administrator's attention. The selected columns are intentionally narrow:
+ * provider handles, capability hashes, storage keys, raw errors, and event
+ * payloads never cross this repository boundary.
+ */
+export async function listScienceAdminActionQueue(
+  db: Db,
+  input: { workspaceId: string; page?: SciencePageInput; now?: Date },
+): Promise<SciencePage<ScienceAdminActionQueueRecord>> {
+  const workspaceId = ScienceWorkspaceAdmission.shape.workspaceId.parse(input.workspaceId);
+  const pagination = page(input.page);
+  const observedAt = input.now ?? new Date();
+  const retainedRenderCutoff = new Date(observedAt.getTime() - 60_000);
+  const result = await db.execute(sql<RawScienceAdminActionQueueRecord>`
+    with action_items as (
+      select
+        r.id as id,
+        'run'::text as kind,
+        r.state as state,
+        evidence.detected_at as detected_at,
+        evidence.attempts as attempts,
+        null::timestamptz as next_retry_at,
+        'compute_reconciliation_required'::text as reason,
+        r.study_id as study_id,
+        r.id as run_id,
+        null::uuid as artifact_id,
+        null::uuid as artifact_version_id
+      from science_runs r
+      inner join science_studies s on s.id = r.study_id
+      cross join lateral (
+        select
+          min(e.created_at) as detected_at,
+          coalesce(max(
+            case
+              when coalesce(e.payload ->> 'attempt', '') ~ '^[0-9]{1,9}$'
+                then (e.payload ->> 'attempt')::integer
+              else 1
+            end
+          ), 0)::integer as attempts
+        from science_run_events e
+        where e.run_id = r.id
+          and e.execution_generation = r.execution_generation
+          and (
+            e.payload ->> 'adminActionRequired' = 'true'
+            or e.payload ->> 'orphaned' = 'true'
+          )
+      ) evidence
+      where s.workspace_id = ${workspaceId}
+        and r.state = 'cancelling'
+        and evidence.detected_at is not null
+
+      union all
+
+      select
+        u.id as id,
+        'upload_reservation'::text as kind,
+        u.state as state,
+        u.updated_at as detected_at,
+        u.cleanup_attempts as attempts,
+        u.cleanup_not_before as next_retry_at,
+        case
+          when u.state = 'quarantined' then 'upload_quarantined'
+          else 'upload_cleanup_retry_pending'
+        end::text as reason,
+        a.study_id as study_id,
+        null::uuid as run_id,
+        u.artifact_id as artifact_id,
+        u.artifact_version_id as artifact_version_id
+      from science_uploads u
+      inner join science_artifacts a on a.id = u.artifact_id
+      where u.workspace_id = ${workspaceId}
+        and (
+          u.state = 'quarantined'
+          or (u.state = 'expired' and u.cleanup_attempts > 0)
+        )
+
+      union all
+
+      select
+        v.id as id,
+        'artifact_version'::text as kind,
+        v.status as state,
+        v.created_at as detected_at,
+        v.cleanup_attempts as attempts,
+        v.cleanup_not_before as next_retry_at,
+        case
+          when v.status = 'quarantined' then 'artifact_version_quarantined'
+          else 'artifact_version_cleanup_retry_pending'
+        end::text as reason,
+        a.study_id as study_id,
+        null::uuid as run_id,
+        v.artifact_id as artifact_id,
+        v.id as artifact_version_id
+      from science_artifact_versions v
+      inner join science_artifacts a on a.id = v.artifact_id
+      inner join science_studies s on s.id = a.study_id
+      where s.workspace_id = ${workspaceId}
+        and (
+          v.status = 'quarantined'
+          or (v.cleanup_eligible = true and v.cleanup_attempts > 0)
+        )
+
+      union all
+
+      select
+        rs.id as id,
+        'render_session'::text as kind,
+        rs.state as state,
+        rs.updated_at as detected_at,
+        rs.cleanup_attempts as attempts,
+        rs.cleanup_not_before as next_retry_at,
+        'render_session_cleanup_pending'::text as reason,
+        coalesce(rr.study_id, ra.study_id) as study_id,
+        rs.run_id as run_id,
+        ra.id as artifact_id,
+        rs.artifact_version_id as artifact_version_id
+      from science_render_sessions rs
+      left join science_runs rr on rr.id = rs.run_id
+      left join science_artifact_versions rv on rv.id = rs.artifact_version_id
+      left join science_artifacts ra on ra.id = rv.artifact_id
+      where rs.workspace_id = ${workspaceId}
+        and rs.state in ('expired', 'failed', 'revoked')
+        and (
+          rs.cleanup_attempts > 0
+          or rs.updated_at <= ${retainedRenderCutoff}
+        )
+    )
+    select
+      id,
+      kind,
+      state,
+      detected_at,
+      attempts,
+      next_retry_at,
+      reason,
+      study_id,
+      run_id,
+      artifact_id,
+      artifact_version_id
+    from action_items
+    order by detected_at asc, kind asc, id asc
+    offset ${pagination.offset}
+    limit ${pagination.limit + 1}
+  `);
+  const rows =
+    (result as unknown as { rows?: RawScienceAdminActionQueueRecord[] }).rows ??
+    (result as unknown as RawScienceAdminActionQueueRecord[]);
+  return paged(
+    rows.map(parseAdminActionQueueRecord),
+    pagination.offset,
+    pagination.limit,
+  );
 }
 
 function isTerminalRunState(value: string): boolean {
@@ -1111,34 +1362,43 @@ export async function claimScienceArtifactVersionRetention(
     if (version.status !== "ready") {
       conflict(`Science artifact version in ${version.status} cannot be retention-expired`);
     }
-    const [[runReference], [childVersion], [renderReference], [activeUpload]] = await Promise.all([
-      scoped
-        .select({ id: scienceRunArtifacts.id })
-        .from(scienceRunArtifacts)
-        .where(eq(scienceRunArtifacts.artifactVersionId, version.id))
-        .limit(1),
-      scoped
-        .select({ id: scienceArtifactVersions.id })
-        .from(scienceArtifactVersions)
-        .where(eq(scienceArtifactVersions.parentVersionId, version.id))
-        .limit(1),
-      scoped
-        .select({ id: scienceRenderSessions.id })
-        .from(scienceRenderSessions)
-        .where(eq(scienceRenderSessions.artifactVersionId, version.id))
-        .limit(1),
-      scoped
-        .select({ id: scienceUploads.id })
-        .from(scienceUploads)
-        .where(
-          and(
-            eq(scienceUploads.artifactId, version.artifactId),
-            eq(scienceUploads.expectedSha256, version.sha256),
-            inArray(scienceUploads.state, ["pending", "uploading", "finalizing"]),
+    // A Drizzle transaction owns one PostgreSQL client. Keep these checks
+    // sequential: pg 8 warns on concurrent queries on one client and pg 9 will
+    // reject them. The artifact/version locks above preserve the same fence.
+    const [runReference] = await scoped
+      .select({ id: scienceRunArtifacts.id })
+      .from(scienceRunArtifacts)
+      .where(eq(scienceRunArtifacts.artifactVersionId, version.id))
+      .limit(1);
+    const [childVersion] = await scoped
+      .select({ id: scienceArtifactVersions.id })
+      .from(scienceArtifactVersions)
+      .where(eq(scienceArtifactVersions.parentVersionId, version.id))
+      .limit(1);
+    const [renderReference] = await scoped
+      .select({ id: scienceRenderSessions.id })
+      .from(scienceRenderSessions)
+      .where(
+        and(
+          eq(scienceRenderSessions.artifactVersionId, version.id),
+          or(
+            inArray(scienceRenderSessions.state, ["starting", "ready"]),
+            isNotNull(scienceRenderSessions.providerHandle),
           ),
-        )
-        .limit(1),
-    ]);
+        ),
+      )
+      .limit(1);
+    const [activeUpload] = await scoped
+      .select({ id: scienceUploads.id })
+      .from(scienceUploads)
+      .where(
+        and(
+          eq(scienceUploads.artifactId, version.artifactId),
+          eq(scienceUploads.expectedSha256, version.sha256),
+          inArray(scienceUploads.state, ["pending", "uploading", "finalizing"]),
+        ),
+      )
+      .limit(1);
     if (runReference) conflict("Run-linked artifact versions cannot be retention-expired");
     if (childVersion) conflict("Artifact versions with retained descendants cannot be expired");
     if (renderReference) conflict("Render-referenced artifact versions cannot be expired");
@@ -1200,23 +1460,29 @@ export async function deleteExpiredScienceArtifactVersionAfterDiscard(
     ) {
       return false;
     }
-    const [[runReference], [childVersion], [renderReference]] = await Promise.all([
-      scoped
-        .select({ id: scienceRunArtifacts.id })
-        .from(scienceRunArtifacts)
-        .where(eq(scienceRunArtifacts.artifactVersionId, candidate.version.id))
-        .limit(1),
-      scoped
-        .select({ id: scienceArtifactVersions.id })
-        .from(scienceArtifactVersions)
-        .where(eq(scienceArtifactVersions.parentVersionId, candidate.version.id))
-        .limit(1),
-      scoped
-        .select({ id: scienceRenderSessions.id })
-        .from(scienceRenderSessions)
-        .where(eq(scienceRenderSessions.artifactVersionId, candidate.version.id))
-        .limit(1),
-    ]);
+    const [runReference] = await scoped
+      .select({ id: scienceRunArtifacts.id })
+      .from(scienceRunArtifacts)
+      .where(eq(scienceRunArtifacts.artifactVersionId, candidate.version.id))
+      .limit(1);
+    const [childVersion] = await scoped
+      .select({ id: scienceArtifactVersions.id })
+      .from(scienceArtifactVersions)
+      .where(eq(scienceArtifactVersions.parentVersionId, candidate.version.id))
+      .limit(1);
+    const [renderReference] = await scoped
+      .select({ id: scienceRenderSessions.id })
+      .from(scienceRenderSessions)
+      .where(
+        and(
+          eq(scienceRenderSessions.artifactVersionId, candidate.version.id),
+          or(
+            inArray(scienceRenderSessions.state, ["starting", "ready"]),
+            isNotNull(scienceRenderSessions.providerHandle),
+          ),
+        ),
+      )
+      .limit(1);
     if (runReference || childVersion || renderReference) return false;
     const [released] = await scoped
       .update(scienceArtifactVersions)
@@ -1366,6 +1632,8 @@ export async function claimScienceUploadTransfer(
     tokenHash: string;
     leaseId: string;
     leaseExpiresAt: Date;
+    external?: boolean;
+    maxConcurrentExternalStreamsPerWorkspace?: number;
     now?: Date;
   },
 ): Promise<{ upload: ScienceUpload; claimed: boolean }> {
@@ -1377,39 +1645,99 @@ export async function claimScienceUploadTransfer(
   ) {
     throw new Error("Science upload transfer lease must expire in the future");
   }
-  const [claimed] = await db
-    .update(scienceUploads)
-    .set({
-      state: "uploading",
-      transferLeaseId: input.leaseId,
-      expiresAt: sql`greatest(${scienceUploads.expiresAt}, ${input.leaseExpiresAt})`,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(scienceUploads.workspaceId, input.workspaceId),
-        eq(scienceUploads.tokenHash, tokenHash),
-        eq(scienceUploads.state, "pending"),
-        eq(scienceUploads.receivedBytes, 0),
-        gt(scienceUploads.expiresAt, now),
-      ),
-    )
-    .returning();
-  if (claimed) return { upload: parseUpload(claimed), claimed: true };
+  const external = input.external === true;
+  if (
+    external &&
+    (!Number.isSafeInteger(input.maxConcurrentExternalStreamsPerWorkspace) ||
+      input.maxConcurrentExternalStreamsPerWorkspace! <= 0 ||
+      input.maxConcurrentExternalStreamsPerWorkspace! > 128)
+  ) {
+    throw new Error(
+      "Science external upload stream limit must be an integer between 1 and 128",
+    );
+  }
 
-  const existing = await getScienceUploadByTokenHash(
-    db,
-    input.workspaceId,
-    tokenHash,
-  );
-  if (!existing) conflict("Science upload intent does not exist in the workspace");
-  if (existing.state === "completed") {
-    return { upload: existing, claimed: false };
-  }
-  if (existing.expiresAt.getTime() <= now.getTime()) {
-    conflict("Science upload lease has expired");
-  }
-  conflict("Science upload byte transfer was already claimed");
+  return db.transaction(async (tx) => {
+    const scoped = tx as unknown as Db;
+    if (external) {
+      // Every server instance serializes the count-and-claim decision on the
+      // same workspace row. A process-local counter alone cannot protect a
+      // horizontally scaled deployment.
+      await lockScienceWorkspaceForUpdate(scoped, input.workspaceId);
+      const existing = await getScienceUploadByTokenHash(
+        scoped,
+        input.workspaceId,
+        tokenHash,
+      );
+      if (!existing) conflict("Science upload intent does not exist in the workspace");
+      if (existing.state === "completed") {
+        return { upload: existing, claimed: false };
+      }
+      if (existing.expiresAt.getTime() <= now.getTime()) {
+        conflict("Science upload lease has expired");
+      }
+      if (existing.state !== "pending" || existing.receivedBytes !== 0) {
+        conflict("Science upload byte transfer was already claimed");
+      }
+      const [usage] = await scoped
+        .select({ value: sql<number>`count(*)` })
+        .from(scienceUploads)
+        .where(
+          and(
+            eq(scienceUploads.workspaceId, input.workspaceId),
+            eq(scienceUploads.externalTransfer, true),
+            eq(scienceUploads.state, "uploading"),
+            isNotNull(scienceUploads.transferLeaseId),
+            gt(scienceUploads.transferLeaseExpiresAt, now),
+          ),
+        );
+      if (
+        Number(usage?.value ?? 0) >=
+        input.maxConcurrentExternalStreamsPerWorkspace!
+      ) {
+        conflict(
+          `Science workspace external upload stream concurrency limit of ` +
+            `${input.maxConcurrentExternalStreamsPerWorkspace} was reached`,
+        );
+      }
+    }
+
+    const [claimed] = await scoped
+      .update(scienceUploads)
+      .set({
+        state: "uploading",
+        transferLeaseId: input.leaseId,
+        transferLeaseExpiresAt: input.leaseExpiresAt,
+        externalTransfer: external,
+        expiresAt: sql`greatest(${scienceUploads.expiresAt}, ${input.leaseExpiresAt})`,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(scienceUploads.workspaceId, input.workspaceId),
+          eq(scienceUploads.tokenHash, tokenHash),
+          eq(scienceUploads.state, "pending"),
+          eq(scienceUploads.receivedBytes, 0),
+          gt(scienceUploads.expiresAt, now),
+        ),
+      )
+      .returning();
+    if (claimed) return { upload: parseUpload(claimed), claimed: true };
+
+    const existing = await getScienceUploadByTokenHash(
+      scoped,
+      input.workspaceId,
+      tokenHash,
+    );
+    if (!existing) conflict("Science upload intent does not exist in the workspace");
+    if (existing.state === "completed") {
+      return { upload: existing, claimed: false };
+    }
+    if (existing.expiresAt.getTime() <= now.getTime()) {
+      conflict("Science upload lease has expired");
+    }
+    conflict("Science upload byte transfer was already claimed");
+  });
 }
 
 export async function renewScienceUploadTransfer(
@@ -1433,6 +1761,7 @@ export async function renewScienceUploadTransfer(
   const [renewed] = await db
     .update(scienceUploads)
     .set({
+      transferLeaseExpiresAt: input.leaseExpiresAt,
       expiresAt: sql`greatest(${scienceUploads.expiresAt}, ${input.leaseExpiresAt})`,
       updatedAt: now,
     })
@@ -1442,6 +1771,7 @@ export async function renewScienceUploadTransfer(
         eq(scienceUploads.tokenHash, tokenHash),
         eq(scienceUploads.state, "uploading"),
         eq(scienceUploads.transferLeaseId, input.leaseId),
+        gt(scienceUploads.transferLeaseExpiresAt, now),
         gt(scienceUploads.expiresAt, now),
       ),
     )
@@ -1504,6 +1834,8 @@ export async function recordScienceUploadProgress(
     }
     if (
       upload.transferLeaseId !== input.leaseId ||
+      !upload.transferLeaseExpiresAt ||
+      upload.transferLeaseExpiresAt.getTime() <= now.getTime() ||
       upload.expiresAt.getTime() <= now.getTime()
     ) {
       conflict("Science upload transfer lease was lost");
@@ -1522,6 +1854,10 @@ export async function recordScienceUploadProgress(
       .set({
         receivedBytes: input.receivedBytes,
         transferLeaseId: input.retainTransferLease ? input.leaseId : null,
+        transferLeaseExpiresAt: input.retainTransferLease
+          ? upload.transferLeaseExpiresAt
+          : null,
+        externalTransfer: input.retainTransferLease ? upload.externalTransfer : false,
         expiresAt: sql`greatest(${scienceUploads.expiresAt}, ${input.readyExpiresAt})`,
         updatedAt: now,
       })
@@ -1656,6 +1992,8 @@ export async function releaseScienceUploadFinalization(
     .set({
       state: "uploading",
       transferLeaseId: null,
+      transferLeaseExpiresAt: null,
+      externalTransfer: false,
       finalizationLeaseId: null,
       expiresAt: input.retryExpiresAt,
       updatedAt: now,
@@ -1728,6 +2066,8 @@ export async function finalizeScienceUpload(
         artifactVersionId: version.id,
         state: "completed",
         transferLeaseId: null,
+        transferLeaseExpiresAt: null,
+        externalTransfer: false,
         finalizationLeaseId: null,
         completedAt: now,
         updatedAt: now,
@@ -1775,6 +2115,8 @@ export async function deleteScienceProviderOutputReservationAfterCommit(
     if (
       upload.state !== "uploading" ||
       upload.transferLeaseId !== input.leaseId ||
+      !upload.transferLeaseExpiresAt ||
+      upload.transferLeaseExpiresAt.getTime() <= now.getTime() ||
       upload.expiresAt.getTime() <= now.getTime() ||
       Number(upload.receivedBytes) !== Number(upload.expectedSizeBytes)
     ) {
@@ -1809,7 +2151,14 @@ export async function deleteScienceProviderOutputReservationAfterCommit(
  */
 export async function quarantineScienceUpload(
   db: Db,
-  input: { workspaceId: string; tokenHash: string; error: string; now?: Date },
+  input: {
+    workspaceId: string;
+    tokenHash: string;
+    error: string;
+    /** Partial external streams can be discarded immediately after timeout. */
+    cleanupEligible?: boolean;
+    now?: Date;
+  },
 ) {
   const error = canonicalText(input.error, "Upload quarantine error", 4_000);
   return db.transaction(async (tx) => {
@@ -1825,9 +2174,12 @@ export async function quarantineScienceUpload(
       .set({
         state: "quarantined",
         transferLeaseId: null,
+        transferLeaseExpiresAt: null,
+        externalTransfer: false,
         finalizationLeaseId: null,
         cleanupAttempts: 0,
         cleanupNotBefore: null,
+        expiresAt: input.cleanupEligible ? now : upload.expiresAt,
         error,
         updatedAt: now,
       })
@@ -1864,6 +2216,8 @@ export async function cleanupExpiredScienceUploads(
     .set({
       state: "expired",
       transferLeaseId: null,
+      transferLeaseExpiresAt: null,
+      externalTransfer: false,
       finalizationLeaseId: null,
       cleanupAttempts: 0,
       cleanupNotBefore: null,
@@ -2378,6 +2732,8 @@ export async function createScienceRun(
       .select({
         version: scienceArtifactVersions,
         studyId: scienceArtifacts.studyId,
+        artifactKind: scienceArtifacts.kind,
+        artifactFormat: scienceArtifacts.format,
         workspaceId: scienceStudies.workspaceId,
       })
       .from(scienceArtifactVersions)
@@ -2404,6 +2760,17 @@ export async function createScienceRun(
       }
       if (owned.version.status !== "ready") {
         conflict("Pending, quarantined, or expired artifacts cannot be run inputs");
+      }
+      if (
+        ["code", "notebook", "solver"].includes(entry.semanticRole) &&
+        !isParsedIpynbArtifactVersion(owned.version, {
+          kind: owned.artifactKind,
+          format: owned.artifactFormat,
+        })
+      ) {
+        conflict(
+          "Science code, notebook, or solver roles require a parsed ipynb notebook artifact",
+        );
       }
     }
     const runId = randomUUID();
@@ -2505,6 +2872,430 @@ export async function getScienceRunForWorkspace(db: Db, workspaceId: string, run
     .where(and(eq(scienceRuns.id, runId), eq(scienceStudies.workspaceId, workspaceId)))
     .limit(1);
   return owned ? parseRun(owned.run) : null;
+}
+
+type ScienceDomainValidationHashInput = Omit<
+  ScienceDomainValidationRecord,
+  "recordHash" | "createdAt"
+>;
+
+function domainValidationHashPayload(input: ScienceDomainValidationHashInput) {
+  const canonicalChecksums = (entries: ScienceValidationOutputChecksum[] | null) =>
+    entries?.map((entry) => ({
+      ...entry,
+      artifactVersionId: entry.artifactVersionId.toLowerCase(),
+    })) ?? null;
+  return {
+    schemaVersion: 2,
+    id: input.id.toLowerCase(),
+    workspaceId: input.workspaceId.toLowerCase(),
+    runId: input.runId.toLowerCase(),
+    revision: input.revision,
+    baselineRunId: input.baselineRunId?.toLowerCase() ?? null,
+    kind: input.kind,
+    metric: input.metric,
+    tolerance: input.tolerance,
+    observedValue: input.observedValue,
+    units: input.units,
+    methodProtocolId: input.methodProtocolId,
+    decision: input.decision,
+    limitationsReason: input.limitationsReason,
+    reviewerId: input.reviewerId.toLowerCase(),
+    reviewerRole: input.reviewerRole,
+    runManifestHash: input.runManifestHash,
+    runOutputChecksums: canonicalChecksums(input.runOutputChecksums),
+    baselineManifestHash: input.baselineManifestHash,
+    baselineOutputChecksums: canonicalChecksums(input.baselineOutputChecksums),
+  };
+}
+
+interface ScienceDomainValidationHeadHashInput {
+  id: string;
+  workspaceId: string;
+  runId: string;
+  kind: ScienceDomainValidationRecord["kind"];
+  scopeBaselineRunId: string;
+  validationId: string;
+  revision: number;
+  recordHash: string;
+}
+
+interface ScienceDomainValidationHeadScope {
+  workspaceId: string;
+  runId: string;
+  kind: ScienceDomainValidationRecord["kind"];
+  scopeBaselineRunId: string;
+}
+
+/** Deterministic UUIDv8 identity for one immutable validation-head scope. */
+export function scienceDomainValidationHeadId(
+  input: ScienceDomainValidationHeadScope,
+): string {
+  const digest = createHash("sha256").update([
+    "science-domain-validation-head-id-v1",
+    input.workspaceId.toLowerCase(),
+    input.runId.toLowerCase(),
+    input.kind,
+    input.scopeBaselineRunId.toLowerCase(),
+  ].join("|"), "utf8").digest("hex");
+  return ScienceStudy.shape.id.parse([
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    `8${digest.slice(13, 16)}`,
+    `8${digest.slice(17, 20)}`,
+    digest.slice(20, 32),
+  ].join("-"));
+}
+
+/** Stable anchor binding one exact canonical scope to one immutable record. */
+export function scienceDomainValidationHeadHash(
+  input: ScienceDomainValidationHeadHashInput,
+): string {
+  const payload = [
+    "science-domain-validation-head-v1",
+    input.id.toLowerCase(),
+    input.workspaceId.toLowerCase(),
+    input.runId.toLowerCase(),
+    input.kind,
+    input.scopeBaselineRunId.toLowerCase(),
+    input.validationId.toLowerCase(),
+    String(input.revision),
+    input.recordHash,
+  ].join("|");
+  return ScienceSha256.parse(createHash("sha256").update(payload, "utf8").digest("hex"));
+}
+
+/** Stable SHA-256 envelope for independently checking one immutable review. */
+export function scienceDomainValidationRecordHash(
+  input: ScienceDomainValidationHashInput,
+): string {
+  return ScienceSha256.parse(
+    createHash("sha256")
+      .update(canonicalScienceJson(domainValidationHashPayload(input)))
+      .digest("hex"),
+  );
+}
+
+export function verifyScienceDomainValidationRecordHash(
+  value: ScienceDomainValidationRecord,
+): boolean {
+  const parsed = ScienceDomainValidationRecord.parse(value);
+  const { recordHash, createdAt: _createdAt, ...hashable } = parsed;
+  return scienceDomainValidationRecordHash(hashable) === recordHash;
+}
+
+function succeededRunValidationSnapshot(runRow: ScienceRunRow): {
+  manifestHash: string;
+  outputs: ScienceValidationOutputChecksum[];
+} {
+  const run = parseRun(runRow);
+  if (run.state !== "succeeded" || !run.manifest || !run.manifestHash) {
+    conflict("Science domain validation requires a succeeded run with a manifest");
+  }
+  const calculated = createHash("sha256")
+    .update(canonicalScienceJson(run.manifest))
+    .digest("hex");
+  if (calculated !== run.manifestHash) {
+    conflict("Science run manifest hash does not match its immutable manifest");
+  }
+  const outputs = run.manifest.outputs.map((entry) =>
+    ScienceValidationOutputChecksum.parse(entry)
+  );
+  if (outputs.length === 0) {
+    conflict("Science domain validation requires at least one manifested output");
+  }
+  return { manifestHash: run.manifestHash, outputs };
+}
+
+/** Canonical total order used before taking any candidate/baseline run locks. */
+export function scienceDomainValidationRunLockOrder(
+  runId: string,
+  baselineRunId?: string | null,
+): string[] {
+  const candidate = ScienceStudy.shape.id.parse(runId).toLowerCase();
+  const baseline = baselineRunId === null || baselineRunId === undefined
+    ? null
+    : ScienceStudy.shape.id.parse(baselineRunId).toLowerCase();
+  return [...new Set([candidate, ...(baseline ? [baseline] : [])])].sort();
+}
+
+/**
+ * Append one actor-attributed review. The reviewer identity/role is supplied by
+ * the authenticated service boundary and is rechecked against membership by
+ * the database guard in the same transaction.
+ */
+export async function createScienceDomainValidation(
+  db: Db,
+  input: ScienceDomainValidationSubmission & {
+    workspaceId: string;
+    runId: string;
+    reviewerId: string;
+    reviewerRole: "admin" | "owner";
+  },
+) {
+  const untrustedInput = input as unknown as Record<string, unknown>;
+  if (
+    Object.prototype.hasOwnProperty.call(untrustedInput, "createdAt") ||
+    Object.prototype.hasOwnProperty.call(untrustedInput, "revision")
+  ) {
+    throw new Error(
+      "Science domain validation revision and createdAt are database-assigned",
+    );
+  }
+  const submission = ScienceDomainValidationSubmission.parse({
+    kind: input.kind,
+    baselineRunId: input.baselineRunId,
+    metric: input.metric,
+    tolerance: input.tolerance,
+    observedValue: input.observedValue,
+    units: input.units,
+    methodProtocolId: input.methodProtocolId,
+    decision: input.decision,
+    limitationsReason: input.limitationsReason,
+  });
+  const workspaceId = ScienceStudy.shape.workspaceId.parse(input.workspaceId).toLowerCase();
+  const runId = ScienceStudy.shape.id.parse(input.runId).toLowerCase();
+  const reviewerId = ScienceStudy.shape.createdBy.parse(input.reviewerId).toLowerCase();
+  const reviewerRole = input.reviewerRole;
+  if (reviewerRole !== "admin" && reviewerRole !== "owner") {
+    throw new Error("Science domain validation reviewer role must be admin or owner");
+  }
+  const baselineRunId = submission.baselineRunId?.toLowerCase() ?? null;
+  if (baselineRunId === runId) {
+    conflict("A numerical-equivalence baseline must be a different run");
+  }
+
+  return db.transaction(async (tx) => {
+    const scoped = tx as unknown as Db;
+    const locked = new Map<string, ScienceRunRow>();
+    for (const id of scienceDomainValidationRunLockOrder(runId, baselineRunId)) {
+      locked.set(id, await lockRunForWorkspace(scoped, workspaceId, id));
+    }
+    const runSnapshot = succeededRunValidationSnapshot(locked.get(runId)!);
+    const baselineSnapshot = baselineRunId
+      ? succeededRunValidationSnapshot(locked.get(baselineRunId)!)
+      : null;
+    const [revisionRow] = await scoped
+      .select({
+        nextRevision: sql<number>`coalesce(max(${scienceDomainValidations.revision}), 0) + 1`,
+      })
+      .from(scienceDomainValidations)
+      .where(eq(scienceDomainValidations.runId, runId));
+    const revision = Number(revisionRow?.nextRevision);
+    if (!Number.isSafeInteger(revision) || revision <= 0) {
+      throw new Error("Science domain validation revision is invalid");
+    }
+    const hashable: ScienceDomainValidationHashInput = {
+      id: randomUUID(),
+      workspaceId,
+      runId,
+      revision,
+      baselineRunId,
+      kind: submission.kind,
+      metric: submission.metric,
+      tolerance: submission.tolerance,
+      observedValue: submission.observedValue,
+      units: submission.units,
+      methodProtocolId: submission.methodProtocolId,
+      decision: submission.decision,
+      limitationsReason: submission.limitationsReason,
+      reviewerId,
+      reviewerRole,
+      runManifestHash: runSnapshot.manifestHash,
+      runOutputChecksums: runSnapshot.outputs,
+      baselineManifestHash: baselineSnapshot?.manifestHash ?? null,
+      baselineOutputChecksums: baselineSnapshot?.outputs ?? null,
+    };
+    const recordHash = scienceDomainValidationRecordHash(hashable);
+    const [row] = await scoped
+      .insert(scienceDomainValidations)
+      .values({ ...hashable, recordHash })
+      .returning();
+    if (!row) throw new Error("Science domain validation insert returned no row");
+    const scopeBaselineRunId = baselineRunId ?? runId;
+    const [existingHead] = await scoped
+      .select({ id: scienceDomainValidationHeads.id })
+      .from(scienceDomainValidationHeads)
+      .where(and(
+        eq(scienceDomainValidationHeads.workspaceId, workspaceId),
+        eq(scienceDomainValidationHeads.runId, runId),
+        eq(scienceDomainValidationHeads.kind, submission.kind),
+        eq(scienceDomainValidationHeads.scopeBaselineRunId, scopeBaselineRunId),
+      ))
+      .limit(1);
+    const headId = existingHead?.id ?? scienceDomainValidationHeadId({
+      workspaceId,
+      runId,
+      kind: submission.kind,
+      scopeBaselineRunId,
+    });
+    const headHash = scienceDomainValidationHeadHash({
+      id: headId,
+      workspaceId,
+      runId,
+      kind: submission.kind,
+      scopeBaselineRunId,
+      validationId: hashable.id,
+      revision,
+      recordHash,
+    });
+    const headValues = {
+      validationId: hashable.id,
+      revision,
+      recordHash,
+      headHash,
+    };
+    if (existingHead) {
+      const [advanced] = await scoped
+        .update(scienceDomainValidationHeads)
+        .set(headValues)
+        .where(eq(scienceDomainValidationHeads.id, headId))
+        .returning({ id: scienceDomainValidationHeads.id });
+      if (!advanced) throw new Error("Science domain validation head advance returned no row");
+    } else {
+      const [created] = await scoped
+        .insert(scienceDomainValidationHeads)
+        .values({
+          id: headId,
+          workspaceId,
+          runId,
+          kind: submission.kind,
+          scopeBaselineRunId,
+          ...headValues,
+        })
+        .returning({ id: scienceDomainValidationHeads.id });
+      if (!created) throw new Error("Science domain validation head insert returned no row");
+    }
+    return parseDomainValidation(row);
+  });
+}
+
+export async function listScienceDomainValidations(
+  db: Db,
+  input: { workspaceId: string; runId: string; page?: SciencePageInput },
+) {
+  const workspaceId = ScienceStudy.shape.workspaceId.parse(input.workspaceId).toLowerCase();
+  const runId = ScienceStudy.shape.id.parse(input.runId).toLowerCase();
+  const run = await getScienceRunForWorkspace(db, workspaceId, runId);
+  if (!run) {
+    return { items: [], nextOffset: null } satisfies SciencePage<ScienceDomainValidationSummary>;
+  }
+  const pagination = page(input.page);
+  const rows = await db
+    .select({
+      id: scienceDomainValidations.id,
+      runId: scienceDomainValidations.runId,
+      revision: scienceDomainValidations.revision,
+      baselineRunId: scienceDomainValidations.baselineRunId,
+      kind: scienceDomainValidations.kind,
+      metric: scienceDomainValidations.metric,
+      tolerance: scienceDomainValidations.tolerance,
+      observedValue: scienceDomainValidations.observedValue,
+      units: scienceDomainValidations.units,
+      methodProtocolId: scienceDomainValidations.methodProtocolId,
+      decision: scienceDomainValidations.decision,
+      limitationsReason: scienceDomainValidations.limitationsReason,
+      reviewerId: scienceDomainValidations.reviewerId,
+      reviewerRole: scienceDomainValidations.reviewerRole,
+      runManifestHash: scienceDomainValidations.runManifestHash,
+      baselineManifestHash: scienceDomainValidations.baselineManifestHash,
+      createdAt: scienceDomainValidations.createdAt,
+      recordHash: scienceDomainValidations.recordHash,
+    })
+    .from(scienceDomainValidations)
+    .where(and(
+      eq(scienceDomainValidations.workspaceId, workspaceId),
+      eq(scienceDomainValidations.runId, runId),
+    ))
+    .orderBy(desc(scienceDomainValidations.revision))
+    .offset(pagination.offset)
+    .limit(pagination.limit + 1);
+  return paged(rows.map(parseDomainValidationSummary), pagination.offset, pagination.limit);
+}
+
+export async function getScienceDomainValidationForRun(
+  db: Db,
+  input: { workspaceId: string; runId: string; validationId: string },
+) {
+  const workspaceId = ScienceStudy.shape.workspaceId.parse(input.workspaceId).toLowerCase();
+  const runId = ScienceStudy.shape.id.parse(input.runId).toLowerCase();
+  const validationId = ScienceStudy.shape.id.parse(input.validationId).toLowerCase();
+  const [row] = await db
+    .select()
+    .from(scienceDomainValidations)
+    .where(and(
+      eq(scienceDomainValidations.id, validationId),
+      eq(scienceDomainValidations.workspaceId, workspaceId),
+      eq(scienceDomainValidations.runId, runId),
+    ))
+    .limit(1);
+  if (!row) return null;
+  const parsed = ScienceDomainValidationRecord.safeParse(row);
+  return parsed.success ? parsed.data : null;
+}
+
+export async function getLatestScienceLinkedNumericalEquivalenceRecord(
+  db: Db,
+  input: { workspaceId: string; baselineRunId: string; candidateRunId: string },
+) {
+  const workspaceId = ScienceStudy.shape.workspaceId.parse(input.workspaceId).toLowerCase();
+  const baselineRunId = ScienceStudy.shape.id.parse(input.baselineRunId).toLowerCase();
+  const candidateRunId = ScienceStudy.shape.id.parse(input.candidateRunId).toLowerCase();
+  const [row] = await db
+    .select({
+      head: scienceDomainValidationHeads,
+      validation: scienceDomainValidations,
+    })
+    .from(scienceDomainValidationHeads)
+    .innerJoin(
+      scienceDomainValidations,
+      eq(scienceDomainValidations.id, scienceDomainValidationHeads.validationId),
+    )
+    .where(and(
+      eq(scienceDomainValidationHeads.workspaceId, workspaceId),
+      eq(scienceDomainValidationHeads.runId, candidateRunId),
+      eq(scienceDomainValidationHeads.kind, "numerical-equivalence"),
+      eq(scienceDomainValidationHeads.scopeBaselineRunId, baselineRunId),
+    ))
+    .limit(1);
+  if (!row) return null;
+  const parsed = ScienceDomainValidationRecord.safeParse(row.validation);
+  if (!parsed.success) return null;
+  const record = parsed.data;
+  try {
+    const headHash = ScienceSha256.parse(row.head.headHash);
+    const recordHash = ScienceSha256.parse(row.head.recordHash);
+    if (
+      row.head.id.toLowerCase() !== row.head.id ||
+      row.head.workspaceId !== workspaceId ||
+      row.head.runId !== candidateRunId ||
+      row.head.kind !== "numerical-equivalence" ||
+      row.head.scopeBaselineRunId !== baselineRunId ||
+      row.head.validationId !== record.id ||
+      row.head.revision !== record.revision ||
+      recordHash !== record.recordHash ||
+      record.workspaceId !== workspaceId ||
+      record.runId !== candidateRunId ||
+      record.kind !== "numerical-equivalence" ||
+      record.baselineRunId !== baselineRunId ||
+      !verifyScienceDomainValidationRecordHash(record) ||
+      scienceDomainValidationHeadHash({
+        id: row.head.id,
+        workspaceId: row.head.workspaceId,
+        runId: row.head.runId,
+        kind: "numerical-equivalence",
+        scopeBaselineRunId: row.head.scopeBaselineRunId,
+        validationId: row.head.validationId,
+        revision: row.head.revision,
+        recordHash,
+      }) !== headHash
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return record;
 }
 
 export async function getScienceRunByMissionForWorkspace(
@@ -2781,6 +3572,9 @@ export async function resolveScienceRunApproval(
       payload: { approvalId: resolved.id, decision: input.decision },
       createdAt: now,
     });
+    if (target === "cancelled") {
+      await markWorkflowWaitsReadyForScienceRun(scoped, { runId: updated.id, now });
+    }
     return { run: parseRun(updated), approval: resolved, event, transitioned: true };
   });
 }
@@ -3241,7 +4035,11 @@ async function validateScienceSuccessManifest(
   run: ScienceRunRow,
   value: unknown,
 ): Promise<{ manifest: ScienceManifest; manifestHash: string }> {
-  const manifest = ScienceManifest.parse(value);
+  const parsed = ScienceManifest.safeParse(value);
+  if (!parsed.success) {
+    conflict("Science manifest does not satisfy the persisted schema");
+  }
+  const manifest = parsed.data;
   if (
     manifest.runId !== run.id ||
     manifest.studyId !== run.studyId ||
@@ -3268,6 +4066,8 @@ async function validateScienceSuccessManifest(
       link: scienceRunArtifacts,
       version: scienceArtifactVersions,
       artifactStudyId: scienceArtifacts.studyId,
+      artifactKind: scienceArtifacts.kind,
+      artifactFormat: scienceArtifacts.format,
     })
     .from(scienceRunArtifacts)
     .innerJoin(
@@ -3314,6 +4114,46 @@ async function validateScienceSuccessManifest(
     conflict("Science manifest inputs and outputs must exactly match persisted run links");
   }
 
+  const linkedCodeInput = manifest.codeArtifactVersionId !== null &&
+    links.some((entry) =>
+      entry.link.direction === "input" &&
+      entry.version.id === manifest.codeArtifactVersionId &&
+      ["code", "notebook", "solver"].includes(entry.link.semanticRole) &&
+      isParsedIpynbArtifactVersion(entry.version, {
+        kind: entry.artifactKind,
+        format: entry.artifactFormat,
+      }));
+  // No trusted repository resolver exists in the current release. A caller
+  // cannot promote a user-declared revision into verified top-level evidence,
+  // even when it resembles a commit hash.
+  if (manifest.sourceRevision !== null) {
+    conflict("Science manifest source revision is unverified; link immutable code input instead");
+  }
+  if (manifest.codeArtifactVersionId !== null && !linkedCodeInput) {
+    conflict(
+      "Science manifest code artifact must be a linked code, notebook, or solver input",
+    );
+  }
+  if (!linkedCodeInput) {
+    if (manifest.complete) {
+      conflict("A complete science manifest requires a linked immutable code input");
+    }
+    if (!manifest.gaps.includes("manifest.codeArtifactVersionId")) {
+      conflict("An incomplete science manifest must name its missing code artifact gap");
+    }
+    const declaredSourceRevision = Object.prototype.hasOwnProperty.call(
+      manifest.parameters,
+      "sourceRevision",
+    ) && manifest.parameters.sourceRevision !== null &&
+      manifest.parameters.sourceRevision !== undefined;
+    if (
+      declaredSourceRevision &&
+      !manifest.gaps.includes("manifest.sourceRevision.unverified")
+    ) {
+      conflict("An unverified declared source revision must remain an explicit manifest gap");
+    }
+  }
+
   if (manifest.codeArtifactVersionId) {
     const codeVersion = await getScienceArtifactVersionForWorkspace(
       db,
@@ -3343,10 +4183,58 @@ async function validateScienceSuccessManifest(
     }
   }
 
+  const structural = assessScienceManifest(manifest);
+  if (
+    manifest.complete !== structural.complete ||
+    !sameJson(manifest.gaps, structural.gaps)
+  ) {
+    conflict(
+      "Science manifest complete and gaps must exactly match the current structural assessment",
+    );
+  }
+
   const manifestHash = createHash("sha256")
     .update(canonicalScienceJson(manifest))
     .digest("hex");
   return { manifest, manifestHash: ScienceSha256.parse(manifestHash) };
+}
+
+/**
+ * Reassess immutable manifest bytes against current structural and relational
+ * trust rules. This deliberately does not rewrite legacy rows: callers receive
+ * a current trust projection while the stored manifest and hash stay intact.
+ */
+export async function assessScienceRunManifestForWorkspace(
+  db: Db,
+  workspaceId: string,
+  runId: string,
+): Promise<{ complete: boolean; gaps: string[] } | null> {
+  const [owned] = await db
+    .select({ run: scienceRuns })
+    .from(scienceRuns)
+    .innerJoin(scienceStudies, eq(scienceRuns.studyId, scienceStudies.id))
+    .where(and(eq(scienceRuns.id, runId), eq(scienceStudies.workspaceId, workspaceId)))
+    .limit(1);
+  if (!owned) return null;
+  if (!owned.run.manifest) {
+    return { complete: false, gaps: ["manifest-not-yet-available"] };
+  }
+
+  const structural = assessScienceManifest(owned.run.manifest);
+  const gaps = new Set(structural.gaps);
+  try {
+    const validated = await validateScienceSuccessManifest(db, owned.run, owned.run.manifest);
+    if (owned.run.manifestHash !== validated.manifestHash) {
+      gaps.add("manifest.hash.mismatch");
+    }
+  } catch (error) {
+    if (!(error instanceof ScienceConflictError)) throw error;
+    // The success validator is the single relational policy: identity,
+    // profile/resources, parameters, and exact input/output links all have to
+    // match. A legacy row that fails any part remains immutable but untrusted.
+    gaps.add("manifest.relational-integrity");
+  }
+  return { complete: gaps.size === 0, gaps: [...gaps].sort() };
 }
 
 export async function transitionScienceRun(
@@ -3516,6 +4404,9 @@ export async function transitionScienceRun(
         },
         createdAt: now,
       });
+    }
+    if (isTerminalRunState(target)) {
+      await markWorkflowWaitsReadyForScienceRun(scoped, { runId: row.id, now });
     }
     return parseRun(row);
   });
@@ -3837,10 +4728,19 @@ export async function createScienceRenderSession(
     runId?: string | null;
     artifactVersionId?: string | null;
     providerHandle?: string | null;
+    requestKeyHash: string;
+    intentFingerprint: string;
+    providerKind: string;
+    mode: "client" | "remote" | "static";
+    sourceSha256: string;
+    sourceMediaType: string;
+    sourceSizeBytes: number;
+    sourceLogicalName: string;
     tokenHash: string;
     audience: string;
     ownerId: string;
     expiresAt: Date;
+    replayExpiresAt: Date;
     maxConcurrentSessions: number;
   },
 ): Promise<{ session: ScienceRenderSession; created: boolean }> {
@@ -3851,6 +4751,27 @@ export async function createScienceRenderSession(
     throw new Error("Render session expiry must be in the future");
   }
   const tokenHash = ScienceSha256.parse(input.tokenHash);
+  const requestKeyHash = ScienceSha256.parse(input.requestKeyHash);
+  const intentFingerprint = ScienceSha256.parse(input.intentFingerprint);
+  const sourceSha256 = ScienceSha256.parse(input.sourceSha256);
+  const providerKind = canonicalText(input.providerKind, "Render provider kind", 80);
+  if (!/^[a-z0-9_-]{1,80}$/i.test(providerKind)) {
+    throw new Error("Render provider kind is invalid");
+  }
+  if (!["client", "remote", "static"].includes(input.mode)) {
+    throw new Error("Render mode is invalid");
+  }
+  const sourceMediaType = canonicalText(input.sourceMediaType, "Render source media type", 200);
+  const sourceLogicalName = canonicalText(input.sourceLogicalName, "Render source logical name", 500);
+  if (!Number.isSafeInteger(input.sourceSizeBytes) || input.sourceSizeBytes < 0) {
+    throw new Error("Render source size must be a non-negative safe integer");
+  }
+  if (
+    !(input.replayExpiresAt instanceof Date) ||
+    input.replayExpiresAt.getTime() < input.expiresAt.getTime()
+  ) {
+    throw new Error("Render replay expiry must not precede the session expiry");
+  }
   const audience = canonicalText(input.audience, "Render session audience", 300);
   const providerHandle =
     input.providerHandle == null
@@ -3922,19 +4843,17 @@ export async function createScienceRenderSession(
     const [existing] = await scoped
       .select()
       .from(scienceRenderSessions)
-      .where(eq(scienceRenderSessions.tokenHash, tokenHash))
+      .where(
+        and(
+          eq(scienceRenderSessions.workspaceId, input.workspaceId),
+          eq(scienceRenderSessions.ownerId, input.ownerId),
+          eq(scienceRenderSessions.requestKeyHash, requestKeyHash),
+        ),
+      )
       .limit(1);
     if (existing) {
-      if (
-        existing.workspaceId !== input.workspaceId ||
-        existing.runId !== (input.runId ?? null) ||
-        existing.artifactVersionId !== (input.artifactVersionId ?? null) ||
-        existing.providerHandle !== providerHandle ||
-        existing.audience !== audience ||
-        existing.ownerId !== input.ownerId ||
-        existing.expiresAt.getTime() !== input.expiresAt.getTime()
-      ) {
-        conflict("Render token hash was already used for a different session");
+      if (existing.intentFingerprint !== intentFingerprint) {
+        conflict("Render idempotency key was already used for a different request intent");
       }
       return { session: parseRenderSession(existing), created: false };
     }
@@ -3960,15 +4879,120 @@ export async function createScienceRenderSession(
         runId: input.runId ?? null,
         artifactVersionId: input.artifactVersionId ?? null,
         providerHandle,
+        requestKeyHash,
+        intentFingerprint,
+        providerKind,
+        mode: input.mode,
+        sourceSha256,
+        sourceMediaType,
+        sourceSizeBytes: input.sourceSizeBytes,
+        sourceLogicalName,
         tokenHash,
         audience,
         state: "starting",
         ownerId: input.ownerId,
         expiresAt: input.expiresAt,
+        replayExpiresAt: input.replayExpiresAt,
       })
       .returning();
     return { session: parseRenderSession(row!), created: true };
   });
+}
+
+/** Claim the only provider start permitted for this request. An abandoned
+ * claim becomes replayable after its short lease; an active concurrent replay
+ * observes the same row without starting a second provider. */
+export async function claimScienceRenderSessionLaunch(
+  db: Db,
+  input: {
+    workspaceId: string;
+    sessionId: string;
+    ownerId: string;
+    providerHandle: string;
+    leaseId: string;
+    leaseExpiresAt: Date;
+    now?: Date;
+  },
+): Promise<{ session: ScienceRenderSession; claimed: boolean }> {
+  const providerHandle = canonicalText(input.providerHandle, "Render launch marker", 500);
+  const now = input.now ?? new Date();
+  if (input.leaseExpiresAt.getTime() <= now.getTime()) {
+    throw new Error("Render launch lease must expire in the future");
+  }
+  return db.transaction(async (tx) => {
+    const scoped = tx as unknown as Db;
+    await scoped.execute(
+      sql`select id from science_render_sessions where id = ${input.sessionId} for update`,
+    );
+    const current = await getScienceRenderSessionForWorkspace(
+      scoped,
+      input.workspaceId,
+      input.sessionId,
+    );
+    if (!current) conflict("Science render session does not exist in the workspace");
+    if (current.ownerId !== input.ownerId) conflict("Science render session owner guard failed");
+    if (current.state !== "starting") return { session: current, claimed: false };
+    if (current.providerHandle !== null && current.providerHandle !== providerHandle) {
+      return { session: current, claimed: false };
+    }
+    if (
+      current.launchLeaseExpiresAt !== null &&
+      current.launchLeaseExpiresAt.getTime() > now.getTime()
+    ) {
+      return { session: current, claimed: false };
+    }
+    const [row] = await scoped
+      .update(scienceRenderSessions)
+      .set({
+        providerHandle,
+        launchLeaseId: input.leaseId,
+        launchLeaseExpiresAt: input.leaseExpiresAt,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(scienceRenderSessions.id, current.id),
+          eq(scienceRenderSessions.state, "starting"),
+        ),
+      )
+      .returning();
+    if (!row) conflict("Render launch claim lost a concurrent race");
+    return { session: parseRenderSession(row), claimed: true };
+  });
+}
+
+/** Release a failed pre-launch claim only when its lease still owns the marker. */
+export async function releaseScienceRenderSessionLaunch(
+  db: Db,
+  input: {
+    workspaceId: string;
+    sessionId: string;
+    ownerId: string;
+    providerHandle: string;
+    leaseId: string;
+    now?: Date;
+  },
+): Promise<ScienceRenderSession | null> {
+  const [row] = await db
+    .update(scienceRenderSessions)
+    .set({
+      providerHandle: null,
+      launchLeaseId: null,
+      launchLeaseExpiresAt: null,
+      updatedAt: input.now ?? new Date(),
+    })
+    .where(
+      and(
+        eq(scienceRenderSessions.id, input.sessionId),
+        eq(scienceRenderSessions.workspaceId, input.workspaceId),
+        eq(scienceRenderSessions.ownerId, input.ownerId),
+        eq(scienceRenderSessions.state, "starting"),
+        eq(scienceRenderSessions.providerHandle, input.providerHandle),
+        eq(scienceRenderSessions.launchLeaseId, input.leaseId),
+      ),
+    )
+    .returning();
+  return row ? parseRenderSession(row) : null;
 }
 
 export async function getScienceRenderSessionForWorkspace(
@@ -4040,6 +5064,7 @@ export async function replaceScienceRenderSessionProviderHandle(
     sessionId: string;
     ownerId: string;
     expectedProviderHandle: string;
+    launchLeaseId?: string;
     providerHandle: string;
     now?: Date;
   },
@@ -4052,7 +5077,12 @@ export async function replaceScienceRenderSessionProviderHandle(
   const providerHandle = canonicalText(input.providerHandle, "Render provider handle", 500);
   const [row] = await db
     .update(scienceRenderSessions)
-    .set({ providerHandle, updatedAt: input.now ?? new Date() })
+    .set({
+      providerHandle,
+      launchLeaseId: null,
+      launchLeaseExpiresAt: null,
+      updatedAt: input.now ?? new Date(),
+    })
     .where(
       and(
         eq(scienceRenderSessions.id, input.sessionId),
@@ -4060,6 +5090,9 @@ export async function replaceScienceRenderSessionProviderHandle(
         eq(scienceRenderSessions.ownerId, input.ownerId),
         eq(scienceRenderSessions.state, "starting"),
         eq(scienceRenderSessions.providerHandle, expectedProviderHandle),
+        ...(input.launchLeaseId
+          ? [eq(scienceRenderSessions.launchLeaseId, input.launchLeaseId)]
+          : []),
       ),
     )
     .returning();
@@ -4150,7 +5183,12 @@ export async function transitionScienceRenderSession(
         heartbeatAt: target === "ready" ? now : current.heartbeatAt,
         ...(target === "ready"
           ? {}
-          : { cleanupAttempts: 0, cleanupNotBefore: null }),
+          : {
+              cleanupAttempts: 0,
+              cleanupNotBefore: null,
+              launchLeaseId: null,
+              launchLeaseExpiresAt: null,
+            }),
         updatedAt: now,
       })
       .where(eq(scienceRenderSessions.id, current.id))
@@ -4166,6 +5204,7 @@ export async function heartbeatScienceRenderSession(
     sessionId: string;
     ownerId: string;
     extendExpiresAt?: Date;
+    extendReplayExpiresAt?: Date;
     now?: Date;
   },
 ) {
@@ -4196,9 +5235,21 @@ export async function heartbeatScienceRenderSession(
       }
       expiresAt = input.extendExpiresAt;
     }
+    let replayExpiresAt = current.replayExpiresAt;
+    if (input.extendReplayExpiresAt !== undefined) {
+      if (
+        !(input.extendReplayExpiresAt instanceof Date) ||
+        input.extendReplayExpiresAt.getTime() < expiresAt.getTime()
+      ) {
+        conflict("Render replay extension cannot precede the live lease");
+      }
+      if (input.extendReplayExpiresAt.getTime() > replayExpiresAt.getTime()) {
+        replayExpiresAt = input.extendReplayExpiresAt;
+      }
+    }
     const [row] = await scoped
       .update(scienceRenderSessions)
-      .set({ heartbeatAt: now, expiresAt, updatedAt: now })
+      .set({ heartbeatAt: now, expiresAt, replayExpiresAt, updatedAt: now })
       .where(eq(scienceRenderSessions.id, current.id))
       .returning();
     return parseRenderSession(row!);
@@ -4255,6 +5306,7 @@ export async function listTerminalScienceRenderSessionsForCleanup(
       and(
         eq(scienceRenderSessions.workspaceId, input.workspaceId),
         inArray(scienceRenderSessions.state, ["expired", "failed", "revoked"]),
+        isNotNull(scienceRenderSessions.providerHandle),
         or(
           isNull(scienceRenderSessions.cleanupNotBefore),
           lte(scienceRenderSessions.cleanupNotBefore, now),
@@ -4291,13 +5343,25 @@ export async function deferScienceRenderSessionCleanup(
   return Boolean(deferred);
 }
 
-/** Release ephemeral render metadata only after the service proved close. */
-export async function deleteTerminalScienceRenderSessionAfterClose(
+/** Release the provider/resource hold after close proof while preserving the
+ * request tombstone until its replay horizon. */
+export async function tombstoneTerminalScienceRenderSessionAfterClose(
   db: Db,
-  input: { workspaceId: string; sessionId: string },
-): Promise<boolean> {
-  const [deleted] = await db
-    .delete(scienceRenderSessions)
+  input: { workspaceId: string; sessionId: string; replayExpiresAt?: Date; now?: Date },
+): Promise<ScienceRenderSession | null> {
+  const now = input.now ?? new Date();
+  const [row] = await db
+    .update(scienceRenderSessions)
+    .set({
+      providerHandle: null,
+      launchLeaseId: null,
+      launchLeaseExpiresAt: null,
+      cleanupAttempts: 0,
+      cleanupNotBefore: null,
+      closedAt: now,
+      ...(input.replayExpiresAt ? { replayExpiresAt: input.replayExpiresAt } : {}),
+      updatedAt: now,
+    })
     .where(
       and(
         eq(scienceRenderSessions.id, input.sessionId),
@@ -4305,6 +5369,53 @@ export async function deleteTerminalScienceRenderSessionAfterClose(
         inArray(scienceRenderSessions.state, ["expired", "failed", "revoked"]),
       ),
     )
+    .returning();
+  return row ? parseRenderSession(row) : null;
+}
+
+/** Owner/workspace-scoped idempotency lookup for a read-only replay path. */
+export async function getScienceRenderSessionForRequest(
+  db: Db,
+  input: { workspaceId: string; ownerId: string; requestKeyHash: string },
+): Promise<ScienceRenderSession | null> {
+  const requestKeyHash = ScienceSha256.parse(input.requestKeyHash);
+  const [row] = await db
+    .select()
+    .from(scienceRenderSessions)
+    .where(
+      and(
+        eq(scienceRenderSessions.workspaceId, input.workspaceId),
+        eq(scienceRenderSessions.ownerId, input.ownerId),
+        eq(scienceRenderSessions.requestKeyHash, requestKeyHash),
+      ),
+    )
+    .limit(1);
+  return row ? parseRenderSession(row) : null;
+}
+
+/** Delete only provider-free tombstones whose replay horizon elapsed. */
+export async function deleteExpiredScienceRenderSessionTombstones(
+  db: Db,
+  input: { workspaceId: string; now?: Date; limit?: number },
+): Promise<number> {
+  const now = input.now ?? new Date();
+  const limit = Math.max(1, Math.min(1_000, input.limit ?? 200));
+  const candidates = db
+    .select({ id: scienceRenderSessions.id })
+    .from(scienceRenderSessions)
+    .where(
+      and(
+        eq(scienceRenderSessions.workspaceId, input.workspaceId),
+        inArray(scienceRenderSessions.state, ["expired", "failed", "revoked"]),
+        isNull(scienceRenderSessions.providerHandle),
+        lte(scienceRenderSessions.replayExpiresAt, now),
+      ),
+    )
+    .orderBy(asc(scienceRenderSessions.replayExpiresAt), asc(scienceRenderSessions.id))
+    .limit(limit);
+  const rows = await db
+    .delete(scienceRenderSessions)
+    .where(inArray(scienceRenderSessions.id, candidates))
     .returning({ id: scienceRenderSessions.id });
-  return Boolean(deleted);
+  return rows.length;
 }
